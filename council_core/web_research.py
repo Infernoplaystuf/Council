@@ -76,7 +76,7 @@ NO_TEXT_SITES = ("youtube.com", "youtu.be", "facebook.com", "instagram.com",
 #: a page is kept up to this many characters
 PAGE_CHARS = 60_000
 #: a passage is about this long
-PASSAGE_CHARS = 900
+PASSAGE_CHARS = 1600
 #: passages given to the model for one section
 PASSAGES_PER_SECTION = 6
 
@@ -345,7 +345,11 @@ SECTION_SYSTEM = ("You write one section of a short research report for the "
                   "each claim, like [2] or [1][4]: the number of the source whose "
                   "text says it. Use only the numbers given, and use every "
                   "source that has something useful, not just one. "
-                  "If the sources do not answer this part, say so in one "
+                  "Name products, tools and amounts exactly as the source "
+                  "writes them, and never name one that no source names. When "
+                  "a source gives steps, keep them in its order and say which "
+                  "source they come from. Do not add advice the sources do not "
+                  "give. If the sources do not answer this part, say so in one "
                   "sentence. Do not write a heading.")
 
 PLAN_SCHEMA = {"type": "object",
@@ -389,6 +393,77 @@ def plan(question: str, chat: Optional[ChatFn], n: int = SUB_QUESTIONS) -> List[
 
 
 _CITE = re.compile(r"\[(\d{1,3})\]")
+#: citations some models write: 【2】 ［2］ [1, 4] [1][4]-style lists
+_ODD_CITE = re.compile(r"[【［\[]\s*(\d{1,3}(?:\s*[,;]\s*\d{1,3})*)\s*[】］\]]")
+
+
+def normalise_citations(text: str) -> str:
+    """【2】, ［2］ and [1, 4] written as [2] and [1][4], so they are checked
+    like any other citation (a section citing only 【2】 was said to cite
+    nothing, 2026-11-10)."""
+    return _ODD_CITE.sub(lambda m: "".join(
+        f"[{n}]" for n in re.split(r"\s*[,;]\s*", m.group(1))), text)
+
+
+# -- names checked against the pages ---------------------------------------
+#: words that start a capitalised run but are not part of a product's name
+_NAME_LEAD = set("""a an and the or of for with to in on at by from use using
+apply add start then try mix thin finish base layer glaze wash drybrush paint
+prime seal keep avoid citadel vallejo game color colour air model army painter
+warpaints scale75 ak tamiya""".split())
+_NAME = re.compile(r"\b[A-Z][A-Za-z0-9'’-]*(?:\s+[A-Z][A-Za-z0-9'’-]*){1,3}")
+
+
+def names_in(text: str, known: str = "") -> List[str]:
+    """Product-like names in ``text``: two or more capitalised words inside
+    a sentence (Magos Purple, Canoptek Alloy), not a heading, a bold label,
+    a line that is only a label, or anything in ``known`` (the question,
+    the heading)."""
+    out = []
+    known = known.lower()
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):                      # a heading
+            continue
+        body = re.sub(r"\*\*[^*]+\*\*:?", " ", line)          # bold labels
+        body = re.sub(r"^\s*(?:[-*]|\d+[.)])?\s*", "", body)    # list marks
+        if _NAME.fullmatch(body.strip(" :*_")):                 # a label line
+            continue
+        for m in _NAME.finditer(body):
+            words = m.group(0).split()
+            while words and words[0].lower() in _NAME_LEAD:
+                words = words[1:]
+            name = " ".join(words).strip("'’-")
+            if len(name.split()) >= 2 and name.lower() not in known:
+                out.append(name)
+    return list(dict.fromkeys(out))
+
+
+def ground_names(text: str, pages: Dict[int, str], known: str = "") -> Tuple[str, int, int]:
+    """Check each product-like name against the pages its block cites.
+
+    A name another page has gets that page's number added to the block (the
+    model credited the wrong source); a name no page has is marked "(not in
+    the sources)". Returns (text, names re-credited, names not found)."""
+    low = {n: t.lower() for n, t in pages.items()}
+    moved = missing = 0
+    blocks = re.split(r"(\n\s*\n)", text)
+    for i in range(0, len(blocks), 2):
+        block = blocks[i]
+        cites = {int(x) for x in _CITE.findall(block)}
+        for name in names_in(block, known):
+            key = name.lower()
+            if any(key in low.get(c, "") for c in cites):
+                continue
+            having = [n for n, t in sorted(low.items()) if key in t]
+            if having:
+                block = block.rstrip() + f" [{having[0]}]"
+                cites.add(having[0])
+                moved += 1
+            else:
+                block = re.sub(re.escape(name), f"{name} (not in the sources)", block, count=1)
+                missing += 1
+        blocks[i] = block
+    return "".join(blocks), moved, missing
 
 
 def check_citations(text: str, allowed: Sequence[int]) -> Tuple[str, List[int], int]:
@@ -396,6 +471,7 @@ def check_citations(text: str, allowed: Sequence[int]) -> Tuple[str, List[int], 
     cites, how many were taken out)."""
     ok = set(allowed)
     dropped = 0
+    text = normalise_citations(text)
 
     def keep(m):
         nonlocal dropped
@@ -464,9 +540,18 @@ def write_sections(run: Run, chat: Optional[ChatFn], *,
             run.sections.append(sec)
             continue
         sec.text, sec.cited, dropped = check_citations(raw, [n for n, _ in chosen])
+        pages = {src.n: read_source_text(run, src) for src in run.kept()}
+        sec.text, moved, missing = ground_names(sec.text, pages, f"{run.question} {sq}")
+        sec.cited = sorted({int(x) for x in _CITE.findall(sec.text)})
         notes = []
         if dropped:
             notes.append(f"{dropped} citation(s) to sources the model was not given were taken out.")
+        if moved:
+            notes.append(f"{moved} name(s) were credited to the wrong source; "
+                         f"the source that has them was added.")
+        if missing:
+            notes.append(f"{missing} name(s) appear in no source read and are "
+                         f"marked \"(not in the sources)\".")
         if sec.text and not sec.cited:
             notes.append("This part cites no source: treat it as the model's own words.")
         sec.note = " ".join(notes)

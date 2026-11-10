@@ -464,3 +464,24 @@ def test_one_site_gives_at_most_two_pages_and_video_sites_are_not_read(online, t
     assert len(run.sources) == wr.MAX_PER_SITE
     assert not any("youtube" in u or "facebook" in u for u in fetched)
     assert any(x.startswith("video or social sites, not read: ") for x in run.skipped)
+
+
+# -- accuracy checks after writing (2026-11-10 flamer report review) ------------
+def test_full_width_and_listed_citations_are_read():
+    text, cited, dropped = wr.check_citations("Glaze it【2】 then［1］, see [1, 3].", [1, 2, 3])
+    assert text == "Glaze it[2] then[1], see [1][3]." and cited == [1, 2, 3] and not dropped
+
+
+def test_names_skip_headings_labels_and_the_question():
+    text = ("### Painting Flamethrower Fire\n**Base Coat**: thin Magos Purple [1]\n"
+            "Canoptek Alloy\nUse Citadel Brassy Brass on Warhammer 40K models [2].")
+    assert wr.names_in(text, "flamers on Warhammer 40K") == ["Magos Purple", "Brassy Brass"]
+
+
+def test_a_name_is_credited_to_the_page_that_has_it_or_marked():
+    pages = {1: "Glaze with Magos Purple", 2: "Drybrush Canoptek Alloy"}
+    text = "Glaze with Magos Purple [2].\n\nPrime with Mephiston Black [1]."
+    out, moved, missing = wr.ground_names(text, pages)
+    assert (moved, missing) == (1, 1)
+    assert "Magos Purple [2]. [1]" in out
+    assert "Mephiston Black (not in the sources) [1]" in out
