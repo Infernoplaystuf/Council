@@ -103,7 +103,11 @@ def qapp():
 
 def test_the_settings_tab_shows_setup_for_searxng_only(qapp):
     from council_qt.tabs.settings import SettingsActions, SettingsTab
-    tab = SettingsTab(actions=SettingsActions())
+
+    class Stub(SettingsActions):
+        """No vault: the Settings tab keeps only the app folder, which the
+        test session already points somewhere throwaway."""
+    tab = SettingsTab(actions=Stub())
     tab.show()
     tab.engine_box.setCurrentIndex(tab.engine_box.findData("searxng"))
     assert tab.searxng_row.isVisible()

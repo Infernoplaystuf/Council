@@ -63,8 +63,16 @@ RESEARCH_DIR = "research"
 
 #: defaults a run uses
 SUB_QUESTIONS = 4
-RESULTS_PER_SEARCH = 5
+RESULTS_PER_SEARCH = 8
 MAX_PAGES = 8
+#: pages kept from one site, so one site (a content farm with an article
+#: per keyword, seen 2026-11-10) cannot fill a run
+MAX_PER_SITE = 2
+#: video and social sites: no article text to read (or robots.txt forbids
+#: it), so they are not fetched - the reads go to pages that have text
+NO_TEXT_SITES = ("youtube.com", "youtu.be", "facebook.com", "instagram.com",
+                 "tiktok.com", "pinterest.com", "x.com", "twitter.com",
+                 "reddit.com")
 #: a page is kept up to this many characters
 PAGE_CHARS = 60_000
 #: a passage is about this long
@@ -493,6 +501,16 @@ def report_markdown(run: Run) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _site(url: str) -> str:
+    """The site a URL is on, without www. or m. (youtube.com, not
+    www.youtube.com), so subdomains of one site count as one."""
+    host = web._host(url).lower().split(":")[0]
+    for prefix in ("www.", "m.", "old."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    return host
+
+
 def _discard(folder: Path) -> None:
     """Take away a run folder that read nothing (its run file, the empty
     pages folder, the folder): only those, never anything else in it."""
@@ -573,9 +591,17 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
 
     robots = web.Robots()
     pages_dir = folder / PAGES_DIR
+    per_site: Counter = Counter()
+    passed: Counter = Counter()
     for q, hit in order:
         if len(run.sources) >= max_pages or stop():
             break
+        site = _site(hit.url)
+        if site in NO_TEXT_SITES:
+            passed[site] += 1
+            continue
+        if per_site[site] >= MAX_PER_SITE:
+            continue
         say(f"Reading {web._host(hit.url)} ({len(run.sources) + 1}/{max_pages})…")
         try:
             page = web.fetch(hit.url, robots=robots)
@@ -588,6 +614,7 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         if len(terms(art.text)) < 40:
             run.skipped.append(f"{art.site}: too little text on the page")
             continue
+        per_site[site] += 1
         n = len(run.sources) + 1
         src = Source(n=n, url=page.final_url or hit.url,
                      title=art.title or hit.title or art.site, site=art.site,
@@ -600,6 +627,9 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         _write_text(pages_dir / Path(src.file).name, page_header(src, question) + "\n" + body + "\n")
         run.sources.append(src)
         save_run(run)
+    if passed:
+        run.skipped.append("video or social sites, not read: " + ", ".join(
+            f"{s} ({k})" if k > 1 else s for s, k in passed.most_common()))
     if not run.sources:
         _discard(folder)
         raise ResearchError("none of the pages found could be read: "

@@ -61,7 +61,7 @@ class _Handler(BaseHTTPRequestHandler):
                     {"url": f"{base}/private", "title": "Private", "content": "no"},
                     {"url": f"{base}/picture", "title": "A picture", "content": ""}]
             return self._send(200, json.dumps({"results": rows}), "application/json")
-        if self.path == "/guide":
+        if self.path.split("?")[0] == "/guide":
             return self._send(200, GUIDE)
         if self.path == "/smoke":
             return self._send(200, SMOKE)
@@ -189,7 +189,8 @@ def test_duckduckgo_results_are_parsed():
 
 
 # -- a run -----------------------------------------------------------------------
-def test_a_run_cites_its_pages_and_keeps_them_in_data_in(online, tmp_path):
+def test_a_run_cites_its_pages_and_keeps_them_in_data_in(online, tmp_path, monkeypatch):
+    monkeypatch.setattr(wr, "MAX_PER_SITE", 10)    # every test page is on one host
     vault = tmp_path / "vault"
     run = wr.research("How do I paint flamethrower effects on Warhammer models",
                       vault, fake_chat, model="fake")
@@ -449,3 +450,17 @@ def test_sections_do_not_all_get_the_same_passages(online, tmp_path):
         return "Glaze it [1]."
     wr.research("How do I paint flamethrower effects", tmp_path / "v", chat)
     assert len(given) == 2 and given[0] != given[1]
+
+
+def test_one_site_gives_at_most_two_pages_and_video_sites_are_not_read(online, tmp_path, monkeypatch):
+    farm = [web.Hit(f"{online}/guide?a={i}", "Farm") for i in range(4)]
+    social = [web.Hit("https://www.youtube.com/watch?v=x", "Video"),
+              web.Hit("https://www.facebook.com/groups/1/posts/2", "Post")]
+    monkeypatch.setattr(web, "search", lambda q, limit=6: social + farm)
+    fetched = []
+    real = web.fetch
+    monkeypatch.setattr(web, "fetch", lambda url, **k: fetched.append(url) or real(url, **k))
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat)
+    assert len(run.sources) == wr.MAX_PER_SITE
+    assert not any("youtube" in u or "facebook" in u for u in fetched)
+    assert any(x.startswith("video or social sites, not read: ") for x in run.skipped)
