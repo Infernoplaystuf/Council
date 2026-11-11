@@ -318,3 +318,95 @@ def test_a_merge_that_fails_says_why_in_the_window(books, tmp_path):
     assert dlg.result is None
     assert "no filled copy" in dlg.report.toPlainText()
     dlg.close()
+
+
+# ── partly filled copies: nothing is filled in (user, 2026-11-11: "The
+# filled copies may not be completely filled so I don't want anything to
+# accidentally get filled in through hallucinations") ─────────────────────
+def test_blanks_in_partly_filled_copies_stay_blank_everywhere(books, tmp_path):
+    template, folder = books
+    # S-2 has no Power and only two of its flaws filled
+    fill(template, folder / "part 2.xlsx",
+         {"Part Number": "S-2", "Frequency (kHz)": 22},
+         {FOD: {"1A": 41, "2A": 42}})
+    res = lm.merge(template, folder)
+    rows = ParentCSV(res.csv).rows_for("S-2")
+    assert {r["Power (W)"] for r in rows} == {""}
+    assert {r["Date"] for r in rows} == {""}
+    by_item = {r["Flaw #"]: r[FOD] for r in rows}
+    assert by_item["1A"] == "41" and by_item["2A"] == "42"
+    assert all(v == "" for it, v in by_item.items() if it not in ("1A", "2A"))
+    # its sheet and All data show the blanks as blank
+    wb = openpyxl.load_workbook(res.workbook)
+    schema = read_template(template)
+    assert wb["S-2"][schema.field("Power (W)").cells[""]].value is None
+    assert wb["S-2"][schema.field(FOD).cells["3A"]].value is None
+    data = wb["All data"]
+    head = [c.value for c in data[1]]
+    s2 = [dict(zip(head, [c.value for c in r])) for r in data.iter_rows(min_row=2)
+          if r[1].value == "S-2"]
+    assert s2 and all(r["Power (W)"] is None for r in s2)
+    # Analyze counts them as missing, never as values
+    d = la.load(res.csv)
+    cov = la.coverage(d).set_index("Field")
+    assert cov.loc["Power (W)", "Filled"] == 5 and cov.loc["Power (W)", "Could hold"] == 6
+    summ = la.summary(d).set_index("Field")
+    assert summ.loc["Power (W)", "Count"] == 5
+    assert "S-2" in set(la.missing_by_part(d).iloc[:, 0])
+
+
+def test_a_blank_is_not_filled_from_another_copy_of_the_same_part(books):
+    template, folder = books
+    fill(template, folder / "part 3.xlsx",                 # S-3 without its Power
+         {"Part Number": "S-3", "Frequency (kHz)": 23})
+    fill(template, folder / "part 3 again.xlsx",
+         {"Part Number": "S-3", "Power (W)": 999, "Frequency (kHz)": 23})
+    res = lm.merge(template, folder)
+    assert {r["Power (W)"] for r in ParentCSV(res.csv).rows_for("S-3")} == {""}
+    listed = [p for p in res.clashes if p.part == "S-3" and p.field == "Power (W)"]
+    assert len(listed) == 1
+    assert "left blank" in listed[0].reason
+    assert listed[0].kept == "(blank) (part 3.xlsx)" and listed[0].value == "999"
+    # the other copy keeps its own sheet with its own value
+    wb = openpyxl.load_workbook(res.workbook)
+    power = read_template(template).field("Power (W)").cells[""]
+    assert wb["S-3"][power].value is None and wb["S-3 (2)"][power].value == 999
+
+
+def test_a_cleared_cell_is_not_given_back_the_templates_text(books, tmp_path):
+    """A template cell holding text (here a field cell typed into the
+    template itself) that a copy cleared stays clear on that copy's sheet."""
+    template, folder = books
+    schema = read_template(template)
+    cell = schema.field("Power (W)").cells[""]
+    wb = openpyxl.load_workbook(template)
+    wb.worksheets[0][cell] = "enter power"
+    pre = tmp_path / "prefilled.xlsx"
+    wb.save(pre)
+    out = tmp_path / "copies2"
+    out.mkdir()
+    fill(pre, out / "a.xlsx", {"Part Number": "S-1", "Power (W)": None})
+    wb = openpyxl.load_workbook(out / "a.xlsx")
+    wb.worksheets[0][cell] = None                            # the copy cleared it
+    wb.save(out / "a.xlsx")
+    res = lm.merge(pre, out)
+    assert openpyxl.load_workbook(res.workbook)["S-1"][cell].value is None
+
+
+def test_the_merge_asks_no_model_and_runs_no_extract():
+    """The merge reads cells and nothing else: none of the model or Extract
+    modules is imported by it or its window."""
+    import ast
+    banned = {"ledger_llm", "source_extract", "ledger_ingest", "model_backends",
+              "council_engine", "ledger_teach", "ledger_linking", "role_models"}
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("council_core/ledger_merge.py", "council_qt/tabs/ledger_merge_dialog.py"):
+        tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names |= {a.name.split(".")[-1] for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                names |= {(node.module or "").split(".")[-1]}
+                names |= {a.name for a in node.names}
+        assert not names & banned, (rel, names & banned)

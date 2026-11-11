@@ -357,31 +357,44 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
         if stale.exists():
             stale.unlink()
     ledger = ParentCSV.create(tmp_csv, schema)
-    first_file: Dict[str, str] = {}
+    # A part in two copies: the parent CSV holds the first copy's values
+    # only, blanks included - a blank is never filled from the other copy
+    # (user, 2026-11-11: "I don't want anything to accidentally get filled
+    # in"). Every value that differs, a blank on either side too, is listed.
+    first: Dict[str, Copy] = {}
     per_item = {f.name for f in schema.fields if f.per_item}
+    fields = [f.name for f in schema.fields if f.name != schema.id_field]
     for c in res.copies:
-        name = c.label
-        rows = [dict(r, **{SOURCE_COL: str(c.path)}) for r in c.rows]
-        added = ledger.add_samples(rows, source=str(c.path))
         key = c.part.lower()
-        if key in first_file:
-            said = set()
-            for label, col, old, new in added.conflicts:
-                per_flaw = col in per_item
-                if not per_flaw and col in said:      # a part's value, on every flaw row
+        kept = first.get(key)
+        if kept is None:
+            first[key] = c
+            ledger.add_samples([dict(r, **{SOURCE_COL: str(c.path)}) for r in c.rows],
+                               source=str(c.path))
+            continue
+        said = 0
+        for k_row, c_row in zip(kept.rows, c.rows):
+            item = c_row.get(schema.item_field, "") if schema.item_field else ""
+            for f in fields:
+                if f not in per_item and item and item != kept.rows[0].get(
+                        schema.item_field, ""):
+                    continue                      # a part's value: once, on its first row
+                old = xl_text(k_row.get(f, "")).strip()
+                new = xl_text(c_row.get(f, "")).strip()
+                if old == new:
                     continue
-                said.add(col)
-                res.problems.append(Problem(name, "same part as another file, different "
-                                                  "value", part=label if per_flaw else c.part,
-                                            field=col, kept=f"{old} ({first_file[key]})",
-                                            value=new))
-            if not added.conflicts:
-                res.problems.append(Problem(name, f"same part as {first_file[key]}, same "
-                                                  "values", part=c.part))
-        else:
-            first_file[key] = name
+                said += 1
+                res.problems.append(Problem(
+                    c.label, "same part as another file, different value"
+                    + ("" if old else " (blank in the kept file: left blank)"),
+                    part=f"{c.part} / {item}" if f in per_item and item else c.part,
+                    field=f, kept=f"{old or '(blank)'} ({kept.label})",
+                    value=new or "(blank)"))
+        if not said:
+            res.problems.append(Problem(c.label, f"same part as {kept.label}, same values: "
+                                                 "not added twice", part=c.part))
     res.merged = len(res.copies)
-    res.parts = len(first_file)
+    res.parts = len(first)
     say("writing the merged workbook", None)
     try:
         write_workbook(schema, ParentCSV(tmp_csv), res, folder, book_path)
@@ -434,12 +447,13 @@ def write_workbook(schema: TemplateSchema, ledger: ParentCSV, res: MergeResult,
             first = sheets[originals[0].title]
 
             def put(f, item: str, value) -> None:
+                # every field cell as the copy has it, a blank too: a value the
+                # template pre-fills does not come back where the copy has none
                 value = xl_text(value)
-                if value in (None, ""):
-                    return
                 cell = f.cells.get(item)
                 if cell:
-                    sheets.get(f.sheet, first)[cell].value = _typed(value)
+                    sheets.get(f.sheet, first)[cell].value = (
+                        None if value in (None, "") else _typed(value))
             for f in schema.fields:
                 if not f.per_item:
                     put(f, "", c.rows[0].get(f.name))
