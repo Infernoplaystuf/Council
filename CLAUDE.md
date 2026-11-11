@@ -191,6 +191,10 @@ same list.
   the best match whole): `examples/qt_apps/README.md`, read by
   `gui_reference.py`. Wireframe examples for Describe stay in `examples/gui/`
   (`gui_examples.py`).
+- The Ledger's "Merge filled copies…" (a folder of hand-filled copies of a
+  template merged into one workbook, a sheet per copy plus All data and Not
+  merged, kept as a Ledger for Analyze; the same label on two pages kept as
+  'Page 2: Date'): `docs/handoff/ledger_merge_2026-11-11.md`.
 - Council's own plugins (plugin.json shared with Typhon, kind "tab", all off
   until ticked in the Settings tab, guarded tab build, plugin data folder):
   `docs/handoff/app_plugins_2026-11-05.md`.

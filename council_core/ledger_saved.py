@@ -31,7 +31,7 @@ SUFFIX = ".ledger.json"
 INDEX_NAME = "ledgers.json"
 #: how each kind of run is said in the Runs window
 KINDS = {"extract": "Extract", "update": "Update with new files",
-         "rerun": "Re-run with my answers"}
+         "rerun": "Re-run with my answers", "merge": "Merge filled copies"}
 #: the Ledger tab's "Group by" choices -> how a saved Ledger is filed
 GROUPS = {"template": "Template", "project": "Project / program",
           "project+template": "Project, then template"}

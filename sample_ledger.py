@@ -293,14 +293,25 @@ def read_template(path, id_field: Optional[str] = None) -> TemplateSchema:
 
 def _dedupe(raw: List[TemplateField], id_name: str) -> List[TemplateField]:
     """Unique CSV headers: the same name twice keeps the first; a part-level
-    field whose plain name collides gets its section in front."""
+    field whose plain name collides gets its section in front. On a template
+    of several sheets (pages), one still colliding gets its sheet in front
+    ('Page 3: Date') instead of being dropped (user, 2026-11-05: a label on
+    two pages with no heading lost the second page's value)."""
     out: List[TemplateField] = []
     seen = set()
+    sheets = {f.sheet for f in raw}
+    first_sheet = {}
+    for f in raw:
+        first_sheet.setdefault(f.name.lower(), f.sheet)
     for f in raw:
         if f.name == id_name and id_name.lower() in seen:
             continue
+        plain = f.name
         if f.name.lower() in seen and f.section:
-            f.name = f"{f.section}: {f.name}"
+            f.name = f"{f.section}: {plain}"
+        if (f.name.lower() in seen and len(sheets) > 1 and f.sheet
+                and f.sheet != first_sheet.get(plain.lower())):
+            f.name = f"{f.sheet}: {plain}"
         if f.name.lower() in seen:
             continue
         seen.add(f.name.lower())

@@ -530,6 +530,15 @@ class LedgerTab(ViewHelpers, QWidget):
             "Where each field of the template is in the files the Connections graph read: "
             "the labels it goes by, which files have it, how many values and what they look "
             "like. ⟳ Build graph in Connections first.")
+        # copies of a template filled in by hand, merged into one workbook
+        # and kept as a Ledger to analyse (council_core.ledger_merge; user,
+        # 2026-11-11)
+        self.merge_btn = self._step_button(row, "Merge filled copies…", self.on_merge_window)
+        self.merge_btn.setToolTip(
+            "Merge a folder of copies of a template that were filled in by hand into one "
+            "workbook: an All data sheet, then each copy on a sheet of its own. No model: "
+            "each copy is read from the template's own cells. Kept as a Ledger, so "
+            "Analyze… works on it.")
         row.addStretch(1)
         grid.addLayout(row, 2, 1)
         outer.addWidget(g1)
@@ -1805,6 +1814,12 @@ class LedgerTab(ViewHelpers, QWidget):
         if self._saved is None:
             self.status.setText("No saved Ledger: run Extract once first.")
             return
+        if self._saved.settings.get("kind") == "merge":
+            # a merged Ledger: its folder merged again, not extracted
+            from council_core import ledger_merge
+            self._run("Merging the folder again",
+                      lambda p: ledger_merge.merge_again(csv, progress=p), self._merged)
+            return
         images = self.use_images.isChecked()
         vision = self._selected_vision_model()
         more = {}
@@ -1915,6 +1930,43 @@ class LedgerTab(ViewHelpers, QWidget):
             return
         self.groups_dialog = dlg
         dlg.show()
+
+    def on_merge_window(self) -> None:
+        """The Merge filled copies window (ledger_merge_dialog), the template
+        shown as its template; when a merge is done the tab shows the merged
+        Ledger."""
+        from .ledger_merge_dialog import MergeDialog
+        folder = ""
+        if self._saved is not None and self._saved.settings.get("kind") == "merge" \
+                and self._saved.sources:
+            folder = self._saved.sources[0]
+        dlg = MergeDialog(self, template=self.template.text().strip(), folder=folder,
+                          run=self._run_or_say, on_done=self._merged,
+                          on_analyze=self.on_analyze_window,
+                          opener=getattr(self.actions, "open", None))
+        self.merge_dialog = dlg
+        dlg.show()
+
+    def _run_or_say(self, title: str, step: Callable, done: Callable,
+                    after: Optional[Callable] = None) -> None:
+        """_run, or - while another step runs - its ``after`` told why not."""
+        if self.busy:
+            if after is not None:
+                after("error: the Ledger is busy with another step; merge once it is done")
+            return
+        self._run(title, step, done, after=after)
+
+    def _merged(self, res) -> None:
+        """A merge done: its Ledger shown in the tab, added to the
+        Connections graph, said in the log."""
+        self.template.setText(res.template)
+        self.csv.setText(res.csv)
+        self.review.setText("")
+        self._say(res.describe())
+        self.status.setText(res.describe().splitlines()[0])
+        self._register(res.csv, again=True)
+        self._on_csv_changed()
+        self.refresh_saved()
 
     def on_analyze_window(self) -> None:
         """The Analyze window (ledger_analytics_dialog) over the parent CSV
