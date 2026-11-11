@@ -50,12 +50,26 @@ No guessing: by the cells `sample_ledger.read_template` found for each field.
   on the skip list (`file_guard.read`, tab "Ledger"), a merged workbook the
   Council made. Excel's `~$` lock files and non-Excel files are ignored.
 * No part number: named after the file, and said so.
-* A part in two copies: the parent CSV keeps the first copy's values (file
-  name order); every value the other differs on is on Not merged (a
-  part-level value once, not once per flaw row). Both copies keep their own
-  sheet (`S-3`, `S-3 (2)`).
+* A part in two copies: the parent CSV holds the first copy's values only
+  (file name order), **blanks included**; every value the other differs on,
+  a blank on either side too ("blank in the kept file: left blank"), is on
+  Not merged (a part-level value once, not once per flaw row). Both copies
+  keep their own sheet (`S-3`, `S-3 (2)`).
 * Never written over: a CSV the merge did not make, or a workbook the
   Council did not write.
+
+## Nothing is filled in (Andy, 2026-11-11)
+
+"The filled copies may not be completely filled so I don't want anything to
+accidentally get filled in through hallucinations." The merge reads cells
+only: no model, no Extract (a test checks neither module is imported by the
+merge or its window), no forward-fill. A blank stays blank in the parent
+CSV, on All data and on the copy's sheet: each copy's sheet writes every
+field cell as the copy has it, a blank too, so text the template itself
+holds in a field cell does not come back where the copy cleared it.
+Analyze counts blanks as missing (coverage, summary counts, missing by
+part). The one value the merge supplies is a part number for a copy with
+none (the file name), and that is listed on Not merged.
 
 ## Fix that came with it
 
