@@ -46,8 +46,15 @@ No guessing: by the cells `sample_ledger.read_template` found for each field.
   fine. The window's "Skip files that match less than …%" changes it (50 to
   100); it is saved with the merged Ledger and used again by Update with new
   files. A file under it is listed as "skipped: matches 62% of the
-  template's layout (needs 75%)". The share counts labels, not filled
-  values, so a partly filled copy is not skipped for its blanks.
+  template's layout (needs 75%)", then the first template labels it is
+  missing. The share counts the template's own labels and headings only
+  (`label_layout`; Andy, 2026-11-11: "the check looks at all values and not
+  just the headers"): text typed into the template, not a formula's result
+  (an AVERAGE over blanks reads '#DIV/0!' in the template and a number in a
+  copy) and not a field's value cell (a placeholder or pre-filled value a
+  copy types over). Blank cells never count, so a partly filled copy is not
+  skipped for its blanks. Extract's filled-copy check
+  (`ledger_examples.template_layout`) is unchanged.
 * Template of one sheet: **every** sheet laid out like it is a copy, so a
   workbook with a filled sheet per part gives each part (labelled
   `file.xlsx [sheet]`).
