@@ -607,3 +607,18 @@ def test_a_contradiction_with_wrong_section_numbers_is_placed_by_its_quotes(tmp_
 
 def test_yes_and_no_in_a_decision_list_are_not_names():
     assert wr.names_in("1. Do you work inside a JEDD? → If NO, no JEDD tax.") == []
+
+
+def test_possessives_tables_acronyms_and_sentence_starts_are_not_false_alarms():
+    pages = {1: "The IRS sets the HDHP minimum. See the RITA website FAQ. "
+                "The Federal Reserve raised rates. Cold-climate heat pump (CCHP) units."}
+    text = ("You need an IRS HDHP plan [1]. Read the RITA FAQ [1]. The Federal Reserve's "
+            "policy mattered [1]. Because CCHPs keep working [1].\n"
+            "| Index | Typical Threshold |\n\nPrime with Mephiston Black [1].")
+    out, moved, missing = wr.ground_names(text, pages)
+    assert missing == 1 and "Mephiston Black (not in the sources)" in out
+    assert out.count("(not in the sources)") == 1
+
+
+def test_a_possessive_splits_a_name():
+    assert wr.names_in("It won Acme Fox's ENERGY STAR award.") == ["Acme Fox", "ENERGY STAR"]

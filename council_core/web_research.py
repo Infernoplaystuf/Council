@@ -521,7 +521,9 @@ def normalise_citations(text: str) -> str:
 _NAME_LEAD = set("""a an and the or of for with to in on at by from use using
 apply add start then try mix thin finish base layer glaze wash drybrush paint
 prime seal keep avoid citadel vallejo game color colour air model army painter
-warpaints scale75 ak tamiya if when then yes no not otherwise else""".split())
+warpaints scale75 ak tamiya if when then yes no not otherwise else because
+since while although these this that those each every both some many most our
+your their its""".split())
 _NAME = re.compile(r"\b[A-Z][A-Za-z0-9'’-]*(?:\s+[A-Z][A-Za-z0-9'’-]*){1,3}")
 
 
@@ -533,7 +535,7 @@ def names_in(text: str, known: str = "") -> List[str]:
     out = []
     known = known.lower()
     for line in text.splitlines():
-        if line.lstrip().startswith("#"):                      # a heading
+        if line.lstrip().startswith(("#", "|")):               # a heading, a table
             continue
         body = re.sub(r"\*\*[^*]+\*\*:?", " ", line)          # bold labels
         body = re.sub(r"^\s*(?:[-*]|\d+[.)])?\s*", "", body)    # list marks
@@ -543,9 +545,11 @@ def names_in(text: str, known: str = "") -> List[str]:
             words = m.group(0).split()
             while words and words[0].lower() in _NAME_LEAD:
                 words = words[1:]
-            name = " ".join(words).strip("'’-")
-            if len(name.split()) >= 2 and name.lower() not in known:
-                out.append(name)
+            # a possessive ends a name: "Fox's ENERGY STAR" is two
+            for part in re.split(r"['’]s(?:\s+|$)", " ".join(words)):
+                name = part.strip("'’- ")
+                if len(name.split()) >= 2 and name.lower() not in known:
+                    out.append(name)
     return list(dict.fromkeys(out))
 
 
@@ -557,15 +561,29 @@ def ground_names(text: str, pages: Dict[int, str], known: str = "") -> Tuple[str
     the sources)". Returns (text, names re-credited, names not found)."""
     low = {n: t.lower() for n, t in pages.items()}
     moved = missing = 0
+
+    def has(page: str, name: str) -> bool:
+        """The page names it: as written, or without a plural s; a name
+        with an acronym in it (IRS HDHP, RITA FAQ, CD4) when the page has
+        each of its words (false alarms in a ten-question test, 2026-11-11)."""
+        key = name.lower()
+        if key in page or (key.endswith("s") and key[:-1] in page):
+            return True
+        words = name.split()
+        if any(sum(c.isupper() for c in w) > 1 or (any(c.isdigit() for c in w)
+                                                    and any(c.isupper() for c in w))
+               for w in words):
+            return all(re.sub(r"s$", "", w.lower()) in page for w in words)
+        return False
+
     blocks = re.split(r"(\n\s*\n)", text)
     for i in range(0, len(blocks), 2):
         block = blocks[i]
         cites = {int(x) for x in _CITE.findall(block)}
         for name in names_in(block, known):
-            key = name.lower()
-            if any(key in low.get(c, "") for c in cites):
+            if any(has(low.get(c, ""), name) for c in cites):
                 continue
-            having = [n for n, t in sorted(low.items()) if key in t]
+            having = [n for n, t in sorted(low.items()) if has(t, name)]
             if having:
                 block = block.rstrip() + f" [{having[0]}]"
                 cites.add(having[0])
