@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -55,9 +56,23 @@ PULL_WAIT = 900
 
 Progress = Callable[[str], None]
 
+#: bumped when SETTINGS_YML changes, so setup brings an older file up to date
+CONFIG_VERSION = 3
+CONFIG_MARK = "# council-searxng-config "
+#: general web engines SearXNG ships switched off, switched on here. With
+#: only its defaults, a day of research (about 50 searches, 2026-11-11)
+#: got Brave and Google suspended for too many requests and DuckDuckGo
+#: answering with a CAPTCHA, and every search came back empty; more engines
+#: spread the searches so one engine's limit does not empty the results.
+#: (mwmbl and yep were tried and dropped: with the big engines suspended,
+#: a question about event cameras got car-price and sports pages.)
+EXTRA_ENGINES = ("bing", "qwant", "mojeek", "yahoo")
+
 SETTINGS_YML = """# Written by Council (council_core/searxng.py). SearXNG's own defaults,
-# with JSON answers for Council and no rate limiter: the port is bound to
-# 127.0.0.1 only, so nothing but this PC can reach it.
+# with JSON answers for Council, no rate limiter (the port is bound to
+# 127.0.0.1 only, so nothing but this PC can reach it), and more general
+# web engines switched on.
+{mark}{version}
 use_default_settings: true
 server:
   secret_key: "{key}"
@@ -68,7 +83,16 @@ search:
   formats:
     - html
     - json
+engines:
+{engines}
 """
+
+
+def settings_yml(key: str) -> str:
+    engines = "\n".join(f"  - name: {e}\n    disabled: false\n    inactive: false"
+                        for e in EXTRA_ENGINES)
+    return SETTINGS_YML.format(mark=CONFIG_MARK, version=CONFIG_VERSION,
+                               key=key, engines=engines)
 
 
 class SearxngError(RuntimeError):
@@ -87,16 +111,27 @@ def config_dir() -> Path:
     return paths.app_dir() / CONFIG_DIR
 
 
-def write_config(folder: Optional[Path] = None) -> Path:
-    """settings.yml, written once; a later setup keeps its secret key."""
+def write_config(folder: Optional[Path] = None) -> bool:
+    """settings.yml: written the first time, and again when Council's
+    template is newer than the one in the file (keeping its secret key). A
+    file not written by Council is left alone. True when it was written."""
     folder = folder or config_dir()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "settings.yml"
-    if not path.exists():
-        tmp = path.with_suffix(".yml.tmp")
-        tmp.write_text(SETTINGS_YML.format(key=secrets.token_hex(32)), encoding="utf-8")
-        os.replace(tmp, path)
-    return path
+    key = secrets.token_hex(32)
+    if path.exists():
+        old = path.read_text(encoding="utf-8", errors="replace")
+        if "Written by Council" not in old:
+            return False
+        m = re.search(re.escape(CONFIG_MARK) + r"(\d+)", old)
+        if m and int(m.group(1)) >= CONFIG_VERSION:
+            return False
+        k = re.search(r'secret_key:\s*"([^"]+)"', old)
+        key = k.group(1) if k else key
+    tmp = path.with_suffix(".yml.tmp")
+    tmp.write_text(settings_yml(key), encoding="utf-8")
+    os.replace(tmp, path)
+    return True
 
 
 def _docker() -> str:
@@ -172,9 +207,15 @@ def setup(on_progress: Optional[Progress] = None) -> web.Settings:
         raise SearxngError("Docker Desktop is not running: start it, wait "
                            "until it says it is running, then try again.")
     folder = config_dir()
-    write_config(folder)
+    changed = write_config(folder)
     state = _state(docker)
-    if state == "running":
+    if state == "running" and changed:
+        say("Restarting SearXNG with Council's newer settings…")
+        done = _run([docker, "restart", CONTAINER], 120)
+        if done.returncode != 0:
+            raise SearxngError(f"Docker could not restart {CONTAINER}: "
+                               f"{(done.stderr or done.stdout).strip()[:300]}")
+    elif state == "running":
         say("SearXNG is already running…")
     elif state:
         say("Starting SearXNG…")

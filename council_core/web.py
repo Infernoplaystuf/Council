@@ -28,7 +28,10 @@ WHAT GOES OUT
   * robots.txt is read (and kept for the run) and a page it disallows is not
     fetched.
   * A page is cut at MAX_BYTES; only text-like pages (HTML, plain text,
-    Markdown, JSON) are read.
+    Markdown, JSON) and PDFs are read. A PDF (up to MAX_PDF_BYTES, its first
+    MAX_PDF_PAGES pages) is read as text with pypdf - datasheets, manuals and
+    tax forms are often only PDFs (seen 2026-11-11); an encrypted or broken
+    PDF is skipped with a sentence saying so.
 
 Search engines (``search``):
   * "searxng" (default): a SearXNG server, no key or account - by default
@@ -81,6 +84,10 @@ DDG_BLOCKED = ("DuckDuckGo showed its bot check instead of results, so it is "
 USER_AGENT = "CouncilResearch/1.0 (+offline-first desktop app; one page at a time)"
 #: a page is read up to this many bytes, then cut
 MAX_BYTES = 2_000_000
+#: a PDF is read up to this many bytes (they run larger than pages) ...
+MAX_PDF_BYTES = 15_000_000
+#: ... and up to this many of its pages
+MAX_PDF_PAGES = 60
 #: seconds a request may take
 TIMEOUT = 20
 #: content types read as text
@@ -188,6 +195,7 @@ class Page:
     text: str                    # the body, decoded
     fetched: str = ""            # ISO time, UTC
     cut: bool = False            # longer than MAX_BYTES
+    title: str = ""              # a PDF's own title, when it has one
 
 
 def now_iso() -> str:
@@ -212,7 +220,8 @@ def _opener():
 
 
 def _open(url: str, headers: Optional[Dict[str, str]] = None,
-          timeout: float = TIMEOUT) -> Tuple[Any, bytes, bool]:
+          timeout: float = TIMEOUT,
+          max_bytes: int = MAX_BYTES) -> Tuple[Any, bytes, bool]:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
                                                "Accept-Language": "en",
                                                **(headers or {})})
@@ -225,8 +234,8 @@ def _open(url: str, headers: Optional[Dict[str, str]] = None,
     except (TimeoutError, OSError) as exc:
         raise WebError(f"could not reach {_host(url)}: {exc}") from None
     with resp:
-        body = resp.read(MAX_BYTES + 1)
-    return resp, body[:MAX_BYTES], len(body) > MAX_BYTES
+        body = resp.read(max_bytes + 1)
+    return resp, body[:max_bytes], len(body) > max_bytes
 
 
 def _host(url: str) -> str:
@@ -275,15 +284,52 @@ def fetch(url: str, *, robots: Optional[Robots] = None) -> Page:
     if robots is not None and not robots.allowed(url):
         raise WebError(f"{_host(url)} asks crawlers not to read that page "
                        f"(robots.txt), so it was skipped")
-    resp, body, cut = _open(url)
+    resp, body, cut = _open(url, max_bytes=MAX_PDF_BYTES)
     ctype = resp.headers.get("Content-Type", "") or ""
+    if "application/pdf" in ctype.lower() or body[:5] == b"%PDF-":
+        if cut:
+            raise WebError(f"{_host(url)} sent a PDF over "
+                           f"{MAX_PDF_BYTES // 1_000_000} MB, too large to read")
+        title, text = pdf_text(body, _host(url))
+        return Page(url=url, final_url=resp.geturl() or url,
+                    status=getattr(resp, "status", 200) or 200,
+                    content_type="application/pdf", text=text,
+                    fetched=now_iso(), title=title)
     if ctype and not any(t in ctype.lower() for t in TEXT_TYPES):
         raise WebError(f"{_host(url)} sent {ctype.split(';')[0]}, not a "
                        f"web page Council can read")
+    cut = cut or len(body) > MAX_BYTES
+    body = body[:MAX_BYTES]
     return Page(url=url, final_url=resp.geturl() or url,
                 status=getattr(resp, "status", 200) or 200,
                 content_type=ctype, text=_decode(body, ctype),
                 fetched=now_iso(), cut=cut)
+
+
+def pdf_text(body: bytes, site: str = "") -> Tuple[str, str]:
+    """(title, text) of a PDF, with pypdf: its first MAX_PDF_PAGES pages,
+    one paragraph break between pages. Nothing in the PDF is run."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(body))
+        if reader.is_encrypted:
+            raise WebError(f"{site}: the PDF is locked, so it was not read")
+        parts = []
+        for page in reader.pages[:MAX_PDF_PAGES]:
+            parts.append(page.extract_text() or "")
+        title = ""
+        try:
+            title = str((reader.metadata or {}).get("/Title") or "").strip()
+        except Exception:                                # noqa: BLE001
+            title = ""
+    except WebError:
+        raise
+    except ImportError:
+        raise WebError("reading PDFs needs pypdf (pip install pypdf)") from None
+    except Exception as exc:                             # noqa: BLE001
+        raise WebError(f"{site}: the PDF could not be read ({type(exc).__name__})") from None
+    return title[:300], "\n\n".join(p.strip() for p in parts if p.strip())
 
 
 # ======================================================================
@@ -386,7 +432,7 @@ def read_page(page: Page) -> Article:
     site = _host(page.final_url or page.url)
     if "html" not in ctype and not page.text.lstrip()[:200].lower().startswith(
             ("<!doctype html", "<html")):
-        return Article(title=site, text=_tidy(page.text), site=site)
+        return Article(title=page.title or site, text=_tidy(page.text), site=site)
     r = _Reader()
     try:
         r.feed(page.text)
@@ -479,9 +525,18 @@ def _search_searxng(q: str, base: str) -> List[Hit]:
     except ValueError:
         raise WebError("the SearXNG server did not answer in JSON - switch on "
                        "the json format in its settings.yml") from None
-    return [Hit(url=r.get("url", ""), title=r.get("title", ""),
+    hits = [Hit(url=r.get("url", ""), title=r.get("title", ""),
                 snippet=r.get("content", ""))
             for r in doc.get("results") or [] if str(r.get("url", "")).startswith("http")]
+    down = doc.get("unresponsive_engines") or []
+    if not hits and down:
+        # every engine it asked refused (rate limits, a CAPTCHA): say which,
+        # rather than "found nothing"
+        said = ", ".join(f"{e[0]} ({e[1]})" if isinstance(e, (list, tuple)) and len(e) > 1
+                         else str(e) for e in down[:6])
+        raise WebError(f"SearXNG's search engines are not answering ({said}); "
+                       f"they usually allow searches again within an hour")
+    return hits
 
 
 def _search_duckduckgo(q: str) -> List[Hit]:

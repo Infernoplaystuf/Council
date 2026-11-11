@@ -90,9 +90,36 @@ def test_a_container_already_made_is_started_not_made_again(docker):
 
 
 def test_the_config_keeps_its_secret_key(tmp_path):
-    first = searxng.write_config(tmp_path).read_text(encoding="utf-8")
-    again = searxng.write_config(tmp_path).read_text(encoding="utf-8")
-    assert first == again and "secret_key" in first
+    assert searxng.write_config(tmp_path) is True
+    first = (tmp_path / "settings.yml").read_text(encoding="utf-8")
+    assert searxng.write_config(tmp_path) is False
+    assert (tmp_path / "settings.yml").read_text(encoding="utf-8") == first
+    assert "secret_key" in first and "- name: bing" in first
+
+
+def test_an_older_council_config_is_brought_up_to_date_with_its_key(tmp_path):
+    (tmp_path / "settings.yml").write_text(
+        '# Written by Council (council_core/searxng.py).\nuse_default_settings: true\n'
+        'server:\n  secret_key: "abc123"\n', encoding="utf-8")
+    assert searxng.write_config(tmp_path) is True
+    new = (tmp_path / "settings.yml").read_text(encoding="utf-8")
+    assert 'secret_key: "abc123"' in new and "- name: qwant" in new
+
+
+def test_a_config_someone_else_wrote_is_left_alone(tmp_path):
+    (tmp_path / "settings.yml").write_text("use_default_settings: true\n", encoding="utf-8")
+    assert searxng.write_config(tmp_path) is False
+
+
+def test_a_running_server_restarts_when_its_config_is_updated(docker):
+    web.set_online(True)
+    docker.state = "running"
+    searxng.config_dir().mkdir(parents=True, exist_ok=True)
+    (searxng.config_dir() / "settings.yml").write_text(
+        '# Written by Council (council_core/searxng.py).\nserver:\n  secret_key: "k"\n',
+        encoding="utf-8")
+    searxng.setup()
+    assert ["restart", searxng.CONTAINER] in docker.calls
 
 
 @pytest.fixture

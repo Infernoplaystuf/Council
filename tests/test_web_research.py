@@ -112,7 +112,8 @@ def fake_chat(messages, num_predict=None, schema=None):
     system = messages[0]["content"]
     if system.startswith("You plan web research"):
         return json.dumps({"questions": ["Which colours make a flame",
-                                         "How to add soot to a flamer"]})
+                                         "How to add soot to a flamer"],
+                           "key_terms": ["flamer"]})
     assert "untrusted data" in system
     # cites a source it was given and one it was not
     return "Glaze from yellow to red over a white undercoat [1][9]. Done."
@@ -446,22 +447,26 @@ def test_sections_do_not_all_get_the_same_passages(online, tmp_path):
         if messages[0]["content"].startswith("You plan web research"):
             return json.dumps({"questions": ["flame colours yellow red",
                                              "soot on the barrel"]})
+        if messages[0]["content"].startswith("You check a research report"):
+            return json.dumps({"conflicts": []})
         given.append(messages[1]["content"].split("The user's question")[0])
         return "Glaze it [1]."
     wr.research("How do I paint flamethrower effects", tmp_path / "v", chat)
     assert len(given) == 2 and given[0] != given[1]
 
 
-def test_one_site_gives_at_most_two_pages_and_video_sites_are_not_read(online, tmp_path, monkeypatch):
-    farm = [web.Hit(f"{online}/guide?a={i}", "Farm") for i in range(4)]
+def test_a_sites_third_page_waits_for_other_sites_and_video_sites_are_not_read(online, tmp_path, monkeypatch):
+    farm = [web.Hit(f"{online}/guide?a={i}", "Flamer farm") for i in range(4)]
+    other = [web.Hit(online.replace("127.0.0.1", "localhost") + "/smoke", "Flamer smoke")]
     social = [web.Hit("https://www.youtube.com/watch?v=x", "Video"),
               web.Hit("https://www.facebook.com/groups/1/posts/2", "Post")]
-    monkeypatch.setattr(web, "search", lambda q, limit=6: social + farm)
+    monkeypatch.setattr(web, "search", lambda q, limit=6: social + farm + other)
     fetched = []
     real = web.fetch
     monkeypatch.setattr(web, "fetch", lambda url, **k: fetched.append(url) or real(url, **k))
-    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat)
-    assert len(run.sources) == wr.MAX_PER_SITE
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat,
+                      max_pages=3)
+    assert [s.site.split(":")[0] for s in run.sources] == ["127.0.0.1", "127.0.0.1", "localhost"]
     assert not any("youtube" in u or "facebook" in u for u in fetched)
     assert any(x.startswith("video or social sites, not read: ") for x in run.skipped)
 
@@ -485,3 +490,120 @@ def test_a_name_is_credited_to_the_page_that_has_it_or_marked():
     assert (moved, missing) == (1, 1)
     assert "Magos Purple [2]. [1]" in out
     assert "Mephiston Black (not in the sources) [1]" in out
+
+
+# -- fixes from the four-question review (2026-11-11) ---------------------------------
+def test_a_crashed_model_call_is_tried_again(monkeypatch):
+    monkeypatch.setattr(wr, "RETRY_WAIT", 0)
+    calls = []
+
+    def flaky(messages, num_predict=None, schema=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("llama-server process has terminated")
+        return json.dumps({"questions": ["a sub question", "another one"]})
+    assert wr.plan("How do I trigger a camera", flaky) == ["a sub question", "another one"]
+    assert len(calls) == 2
+
+
+def test_the_plan_asks_only_for_what_was_asked():
+    assert "unless the question asks for them" in wr.PLAN_SYSTEM
+    assert "mistakes to avoid -" not in wr.PLAN_SYSTEM
+
+
+def test_one_site_gives_more_pages_when_no_other_site_has_any(online, tmp_path, monkeypatch):
+    docs = [web.Hit(f"{online}/guide?p={i}", "Docs") for i in range(5)]
+    monkeypatch.setattr(web, "search", lambda q, limit=6: docs)
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat,
+                      max_pages=4)
+    assert len(run.sources) == 4
+
+
+def test_a_pdf_is_read_as_text():
+    from pypdf import PdfWriter
+    import io
+    w = PdfWriter()
+    w.add_blank_page(200, 200)
+    w.add_metadata({"/Title": "Trigger manual"})
+    buf = io.BytesIO()
+    w.write(buf)
+    title, text = web.pdf_text(buf.getvalue(), "docs.example")
+    assert title == "Trigger manual" and text == ""
+    with pytest.raises(web.WebError, match="could not be read"):
+        web.pdf_text(b"%PDF-1.4 broken", "docs.example")
+
+
+def test_contradicting_sections_are_marked(tmp_path):
+    run = wr.Run(question="Who pays the JEDD tax", folder=str(tmp_path),
+                 sub_questions=["who", "how much"])
+    run.sections = [wr.Section("Who pays", "Employees who work in the district pay it [1]. Done."),
+                    wr.Section("How much", "The tax is paid by the business, not by employees [2].")]
+
+    def chat(messages, num_predict=None, schema=None):
+        assert messages[0]["content"].startswith("You check a research report")
+        return json.dumps({"conflicts": [
+            {"section_a": 1, "quote_a": "Employees who work in the district pay it",
+             "section_b": 2, "quote_b": "not by employees", "supported": "a"},
+            {"section_a": 1, "quote_a": "a statement that is not there",
+             "section_b": 2, "quote_b": "paid by the business", "supported": "b"}]})
+    assert wr.check_sections(run, chat, []) == 1
+    assert "not by employees [2]. ⚠ (section 1 says otherwise; the sources support section 1)"         in run.sections[1].text
+    assert "⚠" not in run.sections[0].text
+    assert "Section 1 contradicts this part" in run.sections[1].note
+
+
+def test_searxng_engines_that_all_refuse_are_named(monkeypatch):
+    web.save(web.Settings(online=True, search="searxng", searxng_url="http://127.0.0.1:9"))
+    body = json.dumps({"results": [], "unresponsive_engines": [
+        ["brave", "Suspended: too many requests"], ["duckduckgo", "CAPTCHA"]]}).encode()
+    monkeypatch.setattr(web, "_open", lambda *_a, **_k: (None, body, False))
+    with pytest.raises(web.WebError, match=r"brave \(Suspended: too many requests\), duckduckgo \(CAPTCHA\)"):
+        web._search_searxng("q", "http://127.0.0.1:9")
+
+
+def test_key_terms_are_guessed_from_names_and_acronyms():
+    assert wr.guess_terms("How does a Joint Economic Development District (JEDD) "
+                          "income tax work in Ohio?")[0] == "JEDD"
+    assert wr.guess_terms("What are Prophesee event cameras?") == ["Prophesee"]
+
+
+def test_pages_off_the_subject_are_not_used(online, tmp_path, monkeypatch):
+    def chat(messages, num_predict=None, schema=None):
+        if messages[0]["content"].startswith("You plan web research"):
+            return json.dumps({"questions": ["q one", "q two"], "key_terms": ["soot"]})
+        return "Soot it [1]."
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", chat)
+    assert [s.url.rsplit("/", 1)[1] for s in run.sources] == ["smoke"]
+    assert any(x.startswith("off the subject (no mention of soot)") for x in run.skipped)
+
+
+def test_a_result_that_looks_off_the_subject_is_read_last(online, tmp_path, monkeypatch):
+    hits = [web.Hit(f"{online}/guide?x=1", "Cheap cars"),
+            web.Hit(online.replace("127.0.0.1", "localhost") + "/smoke", "Flamer soot")]
+    monkeypatch.setattr(web, "search", lambda q, limit=6: hits)
+    run = wr.research("How do I paint flamethrower effects", tmp_path / "v", fake_chat)
+    assert [s.site.split(":")[0] for s in run.sources] == ["localhost", "127.0.0.1"]
+
+
+def test_key_terms_match_any_dash_and_word_stems():
+    assert wr.on_topic("Plot the X-bar and R chart", ["X‑bar R chart"])
+    assert wr.on_topic("a scorched barrel of hot metal", ["heat-scorched metal"]) is False
+    assert wr.on_topic("heat scorched the metal", ["heat-scorched metal"])
+    assert not wr.on_topic("cheap used cars", ["Prophesee", "event camera"])
+
+
+def test_a_contradiction_with_wrong_section_numbers_is_placed_by_its_quotes(tmp_path):
+    run = wr.Run(question="Who pays", folder=str(tmp_path))
+    run.sections = [wr.Section("Who", "Employees who work there pay it [1]."),
+                    wr.Section("How", "It is paid by the business, not by employees [2].")]
+
+    def chat(messages, num_predict=None, schema=None):
+        return json.dumps({"conflicts": [
+            {"section_a": 2, "quote_a": "Employees who work there pay it",
+             "section_b": 2, "quote_b": "not by employees", "supported": "a"}]})
+    assert wr.check_sections(run, chat, []) == 1
+    assert "⚠ (section 1 says otherwise" in run.sections[1].text
+
+
+def test_yes_and_no_in_a_decision_list_are_not_names():
+    assert wr.names_in("1. Do you work inside a JEDD? → If NO, no JEDD tax.") == []
