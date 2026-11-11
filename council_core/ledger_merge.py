@@ -47,6 +47,10 @@ KIND = "merge"
 EXCEL = (".xlsx", ".xlsm")
 #: Excel files openpyxl cannot read: listed with what to do
 OLD_EXCEL = (".xls", ".xlsb")
+#: the share of the template's words a copy's sheet must have in the same
+#: cells to be read as a copy (Andy, 2026-11-11: skip files that don't match
+#: at least 75% of the template); the merge window can change it
+MIN_MATCH = 0.75
 ALL_DATA = "All data"
 NOT_MERGED = "Not merged"
 FILE_COL = "File"
@@ -158,15 +162,26 @@ def _cells(ws) -> Dict[Tuple[int, int], Any]:
             if c.value is not None}
 
 
+def layout_share(cells: Dict[Tuple[int, int], Any], words: Dict[Tuple[int, int], str]) -> float:
+    """The share of the template sheet's words this sheet has in the same
+    cells (0..1)."""
+    from council_core.ledger_examples import _norm
+    if not words:
+        return 0.0
+    return sum(1 for rc, w in words.items() if _norm(cells.get(rc)) == w) / len(words)
+
+
 def match_sheets(cells: Dict[str, Dict[Tuple[int, int], Any]],
                  layout: Dict[str, Dict[Tuple[int, int], str]],
-                 template_sheets: Sequence[str]) -> Dict[str, str]:
-    """Template sheet -> the copy's sheet laid out like it: the one of the
-    same name when its words are in place, else the best laid-out one not
-    taken yet. A template sheet with too few words to tell (a blank page)
-    takes the copy's sheet of the same name, or the one in the same place.
+                 template_sheets: Sequence[str],
+                 min_share: float = MIN_MATCH) -> Dict[str, str]:
+    """Template sheet -> the copy's sheet laid out like it (``min_share`` of
+    the template's words in the same cells): the one of the same name when
+    it is, else the best laid-out one not taken yet. A template sheet with
+    too few words to tell (a blank page) takes the copy's sheet of the same
+    name, or the one in the same place.
     ``cells``: the copy's sheets (title -> {(row, col): value}), in order."""
-    from council_core.ledger_examples import LAYOUT_MIN_WORDS, is_filled_copy
+    from council_core.ledger_examples import LAYOUT_MIN_WORDS
     names = list(cells)
     out: Dict[str, str] = {}
     for i, t in enumerate(template_sheets):
@@ -178,13 +193,18 @@ def match_sheets(cells: Dict[str, Dict[Tuple[int, int], Any]],
             elif i < len(names) and names[i] in free:
                 out[t] = names[i]
             continue
-        one = {t: words}
-        order = ([t] if t in free else []) + [n for n in free if n != t]
-        for n in order:
-            if is_filled_copy(cells[n], one):
-                out[t] = n
-                break
+        shares = {n: layout_share(cells[n], words) for n in free}
+        if t in shares and shares[t] >= min_share:
+            out[t] = t
+            continue
+        best = max(shares, key=shares.get, default=None)
+        if best is not None and shares[best] >= min_share:
+            out[t] = best
     return out
+
+
+def best_share(cells: Dict[str, Dict[Tuple[int, int], Any]], words) -> float:
+    return max((layout_share(c, words) for c in cells.values()), default=0.0)
 
 
 def _entered(schema: TemplateSchema, rows: List[Dict[str, str]]) -> int:
@@ -219,8 +239,8 @@ def _rows_from(schema: TemplateSchema, ws_of: Dict[str, Any]) -> List[Dict[str, 
     return rows
 
 
-def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path
-                ) -> Tuple[List[Copy], List[Problem]]:
+def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
+                min_share: float = MIN_MATCH) -> Tuple[List[Copy], List[Problem]]:
     """The filled copies in one workbook, read by the template's cells, and
     what to say about it. A template of one sheet: every sheet laid out like
     it is a copy (a workbook with a sheet per part). Of several sheets: one
@@ -236,17 +256,19 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path
             return [], [Problem(name, "a merged workbook the Council made, not a copy")]
         tsheets = list(dict.fromkeys(f.sheet for f in schema.fields))
         cells = {ws.title: _cells(ws) for ws in wb.worksheets}
-        found = match_sheets(cells, layout, tsheets)
+        found = match_sheets(cells, layout, tsheets, min_share)
         id_sheet = schema.field(schema.id_field).sheet
         if id_sheet not in found:
-            return [], [Problem(name, "its layout differs from the template (the "
-                                      "template's words are not in the same cells): "
-                                      "read it with Extract instead")]
+            got = best_share(cells, layout.get(id_sheet, {}))
+            return [], [Problem(name, f"skipped: matches {got:.0%} of the template's layout "
+                                      f"(needs {min_share:.0%}); read it with Extract "
+                                      "instead")]
         sets = [found]
         if len(tsheets) == 1:                # more sheets laid out like the template
             rest = [t for t in cells if t != found[id_sheet]]
             while rest:
-                more = match_sheets({t: cells[t] for t in rest}, layout, tsheets)
+                more = match_sheets({t: cells[t] for t in rest}, layout, tsheets,
+                                    min_share)
                 if id_sheet not in more:
                     break
                 sets.append(more)
@@ -304,18 +326,23 @@ def _swap_in(tmp_csv: Path, csv: Path, schema: TemplateSchema) -> None:
 
 
 def merge(template, folder, out_dir=None, *, recursive: bool = True,
+          min_match: float = MIN_MATCH,
           progress: Optional[Callable[..., None]] = None,
           cancel=None) -> MergeResult:
     """Every filled copy of ``template`` under ``folder`` into one parent CSV
     and one workbook in ``out_dir`` (default: '<folder> merged' beside it).
     ``progress(text, fraction)``; ``cancel`` an Event (or anything with
-    is_set) to stop between files."""
+    is_set) to stop between files. ``min_match``: the share of the
+    template's layout a copy must match (0..1); a file under it is skipped
+    and listed with its share."""
     from council_core import file_guard
     from council_core.ledger_examples import template_layout
     template, folder = Path(template), Path(folder)
     out_dir = Path(out_dir) if out_dir else default_out_dir(folder)
     if not template.is_file():
         raise LedgerError(f"template not found: {template}")
+    if not 0 < min_match <= 1:
+        raise LedgerError(f"the layout match must be between 1% and 100%, not {min_match:.0%}")
     if out_dir.resolve() == folder.resolve() or folder.resolve() in out_dir.resolve().parents:
         raise LedgerError("save the merge outside the folder of copies, so it is not read "
                           "as a copy the next time")
@@ -332,7 +359,8 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
         say(f"reading {path.name}", (i + 1) / (len(books) + 1))
         try:
             copies, notes = file_guard.read(
-                path, lambda p=path: read_copies(schema, layout, p, folder), tab="Ledger")
+                path, lambda p=path: read_copies(schema, layout, p, folder, min_match),
+                tab="Ledger")
         except file_guard.Skipped as e:
             copies, notes = [], [Problem(_rel(path, folder), str(e))]
         res.problems.extend(notes)
@@ -403,7 +431,7 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
         for stale in (tmp_csv, schema_path_for(tmp_csv)):
             if stale.exists():
                 stale.unlink()
-    _save_ledger(res, recursive)
+    _save_ledger(res, recursive, min_match)
     return res
 
 
@@ -509,14 +537,15 @@ def write_workbook(schema: TemplateSchema, ledger: ParentCSV, res: MergeResult,
 
 
 # ── saved as a Ledger ───────────────────────────────────────────────────
-def _save_ledger(res: MergeResult, recursive: bool) -> None:
+def _save_ledger(res: MergeResult, recursive: bool, min_match: float = MIN_MATCH) -> None:
     """On the list of saved Ledgers, with a run per merge; its folder is
     merged again by "Update with new files"."""
     from council_core import ledger_saved
     led = ledger_saved.load(res.csv) or ledger_saved.SavedLedger(csv=res.csv)
     led.template = res.template
     led.sources = [res.folder]
-    led.settings = {"kind": KIND, "recursive": bool(recursive), "workbook": res.workbook}
+    led.settings = {"kind": KIND, "recursive": bool(recursive), "workbook": res.workbook,
+                    "min_match": float(min_match)}
     if not led.name:
         led.name = f"{Path(res.template).stem} merged ({Path(res.folder).name})"
     led.files = {}
@@ -552,9 +581,10 @@ def merge_again(csv, progress=None, cancel=None) -> MergeResult:
         raise LedgerError(f"{Path(csv).name} is not a merge the Council made")
     return merge(led.template, led.sources[0], Path(csv).parent,
                  recursive=bool(led.settings.get("recursive", True)),
+                 min_match=float(led.settings.get("min_match", MIN_MATCH)),
                  progress=progress, cancel=cancel)
 
 
-__all__ = ["KIND", "MergeResult", "Problem", "Copy", "merge", "merge_again", "is_merge",
+__all__ = ["KIND", "MIN_MATCH", "layout_share", "MergeResult", "Problem", "Copy", "merge", "merge_again", "is_merge",
            "default_out_dir", "output_paths", "find_files", "read_copies", "match_sheets",
            "write_workbook"]

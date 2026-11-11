@@ -40,8 +40,14 @@ Written to the save folder:
 No guessing: by the cells `sample_ledger.read_template` found for each field.
 
 * Each template sheet is matched to the copy's sheet laid out like it
-  (`ledger_examples.is_filled_copy`: 80% of the template's words in the same
-  cells): the same name first, else any. Renamed sheets are fine.
+  (`layout_share`: at least `MIN_MATCH` = **75%** of the template's words in
+  the same cells; Andy, 2026-11-11: "skip over files that don't at least 75%
+  of the template"): the same name first, else the best. Renamed sheets are
+  fine. The window's "Skip files that match less than …%" changes it (50 to
+  100); it is saved with the merged Ledger and used again by Update with new
+  files. A file under it is listed as "skipped: matches 62% of the
+  template's layout (needs 75%)". The share counts labels, not filled
+  values, so a partly filled copy is not skipped for its blanks.
 * Template of one sheet: **every** sheet laid out like it is a copy, so a
   workbook with a filled sheet per part gives each part (labelled
   `file.xlsx [sheet]`).

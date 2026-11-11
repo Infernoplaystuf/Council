@@ -128,7 +128,7 @@ def test_files_that_cannot_be_merged_are_listed_not_dropped(books, tmp_path):
     assert res.merged == 6
     why = {p.file: p.reason for p in res.left_out}
     assert set(why) == {"laid out otherwise.xlsx", "blank copy.xlsx", "old.xls"}
-    assert "layout differs" in why["laid out otherwise.xlsx"]
+    assert why["laid out otherwise.xlsx"].startswith("skipped: matches 0% of the template's layout (needs 75%)")
     assert "nothing filled in" in why["blank copy.xlsx"]
     assert "save it as .xlsx" in why["old.xls"]
     nm = openpyxl.load_workbook(res.workbook)[lm.NOT_MERGED]
@@ -410,3 +410,65 @@ def test_the_merge_asks_no_model_and_runs_no_extract():
                 names |= {(node.module or "").split(".")[-1]}
                 names |= {a.name for a in node.names}
         assert not names & banned, (rel, names & banned)
+
+
+# ── how much of the template a file must match (Andy, 2026-11-11: "it should
+# be able to skip over files that don't at least 75% of the template") ──────
+def _copy_with_share(template: Path, out: Path, target: float, part: str) -> float:
+    """A filled copy with some of the template's labels wiped, so that about
+    ``target`` of its words are in place; returns the share it has."""
+    import math
+    from council_core.ledger_examples import template_layout
+    schema = read_template(template)
+    words = template_layout(template)[schema.field(schema.id_field).sheet]
+    keep_id = {openpyxl.utils.cell.coordinate_from_string(schema.field(schema.id_field)
+                                                          .cells[""])}
+    fill(template, out, {"Part Number": part, "Power (W)": 310})
+    wb = openpyxl.load_workbook(out)
+    ws = wb.worksheets[0]
+    drop = len(words) - math.ceil(target * len(words))
+    for (r, c) in list(words)[-drop:] if drop else []:
+        ws.cell(r, c).value = None
+    wb.save(out)
+    return (len(words) - drop) / len(words)
+
+
+def test_a_file_matching_at_least_75_percent_is_merged_and_one_under_is_skipped(books):
+    template, folder = books
+    good = _copy_with_share(template, folder / "most labels.xlsx", 0.76, "S-20")
+    bad = _copy_with_share(template, folder / "few labels.xlsx", 0.60, "S-21")
+    assert 0.75 <= good < 0.8 and bad < 0.75
+    res = lm.merge(template, folder)
+    parts = {c.part for c in res.copies}
+    assert "S-20" in parts and "S-21" not in parts
+    why = {p.file: p.reason for p in res.left_out}
+    assert why["few labels.xlsx"] == (f"skipped: matches {bad:.0%} of the template's layout "
+                                      "(needs 75%); read it with Extract instead")
+    # stricter: the 76% file is skipped too
+    res = lm.merge(template, folder, folder.with_name("strict"), min_match=0.8)
+    assert "S-20" not in {c.part for c in res.copies}
+    assert f"matches {good:.0%}" in {p.file: p.reason for p in res.left_out}["most labels.xlsx"]
+    # merging again keeps the setting
+    assert ledger_saved.load(res.csv).settings["min_match"] == 0.8
+    assert "S-20" not in {c.part for c in lm.merge_again(res.csv).copies}
+
+
+def test_the_window_passes_its_match_setting(books):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from test_ledger_tab import make_tab
+    qapp = QApplication.instance() or QApplication([])
+    template, folder = books
+    good = _copy_with_share(template, folder / "most labels.xlsx", 0.76, "S-20")
+    tab, _ = make_tab(qapp)
+    tab.on_merge_window()
+    dlg = tab.merge_dialog
+    assert dlg.min_match.value() == 75
+    dlg.template.setText(str(template))
+    dlg.folder.setText(str(folder))
+    dlg.min_match.setValue(80)
+    dlg.on_merge()
+    assert tab.wait(120)
+    assert "S-20" not in {c.part for c in dlg.result.copies}
+    assert f"matches {good:.0%}" in dlg.report.toPlainText()
+    dlg.close()

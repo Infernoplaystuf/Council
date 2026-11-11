@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PySide6.QtWidgets import (QCheckBox, QDialog, QFileDialog, QGridLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout)
+                               QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox,
+                               QVBoxLayout)
 
 from council_core import ledger_merge as lm
 
@@ -64,6 +65,20 @@ class MergeDialog(QDialog):
         self.recursive = QCheckBox("Include subfolders")
         self.recursive.setChecked(True)
         grid.addWidget(self.recursive, 3, 1)
+        match_row = QHBoxLayout()
+        match_row.addWidget(QLabel("Skip files that match less than"))
+        self.min_match = QSpinBox()
+        self.min_match.setRange(50, 100)
+        self.min_match.setSuffix("%")
+        self.min_match.setValue(round(lm.MIN_MATCH * 100))
+        self.min_match.setToolTip(
+            "How much of the template's layout (its labels in the same cells) a file must "
+            "have to be merged. A file under it is skipped and listed on the Not merged "
+            "sheet with how much it matched.")
+        match_row.addWidget(self.min_match)
+        match_row.addWidget(QLabel("of the template's layout"))
+        match_row.addStretch(1)
+        grid.addLayout(match_row, 4, 1)
         lay.addLayout(grid)
         row = QHBoxLayout()
         self.merge_btn = QPushButton("Merge")
@@ -136,10 +151,12 @@ class MergeDialog(QDialog):
         folder = self.folder.text().strip()
         out = self.out_dir.text().strip()
         recursive = self.recursive.isChecked()
+        min_match = self.min_match.value() / 100.0
         self.report.setPlainText("Merging…")
 
         def step(progress):
-            return lm.merge(template, folder, out, recursive=recursive, progress=progress)
+            return lm.merge(template, folder, out, recursive=recursive,
+                            min_match=min_match, progress=progress)
 
         def done(res) -> None:
             if res is None:
