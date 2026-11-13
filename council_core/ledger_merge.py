@@ -31,6 +31,7 @@ on is listed on "Not merged". Nothing here imports Qt.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -162,6 +163,58 @@ def _cells(ws) -> Dict[Tuple[int, int], Any]:
             if c.value is not None}
 
 
+def label_layout(template, schema: TemplateSchema) -> Dict[str, Dict[Tuple[int, int], str]]:
+    """The template's own labels and headings by sheet and cell - what a
+    filled copy keeps in the same places. Only text typed into the template:
+    not a formula's result (an AVERAGE over blank cells reads '#DIV/0!' in
+    the template and a number in a copy), and not a field's value cell (a
+    pre-filled or placeholder value a copy types over). Andy, 2026-11-11:
+    the match is to look at the headers, not the values."""
+    import openpyxl
+    from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+    from council_core.ledger_examples import _norm
+    value_cells: Dict[str, set] = {}
+    for f in schema.fields:
+        for a1 in f.cells.values():
+            try:
+                col, row = coordinate_from_string(a1)
+            except Exception:                               # noqa: BLE001
+                continue
+            value_cells.setdefault(f.sheet, set()).add((row, column_index_from_string(col)))
+    out: Dict[str, Dict[Tuple[int, int], str]] = {}
+    try:
+        wb = openpyxl.load_workbook(template, data_only=False)   # formulas as written
+    except Exception:                                       # noqa: BLE001
+        return out
+    try:
+        for ws in wb.worksheets:
+            skip = value_cells.get(ws.title, set())
+            words: Dict[Tuple[int, int], str] = {}
+            for rc, cell in list(ws._cells.items())[:200_000]:
+                v = cell.value
+                if (isinstance(v, str) and not v.startswith("=") and rc not in skip
+                        and len(v) <= 120 and re.search(r"[A-Za-z]", v)
+                        and not v.strip().startswith("#")):
+                    words[rc] = _norm(v)
+            if words:
+                out[ws.title] = words
+    finally:
+        wb.close()
+    return out
+
+
+def missing_labels(cells: Dict[str, Dict[Tuple[int, int], Any]], words, most: int = 5
+                   ) -> Tuple[List[str], int]:
+    """The template labels the best-matching sheet of a copy does not have
+    in place (the first ``most``), and how many in all."""
+    from council_core.ledger_examples import _norm
+    if not cells or not words:
+        return [], 0
+    best = max(cells.values(), key=lambda c: layout_share(c, words))
+    gone = [w for rc, w in words.items() if _norm(best.get(rc)) != w]
+    return list(dict.fromkeys(gone))[:most], len(gone)
+
+
 def layout_share(cells: Dict[Tuple[int, int], Any], words: Dict[Tuple[int, int], str]) -> float:
     """The share of the template sheet's words this sheet has in the same
     cells (0..1)."""
@@ -259,10 +312,14 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
         found = match_sheets(cells, layout, tsheets, min_share)
         id_sheet = schema.field(schema.id_field).sheet
         if id_sheet not in found:
-            got = best_share(cells, layout.get(id_sheet, {}))
+            words = layout.get(id_sheet, {})
+            got = best_share(cells, words)
+            gone, n_gone = missing_labels(cells, words)
+            more = f" (+{n_gone - len(gone)} more)" if n_gone > len(gone) else ""
             return [], [Problem(name, f"skipped: matches {got:.0%} of the template's layout "
                                       f"(needs {min_share:.0%}); read it with Extract "
-                                      "instead")]
+                                      "instead. Template labels not in place: "
+                                      + ", ".join(f"'{w}'" for w in gone) + more)]
         sets = [found]
         if len(tsheets) == 1:                # more sheets laid out like the template
             rest = [t for t in cells if t != found[id_sheet]]
@@ -336,7 +393,6 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
     template's layout a copy must match (0..1); a file under it is skipped
     and listed with its share."""
     from council_core import file_guard
-    from council_core.ledger_examples import template_layout
     template, folder = Path(template), Path(folder)
     out_dir = Path(out_dir) if out_dir else default_out_dir(folder)
     if not template.is_file():
@@ -348,7 +404,7 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
                           "as a copy the next time")
     say = progress or (lambda *_a, **_k: None)
     schema = read_template(template)
-    layout = template_layout(template)
+    layout = label_layout(template, schema)
     csv_path, book_path = output_paths(template, out_dir)
     books, problems = find_files(folder, recursive, skip=[template, book_path])
     res = MergeResult(str(csv_path), str(book_path), str(template), str(folder),

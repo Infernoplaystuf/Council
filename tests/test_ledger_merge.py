@@ -418,9 +418,8 @@ def _copy_with_share(template: Path, out: Path, target: float, part: str) -> flo
     """A filled copy with some of the template's labels wiped, so that about
     ``target`` of its words are in place; returns the share it has."""
     import math
-    from council_core.ledger_examples import template_layout
     schema = read_template(template)
-    words = template_layout(template)[schema.field(schema.id_field).sheet]
+    words = lm.label_layout(template, schema)[schema.field(schema.id_field).sheet]
     keep_id = {openpyxl.utils.cell.coordinate_from_string(schema.field(schema.id_field)
                                                           .cells[""])}
     fill(template, out, {"Part Number": part, "Power (W)": 310})
@@ -442,8 +441,9 @@ def test_a_file_matching_at_least_75_percent_is_merged_and_one_under_is_skipped(
     parts = {c.part for c in res.copies}
     assert "S-20" in parts and "S-21" not in parts
     why = {p.file: p.reason for p in res.left_out}
-    assert why["few labels.xlsx"] == (f"skipped: matches {bad:.0%} of the template's layout "
-                                      "(needs 75%); read it with Extract instead")
+    assert why["few labels.xlsx"].startswith(
+        f"skipped: matches {bad:.0%} of the template's layout (needs 75%); read it with "
+        "Extract instead. Template labels not in place: '")
     # stricter: the 76% file is skipped too
     res = lm.merge(template, folder, folder.with_name("strict"), min_match=0.8)
     assert "S-20" not in {c.part for c in res.copies}
@@ -472,3 +472,52 @@ def test_the_window_passes_its_match_setting(books):
     assert "S-20" not in {c.part for c in dlg.result.copies}
     assert f"matches {good:.0%}" in dlg.report.toPlainText()
     dlg.close()
+
+
+
+# ── the match counts the template's labels only (Andy, 2026-11-11: "the
+# check looks at all values and not just the headers") ─────────────────────
+def test_the_match_counts_labels_not_values_or_formulas(books, tmp_path):
+    template, folder = books
+    schema = read_template(template)
+    power = schema.field("Power (W)").cells[""]
+    wb = openpyxl.load_workbook(template)
+    ws = wb.worksheets[0]
+    ws[power] = "enter value"                  # placeholder text in a value cell
+    for f in schema.fields:                    # and 'N/A' in every flaw cell
+        if f.per_item:
+            for a1 in f.cells.values():
+                ws[a1] = "N/A"
+    ws["P2"] = '=IF(B3="","No data",B3)'       # a formula giving text
+    pre = tmp_path / "placeholder template.xlsx"
+    wb.save(pre)
+    schema = read_template(pre)
+    words = lm.label_layout(pre, schema)[ws.title]
+    rc = openpyxl.utils.cell.coordinate_to_tuple(power)
+    assert rc not in words                                # a value cell is not a label
+    assert (2, 16) not in words                           # nor a formula
+    assert "part number" in words.values() and "flaw" in words.values()
+    # copies that typed over the placeholder still match 100%
+    copies = tmp_path / "copies3"
+    copies.mkdir()
+    for p in range(1, 4):
+        fill(pre, copies / f"c{p}.xlsx", {"Part Number": f"S-{p}", "Power (W)": 300 + p},
+             {f.name: {it: 40 + p for it in f.cells} for f in schema.fields if f.per_item})
+    res = lm.merge(pre, copies)
+    assert res.merged == 3 and not res.left_out
+
+
+def test_a_skipped_file_says_which_labels_are_missing(books):
+    template, folder = books
+    wb = openpyxl.load_workbook(template)
+    ws = wb.worksheets[0]
+    schema = read_template(template)
+    words = lm.label_layout(template, schema)[ws.title]
+    for (r, c) in list(words)[len(words) // 2:]:          # half the labels gone
+        ws.cell(r, c).value = None
+    ws[schema.field("Part Number").cells[""]] = "S-30"
+    wb.save(folder / "half.xlsx")
+    res = lm.merge(template, folder)
+    why = {p.file: p.reason for p in res.left_out}["half.xlsx"]
+    gone = list(dict.fromkeys(list(words.values())[len(words) // 2:]))
+    assert f"'{gone[0]}'" in why and "more)" in why
