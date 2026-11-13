@@ -28,8 +28,10 @@ export it to other machines."
   reads it where there is no .git, so a capture's run record still names it.
 - `run.bat` / `run.sh`: `COUNCIL_VAULT_ROOT`, `COUNCIL_APP_DIR`,
   `TYPHON_PLUGIN_HOME`, `FRAME_CLASSES_STORE` all under `data\` beside it;
-  `PYTHON` picks the Python, else `python` on PATH, else the `py`
-  launcher; none found, or the app stops with an error, it says so and
+  `PYTHON` picks the Python (a folder is followed to its python.exe, and a
+  PYTHON that does not start Python is passed over: a lab PC had it set to
+  the Python313 folder, 13 November), else `python` on PATH, else the `py`
+  launcher, each tried with `-c` first; none found, or the app stops with an error, it says so and
   pauses (a double-clicked window does not vanish).
 - `check.bat` / `check.sh` run `check_setup.py` (standard library and the
   folder's own files; a throw-away data folder; changes nothing) on the

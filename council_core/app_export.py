@@ -393,10 +393,22 @@ def _write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+#: Finds a Python that RUNS, not one that is merely named: a PYTHON setting
+#: may name the Python folder rather than python.exe (seen on a lab PC:
+#: "...\\Python313 is not recognized as an internal or external command"),
+#: and "python" on PATH may be the Microsoft Store stub. Each candidate is
+#: tried with -c before it is used.
 _FIND_PYTHON = [
-    "if defined PYTHON goto have_python",
-    "where python >nul 2>nul && set \"PYTHON=python\" && goto have_python",
-    "where py >nul 2>nul && set \"PYTHON=py\" && goto have_python",
+    "if not defined PYTHON goto find_python",
+    "if exist \"%PYTHON%\\python.exe\" set \"PYTHON=%PYTHON%\\python.exe\"",
+    "\"%PYTHON%\" -c \"import sys\" >nul 2>nul && goto have_python",
+    "echo PYTHON is set to \"%PYTHON%\", which does not start Python;",
+    "echo looking for Python on PATH instead.",
+    ":find_python",
+    "set \"PYTHON=python\"",
+    "python -c \"import sys\" >nul 2>nul && goto have_python",
+    "set \"PYTHON=py\"",
+    "py -3 -c \"import sys\" >nul 2>nul && goto have_python",
     "echo No Python found. Install Python 3.11 or newer (tick \"Add python.exe",
     "echo to PATH\"), or set PYTHON to python.exe first, e.g.",
     "echo     set PYTHON=C:\\Python311\\python.exe",
