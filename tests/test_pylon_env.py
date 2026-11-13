@@ -209,3 +209,32 @@ def test_an_export_leaves_the_camera_set_up_behind(tmp_path):
                                            '"prophesee"}', encoding="utf-8")
     copied = app_export._copy_project(src, tmp_path / "out")
     assert copied == ["app.py"]
+
+
+class _Node:
+    def __init__(self, value=None, symbolics=(), lo=None, hi=None):
+        self.Value, self.Symbolics, self.Min, self.Max = value, symbolics, lo, hi
+
+    def IsReadable(self):
+        return True
+
+
+def test_the_camera_s_own_exposure_and_trigger_answers_are_printed():
+    """For the NIR long exposure (Andy, 13 November): what the camera
+    itself offers, read from its nodes."""
+    class Cam:
+        ExposureMode = _Node("Timed", ("Timed", "TriggerControlled"))
+        ExposureTime = _Node(5000.0, lo=21.0, hi=1_000_000.0)
+        TriggerSelector = _Node("FrameStart", ("FrameStart", "FrameBurstStart"))
+        PixelFormat = _Node("Mono8", ("Mono8", "Mono12", "Mono12p"))
+    said = "\n".join(pe.exposure_lines(Cam()))
+    assert "exposure modes: Timed, TriggerControlled" in said
+    assert "no TriggerWidth" in said
+    assert "exposure time: 21 to 1e+06 us (now 5000 us)" in said
+    assert "trigger selectors: FrameStart, FrameBurstStart" in said
+    assert "pixel formats: Mono8, Mono12, Mono12p" in said
+    assert pe.exposure_lines(None) == []
+
+    class Width:
+        ExposureMode = _Node("Timed", ("Timed", "TriggerWidth"))
+    assert "no TriggerWidth" not in "\n".join(pe.exposure_lines(Width()))
