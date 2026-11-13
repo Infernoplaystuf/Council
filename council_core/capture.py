@@ -47,6 +47,7 @@ import csv
 import os
 import re
 import threading
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -68,6 +69,10 @@ QUIET_INTERVALS = 3.0
 #: How many consecutive failed reads end a capture. A backstop for any fault
 #: that repeats every time rather than clearing.
 MAX_CONSECUTIVE_ERRORS = 50
+
+#: A jump in the camera's frame numbers larger than this is a restarted or
+#: reset counter, not frames lost (CaptureSession._frame_id_gap).
+MAX_FRAME_ID_JUMP = 1_000_000
 
 #: What the display-drop count (Stats.dropped) is called in a status line.
 #: "dropped" was read as frames LOST; they are frames the screen did not
@@ -95,6 +100,11 @@ class Stats:
     skipped: int = 0
     #: Frames grabbed and queued, not yet on disk.
     waiting: int = 0
+    #: The save queue's fill, 0-100 % of its byte budget, and how fast
+    #: frames reached the disk over the last couple of seconds (MB/s): the
+    #: saving meter. At 100 % new frames are NOT saved (`skipped`).
+    queue_percent: int = 0
+    save_mb_s: float = 0.0
     #: pylon's skipped-image count (Frame.meta["skipped_by_camera"]): frames
     #: pylon threw away before the app saw them. It counts ONLY in pylon's
     #: "latest image" grab strategies, which a live view uses. A recording
@@ -118,6 +128,12 @@ class Stats:
     #: grabbed and shown, never asked for, so not saved — and not a loss
     #: (council_core.triggered). Always 0 for any other run.
     passed: int = 0
+    #: Frames missing from the camera's OWN frame numbers (Frame.meta
+    #: "frame_id", the stream's block ID): the camera numbered them and
+    #: they never reached Typhon — lost on the cable, in the frame grabber
+    #: or in pylon's buffers, with no failed grab to say so. Failed grabs
+    #: are not counted again here. 0 for a camera without frame numbers.
+    camera_gaps: int = 0
 
     @property
     def grab_attempts(self) -> int:
@@ -141,13 +157,19 @@ class Stats:
         if self.passed:
             bits.append(f"{self.passed} between triggers (not asked for)")
         if self.waiting:
-            bits.append(f"{self.waiting} waiting to save")
+            meter = f"queue {self.queue_percent}% full"
+            if self.save_mb_s > 0:
+                meter += f", saving {self.save_mb_s:.0f} MB/s"
+            bits.append(f"{self.waiting} waiting to save ({meter})")
         if self.skipped:
             bits.append(f"{self.skipped} NOT saved (storage too slow)")
         if self.unsaved:
             bits.append(f"{self.unsaved} NOT saved (recording stopped)")
         if self.camera_skipped:
             bits.append(f"{self.camera_skipped} lost by the camera/driver")
+        if self.camera_gaps:
+            bits.append(f"{self.camera_gaps} lost before Typhon (missing "
+                        f"from the camera's frame numbers)")
         if self.grab_failures:
             bits.append(f"{self.grab_failures} failed grab"
                         f"{'' if self.grab_failures == 1 else 's'}")
@@ -568,6 +590,19 @@ def run_recorder(folder: Any, run: str, claim: Any = None) -> "Recorder":
     one row each in <run>_frames.csv — through `claim`, the handle
     claim_run kept open, when given — and <run>_run_end.json when the
     recording ends (Recorder.finish)."""
+    from . import raw_frames
+
+    if raw_frames.save_format() == "raw":
+        # RAW RECORDING (council_core.raw_frames): every frame appended to
+        # <run>_frames.tyraw, the CSV naming the PNG each becomes once
+        # converted.
+        stack = raw_frames.RawStack(Path(folder) / f"{run}{raw_frames.RAW_NAME}")
+        recorder = Recorder(folder, stem=f"{run}_frame", writer=stack.write,
+                            suffix=".png", index_name=f"{run}{INDEX_SUFFIX}",
+                            index_handle=claim,
+                            end_name=f"{run}{RUN_END_SUFFIX}")
+        recorder.raw_stack = stack
+        return recorder
     return Recorder(folder, stem=f"{run}_frame",
                     index_name=f"{run}{INDEX_SUFFIX}", index_handle=claim,
                     end_name=f"{run}{RUN_END_SUFFIX}")
@@ -633,6 +668,9 @@ class Recorder:
         #: ends, giving its END_BLOCK_KEYS — or None (today's Typhon).
         self.end_blocks: Optional[Callable[[Dict[str, Any]],
                                            Mapping[str, Any]]] = None
+        #: A raw run's stack (council_core.raw_frames.RawStack): its frames
+        #: are in one .tyraw file until converted. None for a PNG run.
+        self.raw_stack: Any = None
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -816,6 +854,18 @@ class Recorder:
         }
         if totals.get("stream_ended"):
             doc["stream_ended"] = str(totals["stream_ended"])
+        stack = self.raw_stack
+        if stack is not None:
+            # A raw run (added in version 1): its frames are in this file,
+            # under the PNG names the frames CSV gives, until converted.
+            doc["raw_frames"] = {"file": stack.path.name,
+                                 "frames": int(stack.frames),
+                                 "bytes": int(stack.bytes),
+                                 "converted": False}
+        if totals.get("camera_gaps"):
+            # Only when some were missing (version 1 readers may meet it):
+            # frames the camera numbered that never reached Typhon.
+            doc["frames_lost_before_typhon"] = int(totals["camera_gaps"])
         info = self.capture_info
         if callable(info):
             # BaseException (typhon-plugins P3 review): a run's books may be
@@ -876,6 +926,9 @@ class Recorder:
     def close(self) -> None:
         """Finish the index. Safe to call twice — and for a run that never
         recorded (a refused Start), which still holds claim_run's handle."""
+        stack = self.raw_stack
+        if stack is not None:
+            stack.close()
         handle, self._index_file, self._index_rows = self._index_file, None, None
         claimed, self._claimed = self._claimed, None
         for each in (handle, claimed):
@@ -913,15 +966,53 @@ def _physical_memory() -> int:
         return 0
 
 
+#: Environment settings (set them in the Command Prompt, or in run.bat, before
+#: Typhon starts). The save queue in GB: up to three quarters of the PC's RAM.
+SAVE_QUEUE_ENV = "TYPHON_SAVE_QUEUE_GB"
+#: How many frames are saved at once (1-64).
+SAVE_THREADS_ENV = "TYPHON_SAVE_THREADS"
+#: Seconds the saving meter's MB/s is measured over.
+SAVE_RATE_WINDOW = 2.0
+
+
+def _env_number(name: str) -> Optional[float]:
+    """A positive number from the environment, or None (unset or unusable:
+    the default stands, and the Command Prompt says why)."""
+    text = os.environ.get(name, "").strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if value > 0:
+        return value
+    print(f"[Typhon] {name}={text!r} is not a positive number; ignored",
+          file=sys.stderr)
+    return None
+
+
 def _write_budget() -> int:
-    """A quarter of this machine's RAM, between 512 MB and 8 GB.
+    """TYPHON_SAVE_QUEUE_GB when set (at most three quarters of RAM, at
+    least 512 MB); otherwise a quarter of this machine's RAM, between
+    512 MB and 8 GB.
+
+    A 65 MP boA9344 frame is 65 MB in Mono8: the default 8 GB is about two
+    seconds of it at 30 fps, so a PC with RAM to spare can be given more.
 
     A fixed 512 MB held about ten full-frame boA5320 frames (49 MB each at
     12 bits) — a burst the disk could not absorb became "NOT saved" while
     most of the machine's memory sat unused. Big enough to ride out bursts,
     small enough to leave the rest of the machine alone.
     """
-    quarter = _physical_memory() // 4
+    memory = _physical_memory()
+    asked = _env_number(SAVE_QUEUE_ENV)
+    if asked is not None:
+        want = int(asked * (1 << 30))
+        if memory > 0:
+            want = min(want, memory * 3 // 4)
+        return int(max(512 << 20, want))
+    quarter = memory // 4
     return int(min(8 << 30, max(512 << 20, quarter)))
 
 
@@ -940,7 +1031,16 @@ DRAIN_TIMEOUT = 30.0
 #: Up to 8 — a machine with cores to spare should spend them here rather
 #: than report frames "NOT saved" — leaving one core for the camera and one
 #: for the window.
-DEFAULT_WRITERS = max(1, min(8, (os.cpu_count() or 2) - 2))
+def _writers() -> int:
+    """TYPHON_SAVE_THREADS when set (1-64), else up to 8, leaving two
+    cores."""
+    asked = _env_number(SAVE_THREADS_ENV)
+    if asked is not None:
+        return int(max(1, min(64, round(asked))))
+    return max(1, min(8, (os.cpu_count() or 2) - 2))
+
+
+DEFAULT_WRITERS = _writers()
 
 
 class FrameWriter:
@@ -1003,6 +1103,9 @@ class FrameWriter:
         #: Snapshot frames that came between triggers (note_passed): the
         #: camera's, never asked for, so not offered — for the end record.
         self.passed = 0
+        #: Frames missing from the camera's frame numbers while this was
+        #: the recording (note_camera_gap; Stats.camera_gaps).
+        self.camera_gaps = 0
         #: Why the camera's stream ended by itself while this was the
         #: recording (note_stream_ended), or "" — for the end record.
         self.stream_ended = ""
@@ -1026,6 +1129,10 @@ class FrameWriter:
         self.paths: List[Path] = []
         self._queue: collections.deque = collections.deque()
         self._queued_bytes = 0
+        #: Bytes of frames saved, and (time, bytes) marks for the saving
+        #: meter's MB/s (save_rate).
+        self.bytes_written = 0
+        self._marks: collections.deque = collections.deque()
         self._inflight = 0          # taken off the queue, not yet published
         self._closing = False
         self._cond = threading.Condition()
@@ -1058,6 +1165,25 @@ class FrameWriter:
     @property
     def alive(self) -> bool:
         return any(t.is_alive() for t in self._threads)
+
+    def queue_percent(self) -> int:
+        """How full the save queue is, 0-100 % of its byte budget."""
+        with self._cond:
+            if self.budget <= 0:
+                return 0
+            return int(min(100, round(100 * self._queued_bytes
+                                      / self.budget)))
+
+    def save_rate(self) -> float:
+        """Bytes a second reaching the disk over the last SAVE_RATE_WINDOW
+        seconds; 0 when nothing was saved in that time."""
+        with self._cond:
+            if len(self._marks) < 2:
+                return 0.0
+            (t0, b0), (t1, b1) = self._marks[0], self._marks[-1]
+            if time.monotonic() - t1 > SAVE_RATE_WINDOW or t1 <= t0:
+                return 0.0
+            return (b1 - b0) / (t1 - t0)
 
     @property
     def closing(self) -> bool:
@@ -1107,6 +1233,12 @@ class FrameWriter:
         with self._cond:
             self.grab_failures += 1
             self._saw_index(index)
+
+    def note_camera_gap(self, count: int) -> None:
+        """`count` frames the camera numbered never arrived (Stats.
+        camera_gaps), while this was the recording."""
+        with self._cond:
+            self.camera_gaps += int(count)
 
     def note_passed(self) -> None:
         """A snapshot frame no trigger asked for went by (not offered)."""
@@ -1183,6 +1315,7 @@ class FrameWriter:
                 "recording_failed": self.failed,
                 "passed": self.passed,
                 "stream_ended": self.stream_ended,
+                "camera_gaps": self.camera_gaps,
             }
 
     def _run(self) -> None:
@@ -1210,6 +1343,15 @@ class FrameWriter:
                 error = f"frame {frame.index} not saved — {_failure(exc)}"
             with self._cond:
                 self._inflight -= 1
+                if path is not None:
+                    self.bytes_written += int(
+                        getattr(frame.image, "nbytes", 0) or 0)
+                    self._marks.append((time.monotonic(),
+                                        self.bytes_written))
+                    while len(self._marks) > 2 and \
+                            self._marks[-1][0] - self._marks[0][0] > \
+                            SAVE_RATE_WINDOW:
+                        self._marks.popleft()
                 self._finished[seq] = (_without_image(frame), path)
                 if error:
                     self.lost += 1
@@ -1440,6 +1582,8 @@ class CaptureSession:
 
     def _reset_locked(self) -> None:
         self._stats = Stats()
+        self._last_frame_id = None
+        self._fails_since_frame = 0
         self._marks = []
         self.mailbox.dropped = 0
         self._counted_from = len(self._writers)
@@ -1485,6 +1629,8 @@ class CaptureSession:
             recorded=sum(w.written for w in writers),
             skipped=sum(w.skipped for w in writers),
             waiting=sum(w.pending for w in writers),
+            queue_percent=max([w.queue_percent() for w in writers] or [0]),
+            save_mb_s=sum(w.save_rate() for w in writers) / 1e6,
             unsaved=base.unsaved + sum(w.lost for w in writers),
             recording_failed=base.recording_failed or failed)
 
@@ -1605,6 +1751,9 @@ class CaptureSession:
         self._last_frame_at = self._clock()
         self._interval = None
         self._from_start = True
+        # A new stream numbers its frames afresh: no gap across a restart.
+        self._last_frame_id = None
+        self._fails_since_frame = 0
         self._thread = threading.Thread(target=self._loop, name="capture",
                                         daemon=True)
         self._thread.start()
@@ -1710,9 +1859,15 @@ class CaptureSession:
             # submit() only queues, so the lock is held for microseconds.
             self._record(frame)
             lost = int((frame.meta or {}).get("skipped_by_camera", 0) or 0)
+            gap = self._frame_id_gap(frame)
+            if gap:
+                writer = self.writer
+                if writer is not None:
+                    writer.note_camera_gap(gap)
             self._stats = replace(
                 self._stats, grabbed=self._stats.grabbed + 1,
                 camera_skipped=self._stats.camera_skipped + lost,
+                camera_gaps=self._stats.camera_gaps + gap,
                 rate=self._rate())
         self.mailbox.put(frame)
         if self.on_frame is not None:
@@ -1823,8 +1978,28 @@ class CaptureSession:
                 pass
         return saved
 
+    def _frame_id_gap(self, frame: cameras.Frame) -> int:
+        """Frames the camera numbered between the last frame and this one
+        that never arrived, less the failed grabs between them (each used a
+        number and is counted as a failed grab). Lock held. A number that
+        goes backwards (a restarted stream, a wrapped counter) or jumps
+        absurdly far starts the count afresh rather than inventing a loss."""
+        fid = (frame.meta or {}).get("frame_id")
+        last = getattr(self, "_last_frame_id", None)
+        fails = getattr(self, "_fails_since_frame", 0)
+        self._fails_since_frame = 0
+        if not isinstance(fid, int) or isinstance(fid, bool):
+            self._last_frame_id = None
+            return 0
+        self._last_frame_id = fid
+        if last is None or fid <= last or fid - last > MAX_FRAME_ID_JUMP:
+            return 0
+        return max(0, fid - last - 1 - fails)
+
     def _count_failed_grab(self, exc: Any = None) -> None:
         with self._lock:
+            self._fails_since_frame = getattr(
+                self, "_fails_since_frame", 0) + 1
             self._stats = replace(
                 self._stats, grab_failures=self._stats.grab_failures + 1)
             writer = self.writer

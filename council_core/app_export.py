@@ -726,6 +726,31 @@ IF SOMETHING GOES WRONG
                              folder. Copy data\\ from the old folder to keep
                              its settings, plugins and classifiers.
 
+SAVING BIG FRAMES FASTER
+  A full boA9344 frame is about 65 MB (Mono8) or 131 MB (Mono12): at 30 fps
+  that is 2-4 GB/s, more than most drives keep up. Before a run of big
+  frames Typhon times the save folder and says in the Command Prompt what
+  frame rate it keeps up with ([Typhon camera] lines); the status line shows
+  the save queue filling while it records. To time a folder yourself:
+      python _council\\council_core\\save_speed.py D:\\runs
+  Settings, typed in the Command Prompt before run.bat (or added to it):
+      set TYPHON_SAVE_QUEUE_GB=24      frames waiting to save (default a
+                                       quarter of RAM, at most 8 GB; up to
+                                       three quarters of RAM)
+      set TYPHON_PYLON_BUFFER_GB=4     pylon's own buffers (default 1 GB)
+      set TYPHON_SAVE_THREADS=12       frames saved at once (default up to 8)
+      set TYPHON_NO_SPEED_CHECK=1      skip the timing before a run
+      set TYPHON_SAVE_FORMAT=raw       RAW RECORDING: each run's frames go
+                                       into one <run>_frames.tyraw file,
+                                       the fastest a disk takes them; the
+                                       pictures appear after converting:
+      python _council\\council_core\\raw_frames.py D:\\runs
+                                       (writes the PNGs the run's CSV names;
+                                       add --remove-raw to remove the .tyraw
+                                       once every frame is a new PNG)
+  Fewer bytes help most: Mono8, a smaller area, a lower frame rate; and a
+  fast, empty local NVMe drive with antivirus scanning off for the folder.
+
 WHAT IS IN THIS FOLDER
   main.py, app.py, ui/ ...  the app as it was built in the Council
   _council/                 the Council files the app uses (nothing else

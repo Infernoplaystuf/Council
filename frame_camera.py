@@ -487,6 +487,111 @@ def _scan_context(host: Any) -> List[str]:
     return out
 
 
+#: Frames smaller than this are not worth a disk test before a run (an
+#: EVK4's pictures, the simulated cameras).
+SPEED_CHECK_MIN_BYTES = 8_000_000
+#: MB written by the test before a run.
+SPEED_CHECK_MB = 256
+
+
+def set_save_format(name: Any = "png") -> Dict[str, Any]:
+    """How the next runs save: "png" (a PNG per frame, as always) or "raw"
+    (every frame appended to one <run>_frames.tyraw file, the fastest a
+    disk can take them, converted to PNGs after Stop: convert_raw_runs).
+
+    Keys: summary, format
+    """
+    from council_core import raw_frames
+
+    chosen = raw_frames.set_format(str(name or "png"))
+    said = ("Runs now save raw: one file per run, converted to PNG after "
+            "Stop." if chosen == "raw" else "Runs now save a PNG per frame.")
+    _console([said])
+    return {"summary": said, "format": chosen}
+
+
+def convert_raw_runs(folder: Any = None) -> Dict[str, Any]:
+    """Write the frames of every raw run (.tyraw) in `folder` (default: the
+    capture folder) as the PNGs their frames CSV names. A PNG already there
+    is left alone; the .tyraw is kept.
+
+    Keys: summary, converted, failed
+    """
+    from council_core import raw_frames
+
+    target = Path(str(folder)) if folder not in (None, "") else _LIVE.folder
+    if target is None:
+        return {"summary": "No folder: capture first, or name the folder.",
+                "converted": 0, "failed": 0}
+    files = raw_frames.raw_files(target)
+    if _LIVE.capturing and _LIVE.run:
+        busy = f"{_LIVE.run}{raw_frames.RAW_NAME}"
+        files = [f for f in files if f.name != busy]
+    lines: List[str] = []
+    converted = failed = 0
+    for each in files:
+        result = raw_frames.convert(each)
+        converted += result["converted"]
+        failed += len(result["failed"]) + bool(result["damaged"])
+        lines.extend(raw_frames.words(result))
+    if not files:
+        lines = [f"No raw runs in {target}."]
+    _console(lines)
+    return {"summary": " ".join(lines), "converted": converted,
+            "failed": failed}
+
+
+def _frame_bytes(device: Any) -> int:
+    """One frame's size as Typhon saves it (8-bit pixels as one byte,
+    10-16-bit as two, RGB/BGR8 as three), from the camera's area and pixel
+    format; 0 when the camera cannot say."""
+    try:
+        roi = device.roi()
+        pixels = int(roi.w) * int(roi.h)
+    except Exception:                                   # noqa: BLE001
+        return 0
+    fmt = ""
+    value = getattr(device, "_value", None)
+    if callable(value):
+        try:
+            fmt = str(value("PixelFormat", "") or "")
+        except Exception:                               # noqa: BLE001
+            fmt = ""
+    upper = fmt.upper()
+    if upper.startswith(("RGB", "BGR")) and upper.endswith("8"):
+        per = 3
+    elif not fmt or upper.endswith("8"):
+        per = 1
+    else:
+        per = 2
+    return pixels * per
+
+
+def _speed_check(out: Path, device: Any, fps: float) -> str:
+    """Time the save folder before a run of big frames (council_core.
+    save_speed), print what it found in the Command Prompt, and return a
+    warning for the summary when the camera's rate is more than the folder
+    keeps up with; "" otherwise. Never raises."""
+    import os
+
+    try:
+        from council_core import capture, save_speed
+
+        if os.environ.get(save_speed.OFF_ENV, "").strip() not in ("", "0"):
+            return ""
+        size = _frame_bytes(device)
+        if size < SPEED_CHECK_MIN_BYTES or _on_network_share(out):
+            return ""
+        result = (save_speed.measured(out)
+                  or save_speed.measure(out, SPEED_CHECK_MB))
+        lines = save_speed.words(result, size, float(fps or 0.0),
+                                 capture.WRITE_BUDGET_BYTES)
+        _console(lines)
+        return lines[2] if len(lines) > 2 else ""
+    except Exception:                                   # noqa: BLE001
+        return ""
+
+
 def _console(lines) -> None:
     """The camera list and any open failure, in the Command Prompt the app
     was started from too (council_core.pylon_env.console), so a camera
@@ -968,6 +1073,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     # recorder writes through it (capture.claim_run): closed and opened
     # again, a program that briefly took the new file without sharing made
     # Start fail after the live view had stopped (measured).
+    # Before anything is written: how fast this folder saves, against the
+    # frame size (once per folder per session; big frames only).
+    speed_warning = _speed_check(out, device, rate)
     try:
         run, claim = (_claim_run(out) if host is None else
                       _claim_run(out, base))
@@ -1161,6 +1269,16 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                  "skipped.")
     if waits_for:
         said += f" The camera waits for {waits_for} before each frame."
+    if speed_warning:
+        said += " " + speed_warning
+    stack = getattr(recorder, "raw_stack", None)
+    if stack is not None:
+        raw_said = (f"Saving raw into {stack.path.name}: the pictures appear "
+                    f"once converted to PNG after Stop (Convert raw runs, or "
+                    f"python _council/council_core/raw_frames.py "
+                    f"\"{out}\").")
+        said += " " + raw_said
+        _console([raw_said])
     if plugin_notes:
         said += " " + " ".join(note if note.endswith(".") else note + "."
                                for note in plugin_notes)

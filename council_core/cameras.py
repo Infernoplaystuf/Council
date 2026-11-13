@@ -774,6 +774,10 @@ class BaslerDevice(Device):
     #: frames on at once, so these only ride out a hiccup; the save queue
     #: (capture.WRITE_BUDGET_BYTES) is the big buffer.
     RECORD_BUFFER_BYTES = 1 << 30
+    #: TYPHON_PYLON_BUFFER_GB overrides it (pylon's own buffers while
+    #: recording; at most 200 of them, at least 10): one 65 MP frame is
+    #: 65 MB, so 1 GB is about 15 frames, half a second at 30 fps.
+    PYLON_BUFFER_ENV = "TYPHON_PYLON_BUFFER_GB"
     #: Frame arrays kept for reuse (FramePool). Enough for a save queue that
     #: keeps pace with the camera many times over; a queue backed up past it
     #: behind a slow disk just gets new arrays for the excess.
@@ -1447,6 +1451,17 @@ class BaslerDevice(Device):
             out["camera_bins"] = own
         return out
 
+    def _record_buffer_bytes(self) -> int:
+        """RECORD_BUFFER_BYTES, or TYPHON_PYLON_BUFFER_GB when set."""
+        import os
+        text = os.environ.get(self.PYLON_BUFFER_ENV, "").strip()
+        try:
+            asked = float(text) if text else 0.0
+        except ValueError:
+            asked = 0.0
+        return int(asked * (1 << 30)) if asked > 0 else \
+            int(self.RECORD_BUFFER_BYTES)
+
     def start(self) -> None:
         """Grab. What pylon keeps when the app falls behind depends on why:
 
@@ -1478,7 +1493,8 @@ class BaslerDevice(Device):
         if self._recording:
             payload = int(self._value("PayloadSize", 0) or 0)
             if payload > 0:
-                count = max(10, min(200, self.RECORD_BUFFER_BYTES // payload))
+                count = max(10, min(200, self._record_buffer_bytes()
+                                    // payload))
                 self._try_set("MaxNumBuffer", int(count))
         self._aoi = self.roi().as_tuple()
         self._format = str(self._value("PixelFormat", "") or "")
