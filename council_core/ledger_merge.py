@@ -36,7 +36,10 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from sample_ledger import (SOURCE_COL, LedgerError, ParentCSV, TemplateSchema,
                            _text, _typed, is_filled_template, mark_filled,
@@ -54,7 +57,14 @@ OLD_EXCEL = (".xls", ".xlsb")
 MIN_MATCH = 0.75
 ALL_DATA = "All data"
 NOT_MERGED = "Not merged"
+CHECK = "Check"
 FILE_COL = "File"
+#: what the Check sheet says of each value (Andy's LMM Analysis Studio
+#: script, 2026-11-13: a mapping audit and a reason for every blank)
+READ, MOVED, BLANK, NO_SHEET = ("read", "read at moved cell", "blank in the copy",
+                                "sheet not found")
+CHECK_COLS = [FILE_COL, "Part", "Field", "Item", "Template cell", "Read from", "Value",
+              "Status"]
 
 
 @dataclass
@@ -76,6 +86,8 @@ class Copy:
     named_by_file: bool = False
     label: str = ""           # file name, '[sheet]' after it when a file has several
     moved: Dict[str, "Placement"] = field(default_factory=dict)  # template sheet -> where it moved
+    #: (field, item, template cell, cell read in the copy ('' none), value, status)
+    audit: List[Tuple[str, str, str, str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -121,6 +133,46 @@ def default_out_dir(folder) -> Path:
     """Beside the folder of copies, not in it: '<folder> merged'."""
     folder = Path(folder)
     return folder.with_name(f"{folder.name} merged")
+
+
+def check_path(csv) -> Path:
+    """Where a merge writes what it read from each copy, cell by cell (read by
+    the Analyze window's Check page)."""
+    csv = Path(csv)
+    return csv.with_name(f"{csv.stem} - check.csv")
+
+
+def check_rows(res: "MergeResult") -> List[List[str]]:
+    """Each value of each copy: file, part, field, item, template cell, the
+    cell read, the value, and its status (read / read at moved cell / blank
+    in the copy / sheet not found)."""
+    return [[c.label, c.part, fname, item, tcell, cell, value, status]
+            for c in res.copies for fname, item, tcell, cell, value, status in c.audit]
+
+
+def _write_check(res: "MergeResult", path: Path) -> None:
+    import csv as _csv
+    tmp = path.with_name(path.name + ".writing")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as fh:
+        w = _csv.writer(fh)
+        w.writerow(CHECK_COLS)
+        w.writerows(check_rows(res))
+    try:
+        os.replace(tmp, path)
+    except PermissionError as e:
+        tmp.unlink(missing_ok=True)
+        raise LedgerError(f"could not write {path.name}: it is probably open in Excel. "
+                          "Close it and merge again.") from e
+
+
+def read_check(csv) -> Optional[pd.DataFrame]:
+    """What a merge read from each copy (check_path), or None when the Ledger
+    is not a merge or was merged before the check was kept."""
+    import pandas as pd
+    path = check_path(csv)
+    if not path.is_file():
+        return None
+    return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
 
 
 def output_paths(template, out_dir) -> Tuple[Path, Path]:
@@ -393,15 +445,26 @@ def _entered(schema: TemplateSchema, rows: List[Dict[str, str]]) -> int:
 
 
 def _rows_from(schema: TemplateSchema, ws_of: Dict[str, Any],
-               placed: Optional[Dict[str, Placement]] = None) -> List[Dict[str, str]]:
+               placed: Optional[Dict[str, Placement]] = None,
+               audit: Optional[list] = None) -> List[Dict[str, str]]:
+    """The copy's rows, read at the template's cells (where they moved, on a
+    sheet in ``placed``); ``audit`` gets (field, item, template cell, cell
+    read, value, status) for every value."""
     placed = placed or {}
+    audit = audit if audit is not None else []
 
     def get(f, item: str) -> str:
         ws = ws_of.get(f.sheet)
+        tcell = f.cells[item]
         if ws is None:
+            audit.append((f.name, item, tcell, "", "", NO_SHEET))
             return ""
         p = placed.get(f.sheet)
-        return _text(ws[p.a1(f.cells[item]) if p else f.cells[item]].value)
+        cell = p.a1(tcell) if p else tcell
+        v = _text(ws[cell].value)
+        audit.append((f.name, item, tcell, cell, xl_text(v),
+                      BLANK if not str(v).strip() else MOVED if cell != tcell else READ))
+        return v
     part = {f.name: get(f, "") for f in schema.fields if not f.per_item}
     if not schema.item_field:
         return [part]
@@ -456,13 +519,16 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
                     break
                 sets.append((more, more_placed))
                 rest.remove(more[id_sheet])
-        read = [(m, pl, _rows_from(schema, {t: wb[s] for t, s in m.items()}, pl))
-                for m, pl in sets]
+        read = []
+        for m, pl in sets:
+            audit: list = []
+            read.append((m, pl, _rows_from(schema, {t: wb[s] for t, s in m.items()}, pl,
+                                           audit), audit))
     finally:
         wb.close()
     copies, notes = [], []
     several = len(read) > 1
-    for m, pl, rows in read:
+    for m, pl, rows, audit in read:
         label = f"{name} [{m[id_sheet]}]" if several else name
         pid = xl_text(rows[0].get(schema.id_field, "")).strip()
         if not pid and not _entered(schema, rows):
@@ -475,7 +541,7 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
             pid, named = (path.stem if not several else f"{path.stem} {m[id_sheet]}"), True
             for r in rows:
                 r[schema.id_field] = pid
-        copies.append(Copy(path, pid, rows, m, named, label, moved=dict(pl)))
+        copies.append(Copy(path, pid, rows, m, named, label, moved=dict(pl), audit=audit))
         for t, p in pl.items():
             notes.append(Problem(label, f"read with its layout moved{' on ' + t if len(tsheets) > 1 else ''}"
                                         f" ({p.describe()}): {p.share:.0%} of the template's "
@@ -615,6 +681,7 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
     try:
         write_workbook(schema, ParentCSV(tmp_csv), res, folder, book_path)
         _swap_in(tmp_csv, csv_path, schema)
+        _write_check(res, check_path(csv_path))
     finally:
         for stale in (tmp_csv, schema_path_for(tmp_csv)):
             if stale.exists():
@@ -649,7 +716,7 @@ def write_workbook(schema: TemplateSchema, ledger: ParentCSV, res: MergeResult,
     wb = openpyxl.load_workbook(schema.template_path)
     originals = list(wb.worksheets)
     several = len(originals) > 1
-    used = {ALL_DATA.lower(), NOT_MERGED.lower()}
+    used = {ALL_DATA.lower(), NOT_MERGED.lower(), CHECK.lower()}
     bold = Font(bold=True)
     head_fill = PatternFill("solid", fgColor="DDEBF7")
     try:
@@ -704,6 +771,22 @@ def write_workbook(schema: TemplateSchema, ledger: ParentCSV, res: MergeResult,
                 cell.font, cell.fill = bold, head_fill
             nm.freeze_panes = "A2"
             _autosize(nm, widest=70)
+
+        # Check: every value of every copy, the cell it was read from
+        ck = wb.create_sheet(CHECK, 2 if res.problems else 1)
+        ck.append(CHECK_COLS)
+        moved_fill = PatternFill("solid", fgColor="FFF2CC")
+        blank_fill = PatternFill("solid", fgColor="EDEDED")
+        for row in check_rows(res):
+            ck.append([_typed(v) if i == 6 else v for i, v in enumerate(row)])
+            if row[-1] in (MOVED, BLANK, NO_SHEET):
+                for cell in ck[ck.max_row]:
+                    cell.fill = moved_fill if row[-1] == MOVED else blank_fill
+        for cell in ck[1]:
+            cell.font, cell.fill = bold, head_fill
+        ck.freeze_panes = "A2"
+        ck.auto_filter.ref = ck.dimensions
+        _autosize(ck, widest=45)
         wb.active = 0
         mark_filled(wb)
         out.parent.mkdir(parents=True, exist_ok=True)

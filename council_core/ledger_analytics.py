@@ -677,6 +677,67 @@ def _sure_by_parts(r: pd.DataFrame, parts: pd.DataFrame, fs: List[str],
     return p, sure
 
 
+# ── checking the values (Andy's LMM Analysis Studio script, 2026-11-13:
+# a mapping audit, a reason for every blank, why a variable is missing) ──
+def left_out_of_correlation(data: Data, group: str = "") -> pd.DataFrame:
+    """Each field and whether it is in the correlation; when not, why."""
+    flat = rows(data, group)
+    whole = per_part(data, flat)
+    out = []
+    for f in fields_of(data, group):
+        info, kind = data.fields[f], _kind_in(data, f, group)
+        a = _numbers(whole[f] if not info.per_item else flat[f])
+        distinct = len(set(a.tolist()))
+        why = ("a count the analysis made" if info.count else
+               "a text field" if kind == TEXT else "a date" if kind == DATE else
+               "nothing filled in" if kind == EMPTY else
+               "no numbers" if not len(a) else
+               "only one value" if len(a) == 1 else
+               "never varies" if distinct < 2 else "")
+        out.append({"Field": f, "Kind": kind, "In the correlation": "no" if why else "yes",
+                    "Why not": why, "Numbers": int(len(a)), "Different values": distinct})
+    res = pd.DataFrame(out, columns=["Field", "In the correlation", "Why not", "Kind",
+                                     "Numbers", "Different values"])
+    if len(res):
+        res = res.sort_values("In the correlation", kind="stable").reset_index(drop=True)
+    return res
+
+
+def merge_check(data: Data) -> Optional[pd.DataFrame]:
+    """What a merge read from each copy, cell by cell (ledger_merge's Check),
+    or None for a Ledger the merge did not make."""
+    from council_core import ledger_merge
+    return ledger_merge.read_check(data.csv)
+
+
+def check_by_file(check: pd.DataFrame) -> pd.DataFrame:
+    """A row per copy: how many of its values were read in place, read at a
+    moved cell, blank, or on a sheet not found."""
+    from council_core import ledger_merge as lm
+    out = []
+    for (f, part), sub in check.groupby(["File", "Part"], sort=False):
+        st = sub["Status"].value_counts()
+        out.append({"File": f, "Part": part, "Read": int(st.get(lm.READ, 0)),
+                    "Read at moved cell": int(st.get(lm.MOVED, 0)),
+                    "Blank in the copy": int(st.get(lm.BLANK, 0)),
+                    "Sheet not found": int(st.get(lm.NO_SHEET, 0))})
+    res = pd.DataFrame(out, columns=["File", "Part", "Read", "Read at moved cell",
+                                     "Blank in the copy", "Sheet not found"])
+    if len(res):
+        res = res.sort_values(["Read at moved cell", "Sheet not found", "Blank in the copy"],
+                              ascending=False, kind="stable").reset_index(drop=True)
+    return res
+
+
+def find_rows(df: pd.DataFrame, text: str) -> pd.DataFrame:
+    """The rows with ``text`` (any case) in any column."""
+    text = (text or "").strip().lower()
+    if not text or df.empty:
+        return df
+    hit = df.astype(str).apply(lambda col: col.str.lower().str.contains(text, regex=False))
+    return df[hit.any(axis=1)]
+
+
 def correlation_figure(c: Correlation):
     """A heatmap of r, -1 blue to +1 red; a dot marks a sure pair."""
     from matplotlib.figure import Figure

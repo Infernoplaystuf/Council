@@ -79,7 +79,7 @@ def test_every_copy_is_merged_into_one_workbook_with_a_sheet_each(books):
     assert res.merged == 6 and res.parts == 6 and not res.problems
     assert Path(res.csv).parent == folder.with_name("filled merged")
     wb = openpyxl.load_workbook(res.workbook)
-    assert wb.sheetnames == ["All data"] + [f"S-{p}" for p in range(1, 7)]
+    assert wb.sheetnames == ["All data", "Check"] + [f"S-{p}" for p in range(1, 7)]
     assert lm.NOT_MERGED not in wb.sheetnames            # nothing to say
     # each sheet is the template filled with that copy's values
     schema = read_template(template)
@@ -260,7 +260,7 @@ def test_a_copy_of_several_pages_is_merged_page_by_page(tmp_path, app_dir):
     assert row["Date"] == "2026-01-02" and row["Page 2: Date"] == "2026-02-02"
     assert row["Hardness (HRC)"] == "52"
     wb = openpyxl.load_workbook(res.workbook)
-    assert wb.sheetnames[1:3] == ["K-1 Page 1", "K-1 Page 2"]
+    assert wb.sheetnames[2:4] == ["K-1 Page 1", "K-1 Page 2"]
     assert wb["K-3 Page 2"]["C2"].value == 53
 
 
@@ -580,3 +580,49 @@ def test_a_workbook_that_is_not_a_copy_is_still_skipped(books):
     wb.save(folder / "other.xlsx")
     res = lm.merge(template, folder)
     assert {p.file: p.reason for p in res.left_out}["other.xlsx"].startswith("skipped:")
+
+
+
+# ── the Check sheet: every value and the cell it came from (Andy's LMM
+# Analysis Studio script, 2026-11-13: mapping audit, a reason per blank) ───
+def test_every_value_is_listed_with_the_cell_it_was_read_from(books):
+    template, folder = books
+    _moved_copy(template, folder / "rows added.xlsx", "S-30", rows_at=(4, 4))
+    res = lm.merge(template, folder)
+    check = lm.read_check(res.csv)
+    assert list(check.columns) == lm.CHECK_COLS
+    s1 = check[(check["Part"] == "S-1") & (check["Field"] == "Power (W)")].iloc[0]
+    assert s1["Status"] == lm.READ and s1["Value"] == "303"
+    assert s1["Read from"] == s1["Template cell"]
+    moved = check[(check["Part"] == "S-30") & (check["Field"] == FOD)]
+    assert set(moved["Status"]) == {lm.MOVED}
+    assert all(int(r[1:]) == int(t[1:]) + 2 for r, t in
+               zip(moved["Read from"], moved["Template cell"]))
+    blank = check[(check["Part"] == "S-1") & (check["Field"] == "Scan Speed (mm/s)")]
+    assert set(blank["Status"]) == {lm.BLANK}
+    wb = openpyxl.load_workbook(res.workbook)
+    assert wb[lm.CHECK].max_row == len(check) + 1
+
+
+def test_the_analyze_window_shows_each_copys_values_to_check(books):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from council_qt.tabs.ledger_analytics_dialog import AnalyticsDialog
+    QApplication.instance() or QApplication([])
+    template, folder = books
+    _moved_copy(template, folder / "rows added.xlsx", "S-30", rows_at=(4, 4))
+    res = lm.merge(template, folder)
+    dlg = AnalyticsDialog(la.load(res.csv))
+    assert "1 copy read where the layout moved" in dlg.check_note.text()
+    t = dlg.check_files
+    cols = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+    assert t.item(0, cols.index("File")).text() == "rows added.xlsx"     # moved ones first
+    dlg.check_status.setCurrentText(lm.MOVED)
+    assert dlg.check_cells.rowCount() > 0
+    dlg.check_find.setText("Power")
+    assert dlg.check_cells.rowCount() == 0          # Power sits above the inserted rows
+    dlg.data_find.setText("S-30")
+    assert dlg.data_table.rowCount() == len(ITEMS)
+    lo = dlg.left_out_table
+    assert lo.rowCount() >= 1
+    dlg.close()
