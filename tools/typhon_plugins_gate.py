@@ -155,6 +155,10 @@ NOT_GATED: Dict[str, str] = {
     "tests/test_qt_app_examples.py":
         "uses gui_reference's EXAMPLES_DIR (examples/qt_apps, the Qt apps "
         "the models read), not Typhon's examples/gui",
+    "tests/test_physics_project.py":
+        "uses council_core.physics_project's EXAMPLES_DIR (examples/"
+        "physics_models, the worked physics models), not Typhon's "
+        "examples/gui",
 }
 
 #: Words that make a test file a Typhon test file (--check-list).
