@@ -55,11 +55,14 @@ class ResearchActions:
         return web.why_offline()
 
     def models(self) -> List[tuple]:
-        """(label, model id): the US-origin Ollama models, then GGUF files."""
+        """(label, model id): the US-origin Ollama models, then GGUF files.
+        Embedding models (granite-embedding, nomic-embed-text) cannot write,
+        so they are left out."""
         try:
             from .connections import ConnectionsActions
             ca = ConnectionsActions.__new__(ConnectionsActions)
-            out = [(name, name) for name in ca.local_models()]
+            out = [(name, name) for name in ca.local_models()
+                   if "embed" not in name.lower()]
             out += list(ca.gguf_models())
             return out
         except Exception:                                 # noqa: BLE001

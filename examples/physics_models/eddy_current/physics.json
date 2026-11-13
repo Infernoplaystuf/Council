@@ -1,0 +1,12 @@
+{
+  "goal": "",
+  "example": "eddy_current",
+  "data": [
+    {
+      "kind": "folder",
+      "target": "sample_data",
+      "name": "Sample meter readings",
+      "question": ""
+    }
+  ]
+}

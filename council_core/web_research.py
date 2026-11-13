@@ -63,14 +63,24 @@ RESEARCH_DIR = "research"
 
 #: defaults a run uses
 SUB_QUESTIONS = 4
-RESULTS_PER_SEARCH = 5
+RESULTS_PER_SEARCH = 8
 MAX_PAGES = 8
+#: pages kept from one site, so one site (a content farm with an article
+#: per keyword, seen 2026-11-10) cannot fill a run
+MAX_PER_SITE = 2
+#: video and social sites: no article text to read (or robots.txt forbids
+#: it), so they are not fetched - the reads go to pages that have text
+NO_TEXT_SITES = ("youtube.com", "youtu.be", "facebook.com", "instagram.com",
+                 "tiktok.com", "pinterest.com", "x.com", "twitter.com",
+                 "reddit.com")
 #: a page is kept up to this many characters
 PAGE_CHARS = 60_000
 #: a passage is about this long
-PASSAGE_CHARS = 900
+PASSAGE_CHARS = 1600
 #: passages given to the model for one section
 PASSAGES_PER_SECTION = 6
+#: seconds before a failed model call is tried again
+RETRY_WAIT = 3
 
 ChatFn = Callable[..., str]
 Progress = Callable[[str], None]
@@ -218,7 +228,7 @@ def page_header(src: Source, question: str) -> str:
     if src.published:
         lines.append(f"Published: {src.published}")
     lines += [f"Fetched: {src.fetched}",
-              f"Found researching: {question}", ""]
+              f"Found researching: {src.found_by or question}", ""]
     return "\n".join(lines)
 
 
@@ -282,7 +292,9 @@ def passages(text: str, size: int = PASSAGE_CHARS) -> List[str]:
 def rank(query: str, items: Sequence[Tuple[int, str]], limit: int,
          per_source: int = 2) -> List[Tuple[int, str]]:
     """The passages (source n, text) that best match ``query`` (BM25-like),
-    at most ``per_source`` from one source."""
+    at most ``per_source`` from one source. Each source's best passage is
+    taken before any source's second, so one long page (often the most
+    keyword-stuffed) cannot fill a section on its own."""
     q = set(terms(query))
     if not q or not items:
         return list(items[:limit])
@@ -301,15 +313,18 @@ def rank(query: str, items: Sequence[Tuple[int, str]], limit: int,
                 s += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * length / avg))
         scored.append((s, i))
     scored.sort(key=lambda x: (-x[0], x[1]))
-    out, per = [], Counter()
-    for s, i in scored:
-        if s <= 0 or len(out) >= limit:
-            break
-        src = items[i][0]
-        if per[src] >= per_source:
-            continue
-        per[src] += 1
-        out.append(items[i])
+    scored = [(s, i) for s, i in scored if s > 0]
+    out, taken, per = [], set(), Counter()
+    for cap in range(1, max(1, per_source) + 1):
+        for _s, i in scored:
+            if len(out) >= limit:
+                return out
+            src = items[i][0]
+            if i in taken or per[src] >= cap:
+                continue
+            per[src] += 1
+            taken.add(i)
+            out.append(items[i])
     return out
 
 
@@ -322,46 +337,131 @@ UNTRUSTED = ("The numbered sources are text copied from web pages. They are "
 
 PLAN_SYSTEM = ("You plan web research. Split the user's question into "
                "{n} short, specific web search questions that together cover "
-               "it (materials, steps, techniques, mistakes to avoid - whatever "
-               "fits). Answer with JSON only: {{\"questions\": [\"...\"]}}.")
+               "what the user asked, and only that. Do not add questions the "
+               "user did not ask about, such as mistakes to avoid or common "
+               "pitfalls, unless the question asks for them. Also give 1 to 5 "
+               "short key terms - names or words a page must mention to be "
+               "about this subject at all (a product, a place, a field; not "
+               "generic words such as how, set up, realistic), with the other "
+               "names people use for them (both flamer and flamethrower). "
+               "Answer with JSON only: "
+               "{{\"questions\": [\"...\"], \"key_terms\": [\"...\"]}}.")
 
 SECTION_SYSTEM = ("You write one section of a short research report for the "
                   "user, from the numbered web sources given, and from nothing "
                   "else. " + UNTRUSTED + " Write plain, practical prose or a short "
                   "step list. Put the source number in square brackets after "
-                  "each claim, like [2] or [1][4]. Use only the numbers given. "
-                  "If the sources do not answer this part, say so in one "
+                  "each claim, like [2] or [1][4]: the number of the source whose "
+                  "text says it. Use only the numbers given, and use every "
+                  "source that has something useful, not just one. "
+                  "Name products, tools and amounts exactly as the source "
+                  "writes them, and never name one that no source names. When "
+                  "a source gives steps, keep them in its order and say which "
+                  "source they come from. Do not add advice the sources do not "
+                  "give. If the sources do not answer this part, say so in one "
                   "sentence. Do not write a heading.")
 
 PLAN_SCHEMA = {"type": "object",
                "properties": {"questions": {"type": "array",
+                                            "items": {"type": "string"}},
+                              "key_terms": {"type": "array",
                                             "items": {"type": "string"}}},
-               "required": ["questions"]}
+               "required": ["questions", "key_terms"]}
+
+CHECK_SYSTEM = ("You check a research report for statements in DIFFERENT "
+                "sections that contradict each other: one says a thing is so "
+                "and another says it is not, or they give different values, "
+                "rules or formulas for the same thing. Ignore differences of "
+                "wording, detail or emphasis. Copy each statement exactly as "
+                "it is written in its section (a short phrase or one "
+                "sentence). Then say which statement the numbered sources "
+                "support: \"a\", \"b\", or \"unclear\" if they do not settle it. "
+                + UNTRUSTED + " If nothing contradicts, answer with an empty "
+                "list. Answer with JSON only.")
+
+CHECK_SCHEMA = {"type": "object",
+                "properties": {"conflicts": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {"section_a": {"type": "integer"},
+                                   "quote_a": {"type": "string"},
+                                   "section_b": {"type": "integer"},
+                                   "quote_b": {"type": "string"},
+                                   "supported": {"type": "string",
+                                                 "enum": ["a", "b", "unclear"]}},
+                    "required": ["section_a", "quote_a", "section_b",
+                                 "quote_b", "supported"]}}},
+                "required": ["conflicts"]}
+#: passages given to the contradiction check to judge by
+CHECK_PASSAGES = 10
 
 
 def _call(chat: ChatFn, messages: List[Dict[str, str]], num_predict,
-          schema: Any = None) -> str:
-    try:
-        return (chat(messages, num_predict=num_predict, schema=schema) or "").strip()
-    except TypeError:
-        return (chat(messages) or "").strip()
+          schema: Any = None, tries: int = 2) -> str:
+    """The model's reply. A failed call is tried once more after a short
+    wait: Ollama's model server can crash on the first call after a model
+    loads (0xc0000409 on Windows, 2026-11-11), and the planning step then
+    quietly fell back to a single search."""
+    for attempt in range(tries):
+        try:
+            try:
+                return (chat(messages, num_predict=num_predict, schema=schema) or "").strip()
+            except TypeError:
+                return (chat(messages) or "").strip()
+        except Exception:                                # noqa: BLE001
+            if attempt + 1 >= tries:
+                raise
+            time.sleep(RETRY_WAIT)
+    return ""
 
 
 def plan(question: str, chat: Optional[ChatFn], n: int = SUB_QUESTIONS) -> List[str]:
     """Sub-questions to search; the question itself without a model."""
+    return plan_and_terms(question, chat, n)[0]
+
+
+#: question words that are never a key term
+_NOT_KEY = set("""how what which who why when where does do is are can should i
+my the a an and or of for to in on with""".split())
+
+
+def guess_terms(question: str) -> List[str]:
+    """Key terms without a model: the question's names and acronyms
+    (capitalised words not starting it, words with capitals inside)."""
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'’-]*", question)
+    acronyms, names = [], []
+    for i, w in enumerate(words):
+        w = w.strip("'’-")
+        if w.lower() in _NOT_KEY or len(w) < 2:
+            continue
+        if sum(c.isupper() for c in w) > 1:
+            acronyms.append(w)                 # JEDD, SPC, CoaXPress
+        elif i > 0 and w[0].isupper():
+            names.append(w)                    # Prophesee, Warhammer
+    return list(dict.fromkeys(acronyms + names))[:3]
+
+
+def plan_and_terms(question: str, chat: Optional[ChatFn],
+                   n: int = SUB_QUESTIONS) -> Tuple[List[str], List[str]]:
+    """(sub-questions, key terms). Key terms are what a page must mention
+    to be about the subject (Prophesee, JEDD): with a day of searches spread
+    over smaller engines, a question about event cameras found car-price
+    and sports pages (2026-11-11)."""
     question = " ".join(question.split())
+    guessed = guess_terms(question)
     if chat is None or n <= 1:
-        return [question]
+        return [question], guessed
     msgs = [{"role": "system", "content": PLAN_SYSTEM.format(n=n)},
             {"role": "user", "content": question}]
     try:
-        raw = _call(chat, msgs, token_budget.reply("short", 300), PLAN_SCHEMA)
+        raw = _call(chat, msgs, token_budget.reply("short", 800), PLAN_SCHEMA)
     except Exception:                                    # noqa: BLE001
-        return [question]
+        return [question], guessed
     qs: List[str] = []
+    keys: List[str] = []
     try:
         doc = json.loads(raw[raw.find("{"): raw.rfind("}") + 1] or raw)
         qs = doc.get("questions", []) if isinstance(doc, dict) else list(doc)
+        keys = doc.get("key_terms", []) if isinstance(doc, dict) else []
     except (ValueError, TypeError, AttributeError):
         qs = [ln.strip(" -*0123456789.)\t") for ln in raw.splitlines()]
     seen, out = set(), []
@@ -370,10 +470,129 @@ def plan(question: str, chat: Optional[ChatFn], n: int = SUB_QUESTIONS) -> List[
         if len(q) > 3 and q.lower() not in seen:
             seen.add(q.lower())
             out.append(q)
-    return out[:n] or [question]
+    # a key term the model made up that the question does not contain is
+    # still allowed (a synonym), but generic words are not
+    keys = [k for k in (" ".join(str(k).split())[:60] for k in keys)
+            if k and k.lower() not in _NOT_KEY and len(k) > 1][:5]
+    return out[:n] or [question], keys or guessed
+
+
+_DASHES = re.compile("[‐-―−]")
+
+
+def _plain(text: str) -> str:
+    """Lower case, every kind of dash a hyphen, every space one space (a
+    model wrote "X‑bar", with a non-breaking hyphen, 2026-11-11)."""
+    return " ".join(_DASHES.sub("-", text.replace(" ", " ")).lower().split())
+
+
+def on_topic(text: str, keys: Sequence[str]) -> bool:
+    """``text`` mentions one of ``keys``: the key itself, or every word of
+    it (a long word by its stem: scorch for scorched). No keys means
+    anything is on topic."""
+    if not keys:
+        return True
+    low = _plain(text)
+    for key in keys:
+        k = _plain(key)
+        if k and k in low:
+            return True
+        words = [w[:-2] if len(w) > 5 else w for w in re.findall(r"[a-z0-9]+", k)]
+        if words and all(w in low for w in words):
+            return True
+    return False
 
 
 _CITE = re.compile(r"\[(\d{1,3})\]")
+#: citations some models write: 【2】 ［2］ [1, 4] [1][4]-style lists
+_ODD_CITE = re.compile(r"[【［\[]\s*(\d{1,3}(?:\s*[,;]\s*\d{1,3})*)\s*[】］\]]")
+
+
+def normalise_citations(text: str) -> str:
+    """【2】, ［2］ and [1, 4] written as [2] and [1][4], so they are checked
+    like any other citation (a section citing only 【2】 was said to cite
+    nothing, 2026-11-10)."""
+    return _ODD_CITE.sub(lambda m: "".join(
+        f"[{n}]" for n in re.split(r"\s*[,;]\s*", m.group(1))), text)
+
+
+# -- names checked against the pages ---------------------------------------
+#: words that start a capitalised run but are not part of a product's name
+_NAME_LEAD = set("""a an and the or of for with to in on at by from use using
+apply add start then try mix thin finish base layer glaze wash drybrush paint
+prime seal keep avoid citadel vallejo game color colour air model army painter
+warpaints scale75 ak tamiya if when then yes no not otherwise else because
+since while although these this that those each every both some many most our
+your their its""".split())
+_NAME = re.compile(r"\b[A-Z][A-Za-z0-9'’-]*(?:\s+[A-Z][A-Za-z0-9'’-]*){1,3}")
+
+
+def names_in(text: str, known: str = "") -> List[str]:
+    """Product-like names in ``text``: two or more capitalised words inside
+    a sentence (Magos Purple, Canoptek Alloy), not a heading, a bold label,
+    a line that is only a label, or anything in ``known`` (the question,
+    the heading)."""
+    out = []
+    known = known.lower()
+    for line in text.splitlines():
+        if line.lstrip().startswith(("#", "|")):               # a heading, a table
+            continue
+        body = re.sub(r"\*\*[^*]+\*\*:?", " ", line)          # bold labels
+        body = re.sub(r"^\s*(?:[-*]|\d+[.)])?\s*", "", body)    # list marks
+        if _NAME.fullmatch(body.strip(" :*_")):                 # a label line
+            continue
+        for m in _NAME.finditer(body):
+            words = m.group(0).split()
+            while words and words[0].lower() in _NAME_LEAD:
+                words = words[1:]
+            # a possessive ends a name: "Fox's ENERGY STAR" is two
+            for part in re.split(r"['’]s(?:\s+|$)", " ".join(words)):
+                name = part.strip("'’- ")
+                if len(name.split()) >= 2 and name.lower() not in known:
+                    out.append(name)
+    return list(dict.fromkeys(out))
+
+
+def ground_names(text: str, pages: Dict[int, str], known: str = "") -> Tuple[str, int, int]:
+    """Check each product-like name against the pages its block cites.
+
+    A name another page has gets that page's number added to the block (the
+    model credited the wrong source); a name no page has is marked "(not in
+    the sources)". Returns (text, names re-credited, names not found)."""
+    low = {n: t.lower() for n, t in pages.items()}
+    moved = missing = 0
+
+    def has(page: str, name: str) -> bool:
+        """The page names it: as written, or without a plural s; a name
+        with an acronym in it (IRS HDHP, RITA FAQ, CD4) when the page has
+        each of its words (false alarms in a ten-question test, 2026-11-11)."""
+        key = name.lower()
+        if key in page or (key.endswith("s") and key[:-1] in page):
+            return True
+        words = name.split()
+        if any(sum(c.isupper() for c in w) > 1 or (any(c.isdigit() for c in w)
+                                                    and any(c.isupper() for c in w))
+               for w in words):
+            return all(re.sub(r"s$", "", w.lower()) in page for w in words)
+        return False
+
+    blocks = re.split(r"(\n\s*\n)", text)
+    for i in range(0, len(blocks), 2):
+        block = blocks[i]
+        cites = {int(x) for x in _CITE.findall(block)}
+        for name in names_in(block, known):
+            if any(has(low.get(c, ""), name) for c in cites):
+                continue
+            having = [n for n, t in sorted(low.items()) if has(t, name)]
+            if having:
+                block = block.rstrip() + f" [{having[0]}]"
+                cites.add(having[0])
+                moved += 1
+            else:
+                block = re.sub(re.escape(name), f"{name} (not in the sources)", block, count=1)
+                missing += 1
+        blocks[i] = block
+    return "".join(blocks), moved, missing
 
 
 def check_citations(text: str, allowed: Sequence[int]) -> Tuple[str, List[int], int]:
@@ -381,6 +600,7 @@ def check_citations(text: str, allowed: Sequence[int]) -> Tuple[str, List[int], 
     cites, how many were taken out)."""
     ok = set(allowed)
     dropped = 0
+    text = normalise_citations(text)
 
     def keep(m):
         nonlocal dropped
@@ -411,10 +631,19 @@ def write_sections(run: Run, chat: Optional[ChatFn], *,
         for p in passages(read_source_text(run, src)):
             items.append((src.n, p))
     run.sections = []
+    used: set = set()
     for i, sq in enumerate(run.sub_questions, 1):
         if should_stop and should_stop():
             break
-        chosen = rank(f"{sq} {run.question}", items, PASSAGES_PER_SECTION)
+        # the sub-question alone (the whole question added to each one gave
+        # every section the same passages); passages an earlier section had
+        # are used again only when nothing fresh matches
+        fresh = [it for it in items if it not in used]
+        chosen = rank(sq, fresh, PASSAGES_PER_SECTION)
+        if len(chosen) < PASSAGES_PER_SECTION // 2:
+            chosen = rank(sq, items, PASSAGES_PER_SECTION) or rank(
+                f"{sq} {run.question}", items, PASSAGES_PER_SECTION)
+        used.update(chosen)
         sec = Section(heading=sq)
         if not chosen:
             sec.note = "No page read for this run says anything about this."
@@ -440,13 +669,110 @@ def write_sections(run: Run, chat: Optional[ChatFn], *,
             run.sections.append(sec)
             continue
         sec.text, sec.cited, dropped = check_citations(raw, [n for n, _ in chosen])
+        pages = {src.n: read_source_text(run, src) for src in run.kept()}
+        sec.text, moved, missing = ground_names(sec.text, pages, f"{run.question} {sq}")
+        sec.cited = sorted({int(x) for x in _CITE.findall(sec.text)})
         notes = []
         if dropped:
             notes.append(f"{dropped} citation(s) to sources the model was not given were taken out.")
+        if moved:
+            notes.append(f"{moved} name(s) were credited to the wrong source; "
+                         f"the source that has them was added.")
+        if missing:
+            notes.append(f"{missing} name(s) appear in no source read and are "
+                         f"marked \"(not in the sources)\".")
         if sec.text and not sec.cited:
             notes.append("This part cites no source: treat it as the model's own words.")
         sec.note = " ".join(notes)
         run.sections.append(sec)
+    if chat is not None and not (should_stop and should_stop()):
+        if on_progress and sum(1 for s in run.sections if s.text) > 1:
+            on_progress("Checking the sections against each other…")
+        check_sections(run, chat, items)
+
+
+def _mark(text: str, quote: str, marker: str) -> Tuple[str, bool]:
+    """``text`` with ``marker`` put after the sentence holding ``quote``
+    (matched ignoring case and spacing); unchanged if it is not there."""
+    words = [re.escape(w) for w in quote.split()]
+    if not words:
+        return text, False
+    m = re.search(r"\s+".join(words), text, re.I)
+    if not m:
+        return text, False
+    rest = text[m.end():]
+    stop = re.search(r"[.!?](?=\s|$)|\n", rest)
+    if stop is None:
+        at = len(text)
+    elif stop.group(0) == "\n":
+        at = m.end() + stop.start()          # the line ends first
+    else:
+        at = m.end() + stop.end()            # after the sentence's full stop
+    return text[:at] + marker + text[at:], True
+
+
+def check_sections(run: Run, chat: ChatFn, items: Sequence[Tuple[int, str]]) -> int:
+    """One more model call: statements in different sections that contradict
+    each other (a JEDD report said in one section that employees pay the tax
+    and in another that they do not, 2026-11-11). Each one found - only if
+    both statements really are in their sections - is marked in place, the
+    statement the sources do not support (both, when they do not settle it),
+    and the section's note says so. Returns how many were marked."""
+    written = [(i, s) for i, s in enumerate(run.sections, 1) if s.text]
+    if len(written) < 2:
+        return 0
+    report = "\n\n".join(f"Section {i}: {s.heading}\n{s.text}" for i, s in written)
+    chosen = rank(run.question, list(items), CHECK_PASSAGES)
+    msgs = [{"role": "system", "content": CHECK_SYSTEM},
+            {"role": "user", "content":
+                f"Sources:\n\n{_source_block(run, chosen)}\n\n"
+                f"The report:\n\n{report}"}]
+    try:
+        raw = _call(chat, msgs, token_budget.reply("answer", 900), CHECK_SCHEMA)
+        doc = json.loads(raw[raw.find("{"): raw.rfind("}") + 1] or "{}")
+        found = (doc.get("conflicts") or []) if isinstance(doc, dict) else []
+    except Exception:                                    # noqa: BLE001
+        return 0
+    def where(quote: str, hint: Any) -> int:
+        """The section that has ``quote`` - the model's number when that
+        section has it, else the first that does (gpt-oss gave the right
+        quotes with wrong section numbers); 0 when none has it, so a quote
+        it made up marks nothing."""
+        try:
+            hint = int(hint)
+        except (TypeError, ValueError):
+            hint = 0
+        if 1 <= hint <= len(run.sections) and _mark(run.sections[hint - 1].text, quote, "")[1]:
+            return hint
+        for i, s in enumerate(run.sections, 1):
+            if _mark(s.text, quote, "")[1]:
+                return i
+        return 0
+
+    marked = 0
+    done = set()
+    for c in found:
+        if not isinstance(c, dict):
+            continue
+        qa, qb = str(c.get("quote_a", "")).strip(), str(c.get("quote_b", "")).strip()
+        side = str(c.get("supported", "unclear"))
+        a, b = where(qa, c.get("section_a")), where(qb, c.get("section_b"))
+        if not a or not b or a == b or (a, qa) in done or (b, qb) in done:
+            continue
+        done.update({(a, qa), (b, qb)})
+        sa, sb = run.sections[a - 1], run.sections[b - 1]
+        wrong = {"a": [(sb, b, a)], "b": [(sa, a, b)]}.get(
+            side, [(sa, a, b), (sb, b, a)])
+        for sec, here, other in wrong:
+            quote = qa if here == a else qb
+            tail = (f"the sources support section {other}" if side in ("a", "b")
+                    else "the sources do not settle it")
+            sec.text, _ = _mark(sec.text, quote,
+                                f" ⚠ (section {other} says otherwise; {tail})")
+            note = f"Section {other} contradicts this part; check the marked statement."
+            sec.note = f"{sec.note} {note}".strip() if note not in sec.note else sec.note
+        marked += 1
+    return marked
 
 
 def report_markdown(run: Run) -> str:
@@ -477,6 +803,35 @@ def report_markdown(run: Run) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _then_held(order, held):
+    """(q, hit, second): ``order``, then whatever was put into ``held``
+    while going through it (``second`` True), each once."""
+    for q, hit in order:
+        yield q, hit, False
+    for q, hit in list(held):
+        yield q, hit, True
+
+
+def _site(url: str) -> str:
+    """The site a URL is on, without www. or m. (youtube.com, not
+    www.youtube.com), so subdomains of one site count as one."""
+    host = web._host(url).lower().split(":")[0]
+    for prefix in ("www.", "m.", "old."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    return host
+
+
+def _discard(folder: Path) -> None:
+    """Take away a run folder that read nothing (its run file, the empty
+    pages folder, the folder): only those, never anything else in it."""
+    for path in (folder / RUN_FILE, folder / PAGES_DIR, folder):
+        try:
+            path.unlink() if path.is_file() else path.rmdir()
+        except OSError:
+            pass
+
+
 def finish(run: Run) -> None:
     run.written = web.now_iso()
     _write_text(run.path / REPORT_FILE, report_markdown(run))
@@ -501,15 +856,15 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
     stop = should_stop or (lambda: False)
 
     say("Planning the searches…")
-    subs = plan(question, chat, sub_questions)
-    folder = new_folder(vault, question)
-    run = Run(question=question, folder=str(folder), sub_questions=subs,
-              model=model, engine=settings.search, started=web.now_iso())
-    save_run(run)
+    subs, keys = plan_and_terms(question, chat, sub_questions)
+    started = web.now_iso()
 
-    # search: the question itself first, then each sub-question
+    # search: the question itself first, then each sub-question. The run's
+    # folder is made only once a search has found something, so a run that
+    # finds nothing leaves no empty folder behind in the run list.
     queries = [question] + [q for q in subs if q.lower() != question.lower()]
     lists: List[Tuple[str, List[web.Hit]]] = []
+    errors: List[str] = []
     for i, q in enumerate(queries):
         if stop():
             break
@@ -517,13 +872,24 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         try:
             lists.append((q, web.search(q, results_per_search)))
         except web.WebError as exc:
-            run.skipped.append(f"search {q!r}: {exc}")
+            errors.append(str(exc))
         web.pause()
     if not any(hits for _, hits in lists):
-        run.skipped.append("no search found any page")
-        save_run(run)
-        reason = run.skipped[0] if run.skipped else "no results"
-        raise ResearchError(f"the search found nothing to read ({reason})")
+        reason = errors[0] if errors else "no results for any search"
+        raise ResearchError(f"the search found nothing to read: {reason}")
+
+    engines = {h.engine for _, hits in lists for h in hits if h.engine}
+    engine = settings.search
+    folder = new_folder(vault, question)
+    run = Run(question=question, folder=str(folder), sub_questions=subs,
+              model=model, engine=engine, started=started)
+    if engines and engine not in engines:
+        run.engine = sorted(engines)[0]
+        run.skipped.append(
+            f"{web.ENGINE_NAMES.get(engine, engine)} could not be reached, so "
+            f"{web.ENGINE_NAMES.get(run.engine, run.engine)} searched instead")
+    run.skipped += [f"a search failed: {e}" for e in dict.fromkeys(errors)]
+    save_run(run)
 
     # take the results in turns, so every sub-question gets its best pages
     order: List[Tuple[str, web.Hit]] = []
@@ -536,9 +902,26 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
 
     robots = web.Robots()
     pages_dir = folder / PAGES_DIR
-    for q, hit in order:
+    per_site: Counter = Counter()
+    passed: Counter = Counter()
+    off: Counter = Counter()
+    held: List[Tuple[str, web.Hit]] = []
+    # pages over a site's MAX_PER_SITE wait in ``held``; they are read
+    # only if the other sites leave room (a vendor's own documentation is
+    # often the best source - a Basler question read 2 pages, 2026-11-11)
+    for q, hit, second in _then_held(order, held):
         if len(run.sources) >= max_pages or stop():
             break
+        site = _site(hit.url)
+        if site in NO_TEXT_SITES:
+            passed[site] += 1
+            continue
+        if not second and not on_topic(f"{hit.title} {hit.snippet} {hit.url}", keys):
+            held.append((q, hit))      # read last: its page may still be on topic
+            continue
+        if per_site[site] >= MAX_PER_SITE and not second:
+            held.append((q, hit))
+            continue
         say(f"Reading {web._host(hit.url)} ({len(run.sources) + 1}/{max_pages})…")
         try:
             page = web.fetch(hit.url, robots=robots)
@@ -551,6 +934,10 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         if len(terms(art.text)) < 40:
             run.skipped.append(f"{art.site}: too little text on the page")
             continue
+        if not on_topic(f"{art.title} {art.text}", keys):
+            off[site] += 1
+            continue
+        per_site[site] += 1
         n = len(run.sources) + 1
         src = Source(n=n, url=page.final_url or hit.url,
                      title=art.title or hit.title or art.site, site=art.site,
@@ -563,8 +950,15 @@ def research(question: str, vault: Any, chat: Optional[ChatFn] = None, *,
         _write_text(pages_dir / Path(src.file).name, page_header(src, question) + "\n" + body + "\n")
         run.sources.append(src)
         save_run(run)
+    if passed:
+        run.skipped.append("video or social sites, not read: " + ", ".join(
+            f"{s} ({k})" if k > 1 else s for s, k in passed.most_common()))
+    if off:
+        run.skipped.append(f"off the subject (no mention of {' / '.join(keys)}), "
+                           f"not used: " + ", ".join(
+                               f"{s} ({k})" if k > 1 else s for s, k in off.most_common()))
     if not run.sources:
-        save_run(run)
+        _discard(folder)
         raise ResearchError("none of the pages found could be read: "
                             + "; ".join(run.skipped[:4]))
 

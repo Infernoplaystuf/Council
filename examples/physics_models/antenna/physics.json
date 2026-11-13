@@ -1,0 +1,12 @@
+{
+  "goal": "",
+  "example": "antenna",
+  "data": [
+    {
+      "kind": "folder",
+      "target": "sample_data",
+      "name": "Sample analyzer sweep",
+      "question": ""
+    }
+  ]
+}

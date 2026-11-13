@@ -28,12 +28,21 @@ WHAT GOES OUT
   * robots.txt is read (and kept for the run) and a page it disallows is not
     fetched.
   * A page is cut at MAX_BYTES; only text-like pages (HTML, plain text,
-    Markdown, JSON) are read.
+    Markdown, JSON) and PDFs are read. A PDF (up to MAX_PDF_BYTES, its first
+    MAX_PDF_PAGES pages) is read as text with pypdf - datasheets, manuals and
+    tax forms are often only PDFs (seen 2026-11-11); an encrypted or broken
+    PDF is skipped with a sentence saying so.
 
 Search engines (``search``):
-  * "duckduckgo" (default): DuckDuckGo's HTML page, no key or account;
-  * "brave": the Brave Search API with the user's own key;
-  * "searxng": the user's own SearXNG server (its JSON output).
+  * "searxng" (default): a SearXNG server, no key or account - by default
+    the one Settings › Online › "Set up SearXNG" runs in Docker on this PC
+    (council_core.searxng, http://127.0.0.1:8888). It asks several engines
+    and merges their results, so one engine refusing does not stop a search.
+    If it cannot be reached, DuckDuckGo is tried instead;
+  * "duckduckgo": DuckDuckGo's HTML page, no key or account. DuckDuckGo
+    often answers a program with its bot check instead of results (seen
+    2026-11-10); that is reported as such, never got round;
+  * "brave": the Brave Search API with the user's own key.
 
 What a page SAYS is data. Nothing here interprets it; council_core.
 web_research tells the model to ignore instructions written in pages.
@@ -61,13 +70,24 @@ from typing import Any, Dict, List, Optional, Tuple
 from council_core import paths
 
 SETTINGS_FILE = "online.json"
-ENGINES = ("duckduckgo", "brave", "searxng")
-ENGINE_NAMES = {"duckduckgo": "DuckDuckGo (no account)",
-                "brave": "Brave Search (your API key)",
-                "searxng": "Your own SearXNG server"}
+ENGINES = ("searxng", "duckduckgo", "brave")
+DEFAULT_ENGINE = "searxng"
+ENGINE_NAMES = {"searxng": "SearXNG (no account; on this PC or your server)",
+                "duckduckgo": "DuckDuckGo (no account)",
+                "brave": "Brave Search (your API key)"}
+#: where "Set up SearXNG" runs it, and the address used when none is saved
+DEFAULT_SEARXNG = "http://127.0.0.1:8888"
+#: DuckDuckGo's bot-check page instead of results
+DDG_BLOCKED = ("DuckDuckGo showed its bot check instead of results, so it is "
+               "not answering Council's searches. Use SearXNG instead "
+               "(Settings › Online › Set up SearXNG).")
 USER_AGENT = "CouncilResearch/1.0 (+offline-first desktop app; one page at a time)"
 #: a page is read up to this many bytes, then cut
 MAX_BYTES = 2_000_000
+#: a PDF is read up to this many bytes (they run larger than pages) ...
+MAX_PDF_BYTES = 15_000_000
+#: ... and up to this many of its pages
+MAX_PDF_PAGES = 60
 #: seconds a request may take
 TIMEOUT = 20
 #: content types read as text
@@ -91,7 +111,7 @@ class WebError(RuntimeError):
 @dataclass
 class Settings:
     online: bool = False
-    search: str = "duckduckgo"
+    search: str = DEFAULT_ENGINE
     searxng_url: str = ""
     brave_key: str = ""
 
@@ -118,7 +138,7 @@ def load() -> Settings:
         return Settings()
     if not isinstance(doc, dict):
         return Settings()
-    engine = doc.get("search") if doc.get("search") in ENGINES else "duckduckgo"
+    engine = doc.get("search") if doc.get("search") in ENGINES else DEFAULT_ENGINE
     return Settings(online=doc.get("online") is True, search=engine,
                     searxng_url=str(doc.get("searxng_url") or "").strip(),
                     brave_key=str(doc.get("brave_key") or "").strip())
@@ -175,6 +195,7 @@ class Page:
     text: str                    # the body, decoded
     fetched: str = ""            # ISO time, UTC
     cut: bool = False            # longer than MAX_BYTES
+    title: str = ""              # a PDF's own title, when it has one
 
 
 def now_iso() -> str:
@@ -199,7 +220,8 @@ def _opener():
 
 
 def _open(url: str, headers: Optional[Dict[str, str]] = None,
-          timeout: float = TIMEOUT) -> Tuple[Any, bytes, bool]:
+          timeout: float = TIMEOUT,
+          max_bytes: int = MAX_BYTES) -> Tuple[Any, bytes, bool]:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
                                                "Accept-Language": "en",
                                                **(headers or {})})
@@ -212,8 +234,8 @@ def _open(url: str, headers: Optional[Dict[str, str]] = None,
     except (TimeoutError, OSError) as exc:
         raise WebError(f"could not reach {_host(url)}: {exc}") from None
     with resp:
-        body = resp.read(MAX_BYTES + 1)
-    return resp, body[:MAX_BYTES], len(body) > MAX_BYTES
+        body = resp.read(max_bytes + 1)
+    return resp, body[:max_bytes], len(body) > max_bytes
 
 
 def _host(url: str) -> str:
@@ -262,15 +284,52 @@ def fetch(url: str, *, robots: Optional[Robots] = None) -> Page:
     if robots is not None and not robots.allowed(url):
         raise WebError(f"{_host(url)} asks crawlers not to read that page "
                        f"(robots.txt), so it was skipped")
-    resp, body, cut = _open(url)
+    resp, body, cut = _open(url, max_bytes=MAX_PDF_BYTES)
     ctype = resp.headers.get("Content-Type", "") or ""
+    if "application/pdf" in ctype.lower() or body[:5] == b"%PDF-":
+        if cut:
+            raise WebError(f"{_host(url)} sent a PDF over "
+                           f"{MAX_PDF_BYTES // 1_000_000} MB, too large to read")
+        title, text = pdf_text(body, _host(url))
+        return Page(url=url, final_url=resp.geturl() or url,
+                    status=getattr(resp, "status", 200) or 200,
+                    content_type="application/pdf", text=text,
+                    fetched=now_iso(), title=title)
     if ctype and not any(t in ctype.lower() for t in TEXT_TYPES):
         raise WebError(f"{_host(url)} sent {ctype.split(';')[0]}, not a "
                        f"web page Council can read")
+    cut = cut or len(body) > MAX_BYTES
+    body = body[:MAX_BYTES]
     return Page(url=url, final_url=resp.geturl() or url,
                 status=getattr(resp, "status", 200) or 200,
                 content_type=ctype, text=_decode(body, ctype),
                 fetched=now_iso(), cut=cut)
+
+
+def pdf_text(body: bytes, site: str = "") -> Tuple[str, str]:
+    """(title, text) of a PDF, with pypdf: its first MAX_PDF_PAGES pages,
+    one paragraph break between pages. Nothing in the PDF is run."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(body))
+        if reader.is_encrypted:
+            raise WebError(f"{site}: the PDF is locked, so it was not read")
+        parts = []
+        for page in reader.pages[:MAX_PDF_PAGES]:
+            parts.append(page.extract_text() or "")
+        title = ""
+        try:
+            title = str((reader.metadata or {}).get("/Title") or "").strip()
+        except Exception:                                # noqa: BLE001
+            title = ""
+    except WebError:
+        raise
+    except ImportError:
+        raise WebError("reading PDFs needs pypdf (pip install pypdf)") from None
+    except Exception as exc:                             # noqa: BLE001
+        raise WebError(f"{site}: the PDF could not be read ({type(exc).__name__})") from None
+    return title[:300], "\n\n".join(p.strip() for p in parts if p.strip())
 
 
 # ======================================================================
@@ -373,7 +432,7 @@ def read_page(page: Page) -> Article:
     site = _host(page.final_url or page.url)
     if "html" not in ctype and not page.text.lstrip()[:200].lower().startswith(
             ("<!doctype html", "<html")):
-        return Article(title=site, text=_tidy(page.text), site=site)
+        return Article(title=page.title or site, text=_tidy(page.text), site=site)
     r = _Reader()
     try:
         r.feed(page.text)
@@ -399,6 +458,7 @@ class Hit:
     url: str
     title: str = ""
     snippet: str = ""
+    engine: str = ""             # the engine that found it
 
 
 def _ddg_url(href: str) -> str:
@@ -441,47 +501,85 @@ def parse_duckduckgo(page_html: str) -> List[Hit]:
     return hits
 
 
+def _search_brave(q: str, limit: int, key: str) -> List[Hit]:
+    if not key:
+        raise WebError("Brave Search needs your API key (Settings › Online)")
+    _, body, _ = _open(f"https://api.search.brave.com/res/v1/web/search?q={q}"
+                       f"&count={max(1, min(limit, 20))}",
+                       headers={"Accept": "application/json",
+                                "X-Subscription-Token": key})
+    doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
+    rows = ((doc.get("web") or {}).get("results") or [])
+    return [Hit(url=r.get("url", ""), title=r.get("title", ""),
+                snippet=re.sub(r"<[^>]+>", "", r.get("description", "")))
+            for r in rows if str(r.get("url", "")).startswith("http")]
+
+
+def _search_searxng(q: str, base: str) -> List[Hit]:
+    base = (base or DEFAULT_SEARXNG).rstrip("/")
+    _check_url(base)
+    _, body, _ = _open(f"{base}/search?q={q}&format=json",
+                       headers={"Accept": "application/json"})
+    try:
+        doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
+    except ValueError:
+        raise WebError("the SearXNG server did not answer in JSON - switch on "
+                       "the json format in its settings.yml") from None
+    hits = [Hit(url=r.get("url", ""), title=r.get("title", ""),
+                snippet=r.get("content", ""))
+            for r in doc.get("results") or [] if str(r.get("url", "")).startswith("http")]
+    down = doc.get("unresponsive_engines") or []
+    if not hits and down:
+        # every engine it asked refused (rate limits, a CAPTCHA): say which,
+        # rather than "found nothing"
+        said = ", ".join(f"{e[0]} ({e[1]})" if isinstance(e, (list, tuple)) and len(e) > 1
+                         else str(e) for e in down[:6])
+        raise WebError(f"SearXNG's search engines are not answering ({said}); "
+                       f"they usually allow searches again within an hour")
+    return hits
+
+
+def _search_duckduckgo(q: str) -> List[Hit]:
+    _, body, _ = _open(f"https://html.duckduckgo.com/html/?q={q}")
+    page = body.decode("utf-8", errors="replace")
+    hits = parse_duckduckgo(page)
+    if not hits and duckduckgo_blocked(page):
+        raise WebError(DDG_BLOCKED)
+    return hits
+
+
+def duckduckgo_blocked(page_html: str) -> bool:
+    """DuckDuckGo's bot check (its "anomaly" picture challenge) instead of
+    results. Council says so; it never tries to answer the check."""
+    return "anomaly-modal" in page_html or 'id="challenge-form"' in page_html
+
+
 def search(query: str, limit: int = 6) -> List[Hit]:
-    """Web results for ``query`` from the engine chosen in Settings."""
+    """Web results for ``query`` from the engine chosen in Settings; a
+    SearXNG server that cannot be reached falls back to DuckDuckGo. Each
+    Hit says which engine found it."""
     s = require_online()
     query = " ".join(str(query or "").split())[:300]
     if not query:
         return []
     q = urllib.parse.quote_plus(query)
     if s.search == "brave":
-        if not s.brave_key:
-            raise WebError("Brave Search needs your API key (Settings › Online)")
-        _, body, _ = _open(f"https://api.search.brave.com/res/v1/web/search?q={q}"
-                           f"&count={max(1, min(limit, 20))}",
-                           headers={"Accept": "application/json",
-                                    "X-Subscription-Token": s.brave_key})
-        doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
-        rows = ((doc.get("web") or {}).get("results") or [])
-        hits = [Hit(url=r.get("url", ""), title=r.get("title", ""),
-                    snippet=re.sub(r"<[^>]+>", "", r.get("description", "")))
-                for r in rows if str(r.get("url", "")).startswith("http")]
+        hits, engine = _search_brave(q, limit, s.brave_key), "brave"
     elif s.search == "searxng":
-        if not s.searxng_url:
-            raise WebError("set your SearXNG server's address (Settings › Online)")
-        base = s.searxng_url.rstrip("/")
-        _check_url(base)
-        _, body, _ = _open(f"{base}/search?q={q}&format=json",
-                           headers={"Accept": "application/json"})
         try:
-            doc = json.loads(body.decode("utf-8", errors="replace") or "{}")
-        except ValueError:
-            raise WebError("the SearXNG server did not answer in JSON - switch on "
-                           "the json format in its settings.yml") from None
-        hits = [Hit(url=r.get("url", ""), title=r.get("title", ""),
-                    snippet=r.get("content", ""))
-                for r in doc.get("results") or [] if str(r.get("url", "")).startswith("http")]
+            hits, engine = _search_searxng(q, s.searxng_url), "searxng"
+        except WebError as exc:
+            try:
+                hits, engine = _search_duckduckgo(q), "duckduckgo"
+            except WebError as exc2:
+                raise WebError(f"SearXNG: {exc}; DuckDuckGo: {exc2}") from None
     else:
-        _, body, _ = _open(f"https://html.duckduckgo.com/html/?q={q}")
-        hits = parse_duckduckgo(body.decode("utf-8", errors="replace"))
+        hits, engine = _search_duckduckgo(q), "duckduckgo"
     out, seen = [], set()
     for h in hits:
         if h.url not in seen:
             seen.add(h.url)
+            h.engine = engine
             out.append(h)
     return out[:limit]
 

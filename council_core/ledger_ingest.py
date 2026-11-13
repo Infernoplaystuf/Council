@@ -885,7 +885,10 @@ def ledger_tools(policy) -> Dict[str, Any]:
         review = _inside(out_root, args.get("review"), "review")
         wb = openpyxl.load_workbook(review, read_only=True)
         try:
-            meta = json.loads(wb["_run"]["A1"].value)
+            from source_extract import read_run_meta
+            if "_run" not in wb.sheetnames:
+                raise LedgerError("no _run sheet")
+            meta = read_run_meta(wb, review.name)
         except Exception:
             return {"error": f"{review.name} is not a review workbook"}
         finally:
