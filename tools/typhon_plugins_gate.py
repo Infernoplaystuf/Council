@@ -139,6 +139,9 @@ BRANCH_GLOBS = (
 
 #: Test files that name a Typhon word but are not Typhon tests, and why.
 NOT_GATED: Dict[str, str] = {
+    "tests/test_physics_project.py":
+        "names physics_project's own EXAMPLES_DIR (examples/physics_models); "
+        "tests the Build tab's physics models, not Typhon",
     "tests/test_var_graph.py":
         "uses frame_timing.py's name as a sample script's; tests the "
         "variable graph, not Typhon",
