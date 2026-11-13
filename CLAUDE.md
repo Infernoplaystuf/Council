@@ -223,6 +223,11 @@ same list.
   another machine without the Council (the GUI Designer's "Export app…",
   `tools/export_app.py`, `council_core/app_export.py`, the check that it
   stands alone): `docs/handoff/app_export_2026-11-06.md`.
+- Typhon saving big frames faster and counting what is lost (the save
+  folder timed before a run, the saving meter, TYPHON_SAVE_QUEUE_GB /
+  TYPHON_PYLON_BUFFER_GB / TYPHON_SAVE_THREADS, gaps in the camera's frame
+  numbers, raw recording to one .tyraw file per run and converting it to
+  PNGs; what is next): `docs/handoff/typhon_saving_2026-11-13.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

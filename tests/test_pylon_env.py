@@ -151,3 +151,61 @@ def test_the_command_prompt_gets_the_camera_list(capsys, monkeypatch):
     monkeypatch.setenv(pe.QUIET_ENV, "1")
     frame_camera.list_cameras()
     assert pe.PREFIX not in capsys.readouterr().err, "can be silenced"
+
+
+def test_the_command_prompt_says_where_the_scan_looked(capsys, monkeypatch):
+    """check.bat saw the camera, the app did not (Andy, 13 November): the
+    console now names the Python the scan ran in, the camera the app is
+    set up for, and the GenTL path, so the two can be compared."""
+    monkeypatch.delenv(pe.QUIET_ENV, raising=False)
+    import frame_camera
+    monkeypatch.setattr(frame_camera, "current_choice", lambda: "prophesee")
+    frame_camera.list_cameras()
+    err = capsys.readouterr().err
+    assert "scanned with Python" in err and sys.executable in err
+    assert "Basler cameras are NOT searched" in err
+    assert pe.ENV in err
+
+
+def test_the_wizard_scan_sets_the_gentl_path_before_pypylon(monkeypatch):
+    """The set-up wizard's "Scan Basler cameras" imported pypylon without
+    prepare(): run first, it left the app's later camera list blind to a
+    CXP camera."""
+    from council_core import basler_scan
+    calls = []
+    monkeypatch.setattr(pe, "prepare", lambda *a, **k: calls.append(1) or [])
+    monkeypatch.setitem(sys.modules, "pypylon", None)   # import fails fast
+    basler_scan.scan(test_grab=False, pnp=lambda a: None,
+                     gentl_changed=lambda: None)
+    assert calls, "prepare() ran before the pypylon import"
+
+
+def test_a_prophesee_set_up_still_finds_the_basler(capsys, monkeypatch):
+    """Andy's lab PC (13 November): the exported Typhon carried the Council
+    PC's Prophesee set-up, so it searched only for an EVK4 and the
+    simulated cameras, and its Basler never showed."""
+    from tests.test_basler_trigger import FakePylon as TriggerPylon
+    from tests.test_typhon_plugins_basler_lines import LevelBasler
+    import frame_camera
+    monkeypatch.setattr(frame_camera, "_plugin_host", lambda: None)
+    monkeypatch.setattr(frame_camera, "current_choice", lambda: "prophesee")
+    basler = cameras.BaslerBackend(TriggerPylon(LevelBasler()))
+    monkeypatch.setattr(cameras, "backends", lambda *a, **k: [
+        basler, cameras.EvkBackend(), cameras.SyntheticBackend()])
+    monkeypatch.setattr(cameras.EvkBackend, "available", lambda self: False)
+    out = frame_camera.list_cameras()
+    assert any("basler" in r.lower() for r in out["rows"]), out["rows"]
+    assert "set up for Prophesee" in out["notes"][0]
+    assert "Camera setup" in out["notes"][0]
+
+
+def test_an_export_leaves_the_camera_set_up_behind(tmp_path):
+    """camera_setup.json is per machine: the lab PC gets its own wizard."""
+    from council_core import app_export
+    src = tmp_path / "proj"
+    src.mkdir()
+    (src / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (src / "camera_setup.json").write_text('{"format": 1, "camera": '
+                                           '"prophesee"}', encoding="utf-8")
+    copied = app_export._copy_project(src, tmp_path / "out")
+    assert copied == ["app.py"]

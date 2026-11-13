@@ -417,7 +417,22 @@ def list_cameras() -> Dict[str, Any]:
 
     host = _plugin_host()
     if host is None:
-        found = cameras.discover(_backends_for(current_choice()))
+        choice = current_choice()
+        chosen = _backends_for(choice)
+        found = cameras.discover(chosen)
+        if chosen is not None and not any(
+                c.backend == choice for c in found.cameras):
+            # Set up for a camera this PC has none of (its SDK missing, or
+            # none plugged in): look for every kind rather than show only
+            # the simulated ones. The Council PC's Prophesee set-up, copied
+            # with an exported Typhon, hid the lab PC's Basler (13 November).
+            every = cameras.discover(None)
+            if any(not c.backend == "simulated" for c in every.cameras):
+                every.notes.insert(0, (
+                    f"This app is set up for {choice.title()}, but none was "
+                    f"found, so every kind of camera was searched. Click "
+                    f"Camera setup to choose the camera this PC has."))
+                found = every
     else:
         # A "Typhon (plugins)" project: the camera plugins it runs, less
         # the families its set-up did not tick — the same scan, the same
@@ -439,8 +454,95 @@ def list_cameras() -> Dict[str, Any]:
     else:
         summary = "No cameras found — see the notes."
     _console([summary] + [f"  {r}" for r in rows] + [f"  note: {n}"
-                                                      for n in notes])
+                                                      for n in notes]
+             + _scan_context(host))
     return {"rows": rows, "summary": summary, "notes": notes}
+
+
+def _scan_context(host: Any) -> List[str]:
+    """Where the scan looked, for the Command Prompt: which Python ran it
+    (check.bat and a double-clicked run.bat can find different ones), which
+    camera the app is set up for (a Prophesee set-up never searches for a
+    Basler), and pypylon's GenTL path. Never raises."""
+    import sys
+    out = [f"  scanned with Python {sys.version.split()[0]} at "
+           f"{sys.executable}"]
+    try:
+        if host is not None:
+            out.append("  plugin Typhon: the camera plugins it runs were "
+                       "searched")
+        else:
+            choice = current_choice()
+            out.append("  set up for: " + {
+                "basler": "Basler (Basler and simulated cameras searched)",
+                "prophesee": "Prophesee (Basler cameras are NOT searched; "
+                             "run Camera setup and pick Basler)",
+            }.get(choice or "", "no camera chosen (every backend searched)"))
+        import os
+        from council_core import pylon_env
+        path = os.environ.get(pylon_env.ENV, "")
+        out.append(f"  {pylon_env.ENV}: {path or '(not set)'}")
+    except Exception:                                   # noqa: BLE001
+        pass
+    return out
+
+
+#: Frames smaller than this are not worth a disk test before a run (an
+#: EVK4's pictures, the simulated cameras).
+SPEED_CHECK_MIN_BYTES = 8_000_000
+#: MB written by the test before a run.
+SPEED_CHECK_MB = 256
+
+
+def _frame_bytes(device: Any) -> int:
+    """One frame's size as Typhon saves it (8-bit pixels as one byte,
+    10-16-bit as two, RGB/BGR8 as three), from the camera's area and pixel
+    format; 0 when the camera cannot say."""
+    try:
+        roi = device.roi()
+        pixels = int(roi.w) * int(roi.h)
+    except Exception:                                   # noqa: BLE001
+        return 0
+    fmt = ""
+    value = getattr(device, "_value", None)
+    if callable(value):
+        try:
+            fmt = str(value("PixelFormat", "") or "")
+        except Exception:                               # noqa: BLE001
+            fmt = ""
+    upper = fmt.upper()
+    if upper.startswith(("RGB", "BGR")) and upper.endswith("8"):
+        per = 3
+    elif not fmt or upper.endswith("8"):
+        per = 1
+    else:
+        per = 2
+    return pixels * per
+
+
+def _speed_check(out: Path, device: Any, fps: float) -> str:
+    """Time the save folder before a run of big frames (council_core.
+    save_speed), print what it found in the Command Prompt, and return a
+    warning for the summary when the camera's rate is more than the folder
+    keeps up with; "" otherwise. Never raises."""
+    import os
+
+    try:
+        from council_core import capture, save_speed
+
+        if os.environ.get(save_speed.OFF_ENV, "").strip() not in ("", "0"):
+            return ""
+        size = _frame_bytes(device)
+        if size < SPEED_CHECK_MIN_BYTES or _on_network_share(out):
+            return ""
+        result = (save_speed.measured(out)
+                  or save_speed.measure(out, SPEED_CHECK_MB))
+        lines = save_speed.words(result, size, float(fps or 0.0),
+                                 capture.WRITE_BUDGET_BYTES)
+        _console(lines)
+        return lines[2] if len(lines) > 2 else ""
+    except Exception:                                   # noqa: BLE001
+        return ""
 
 
 def _console(lines) -> None:
@@ -924,6 +1026,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     # recorder writes through it (capture.claim_run): closed and opened
     # again, a program that briefly took the new file without sharing made
     # Start fail after the live view had stopped (measured).
+    # Before anything is written: how fast this folder saves, against the
+    # frame size (once per folder per session; big frames only).
+    speed_warning = _speed_check(out, device, rate)
     try:
         run, claim = (_claim_run(out) if host is None else
                       _claim_run(out, base))
@@ -1117,6 +1222,16 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
                  "skipped.")
     if waits_for:
         said += f" The camera waits for {waits_for} before each frame."
+    if speed_warning:
+        said += " " + speed_warning
+    stack = getattr(recorder, "raw_stack", None)
+    if stack is not None:
+        raw_said = (f"Saving raw into {stack.path.name}: the pictures appear "
+                    f"once converted to PNG after Stop (python "
+                    f"_council/council_core/raw_frames.py "
+                    f"\"{out}\").")
+        said += " " + raw_said
+        _console([raw_said])
     if plugin_notes:
         said += " " + " ".join(note if note.endswith(".") else note + "."
                                for note in plugin_notes)
