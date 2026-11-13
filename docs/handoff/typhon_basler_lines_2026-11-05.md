@@ -106,3 +106,21 @@ machine but an older console or environment never inherits.
 - Not verified on real hardware: whether a GenTL producer on the path shows
   in pypylon as its own transport layer, and what the Suite's CXP .cti is
   called. Tests: `tests/test_pylon_env.py` (fake pylon, temporary folders).
+
+### check.bat sees the camera, Typhon does not (13 November 2026, later)
+
+- The set-up wizard's "Scan Basler cameras" (`council_core/basler_scan.py`)
+  imported pypylon without `pylon_env.prepare()`. Run before the app's camera
+  list, it left pylon reading the GenTL path without the CXP producer for the
+  rest of the process. It now calls `prepare()` first, and `prepare()` says in
+  the Command Prompt if pypylon was already imported.
+- Each camera scan now also prints, after its `[Typhon camera]` rows and
+  notes: the Python that ran it (a double-clicked `run.bat` and `check.bat`
+  typed in an activated environment can find different ones), the camera the
+  app is set up for (a Prophesee set-up never searches for a Basler), and
+  `GENICAM_GENTL64_PATH`.
+- The cause on Andy's lab PC: the exported Typhon carried the Council PC's
+  `camera_setup.json` (set up for Prophesee), so it searched only for an
+  EVK4 and the simulated cameras. An export now leaves `camera_setup.json`
+  behind (it is per machine), and an app set up for a camera kind it finds
+  none of searches every kind, with a note to run Camera setup.

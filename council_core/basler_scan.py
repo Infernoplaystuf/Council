@@ -371,6 +371,12 @@ def scan(pylon: Any = None, genicam: Any = None, *,
     try:
         if pylon is None or genicam is None:
             try:
+                # The CXP producer on the GenTL path BEFORE pypylon's first
+                # import, as BaslerBackend.sdk() does: when the wizard's scan
+                # ran first, the app's later camera list never saw a CXP
+                # camera (pylon_env).
+                from . import pylon_env
+                pylon_env.prepare()
                 from pypylon import genicam as _genicam
                 from pypylon import pylon as _pylon
             except Exception as exc:                       # noqa: BLE001
