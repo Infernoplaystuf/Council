@@ -37,7 +37,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -71,6 +71,7 @@ class FieldInfo:
     unit: str = ""
     section: str = ""
     per_item: bool = False
+    count: bool = False           # a count the analysis made (runs filled): not correlated
 
 
 @dataclass
@@ -82,6 +83,9 @@ class Data:
     fields: Dict[str, FieldInfo]  # analysed fields, in template order
     groups: List[lg.Group] = field(default_factory=list)
     _facts: Optional[Dict[str, lg.PartFacts]] = None
+    #: a repeated table's fields taken as one: 'Concealment: Media Run Time'
+    #: -> ['Concealment 1: Media Run Time', 'Concealment 2: …', …]
+    stacked: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def parts(self) -> List[str]:
@@ -143,8 +147,9 @@ def _varies_within_parts(frame: pd.DataFrame, id_field: str, col: str) -> bool:
     return False
 
 
-def load(csv) -> Data:
-    """The parent CSV, ready to analyse."""
+def load(csv, stack: bool = True) -> Data:
+    """The parent CSV, ready to analyse. ``stack``: a repeated table's runs
+    taken as one field each (see _stack_repeats); False: each run its own."""
     ledger = ParentCSV(csv)
     frame = pd.DataFrame(ledger.rows, columns=ledger.columns).fillna("").astype(str)
     schema = ledger.schema
@@ -162,8 +167,83 @@ def load(csv) -> Data:
         info[col] = FieldInfo(col, _kind(col, frame[col].tolist()),
                               unit=tf.unit if tf else "", section=tf.section if tf else "",
                               per_item=per_item)
-    return Data(csv=str(csv), frame=frame, id_field=ledger.id_field,
+    data = Data(csv=str(csv), frame=frame, id_field=ledger.id_field,
                 item_field=item_field, fields=info, groups=lg.load_groups(csv))
+    if stack and schema:
+        _stack_repeats(data, schema)
+    return data
+
+
+_RUN = re.compile(r"^(?P<section>.+?) (?P<run>\d+): (?P<label>.+)$")
+#: the field a stacked table adds: how many of its runs a part filled
+RUNS_FILLED = "runs filled"
+
+
+def _stack_repeats(data: Data, schema) -> None:
+    """A repeated table (Concealment 1..7, each run a row) as one field per
+    column: a part's runs averaged for a number, its one value for a text
+    (several different: listed), and '<table>: runs filled'. Andy's LMM
+    Analysis Studio script (2026-11-13) does the same; run against run is
+    not a relation worth listing. The numbered fields stay in the CSV."""
+    groups: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+    for f in schema.fields:
+        m = _RUN.match(f.name)
+        if f.layout != "repeat" or not m or f.name not in data.fields:
+            continue
+        groups.setdefault((m["section"], m["label"]), []).append((int(m["run"]), f.name))
+    tables: Dict[str, List[str]] = {}
+    new_info: Dict[str, FieldInfo] = {}
+    for (section, lab), runs in groups.items():
+        if len(runs) < 2:
+            continue
+        names = [n for _r, n in sorted(runs)]
+        name = f"{section}: {lab}"
+        if name in data.frame.columns:
+            continue
+        kinds = {data.fields[n].kind for n in names} - {EMPTY}
+        kind = NUMBER if kinds == {NUMBER} else DATE if kinds == {DATE} else (
+            TEXT if kinds else EMPTY)
+        col = []
+        for _i, row in data.frame[names].iterrows():
+            vals = [str(v).strip() for v in row if str(v).strip()]
+            if kind == NUMBER:
+                nums = [n for n in map(to_number, vals) if n is not None]
+                col.append(f"{sum(nums) / len(nums):.6g}" if nums else "")
+            else:
+                distinct = list(dict.fromkeys(vals))
+                col.append(distinct[0] if len(distinct) == 1 else "; ".join(distinct))
+        data.frame[name] = pd.Series(col, index=data.frame.index, dtype=object)
+        first = data.fields[names[0]]
+        new_info[name] = FieldInfo(name, kind, unit=first.unit, section=section,
+                                   per_item=False)
+        data.stacked[name] = names
+        tables.setdefault(section, []).extend(names)
+    if not data.stacked:
+        return
+    for section, names in tables.items():
+        runs = sorted({int(_RUN.match(n)["run"]) for n in names})
+        filled = []
+        for _i, row in data.frame[names].iterrows():
+            have = {int(_RUN.match(n)["run"]) for n in names if str(row[n]).strip()}
+            filled.append(str(len([r for r in runs if r in have])))
+        name = f"{section}: {RUNS_FILLED}"
+        if name not in data.frame.columns:
+            data.frame[name] = pd.Series(filled, index=data.frame.index, dtype=object)
+            new_info[name] = FieldInfo(name, NUMBER, section=section, count=True)
+    # the stacked fields where the table's first run was, the runs left out
+    out: Dict[str, FieldInfo] = {}
+    gone = {n for ns in data.stacked.values() for n in ns}
+    placed = set()
+    for f, inf in data.fields.items():
+        if f in gone:
+            m = _RUN.match(f)
+            for name, ni in new_info.items():
+                if ni.section == m["section"] and name not in placed:
+                    out[name] = ni
+                    placed.add(name)
+            continue
+        out[f] = inf
+    data.fields = out
 
 
 # ── slicing ─────────────────────────────────────────────────────────────
@@ -183,23 +263,34 @@ def rows(data: Data, group: str = "") -> pd.DataFrame:
     keep = {p.lower() for p in lg.members(g, _facts(data), data.csv)}
     df = df[df[data.id_field].str.lower().isin(keep)].copy()
     for f in data.fields:
-        mode = g.mode(f)
+        mode, key = _mode(data, g, f)
         if mode == lg.OFF:
             df[f] = ""
         elif mode == lg.YES_NO:
-            df[f] = [lg.as_yes_no(v, g.yes_no.get(f, "")) for v in df[f]]
+            df[f] = [lg.as_yes_no(v, g.yes_no.get(key, "")) for v in df[f]]
     return df
+
+
+def _mode(data: Data, g: Optional[lg.Group], f: str) -> Tuple[str, str]:
+    """How group ``g`` treats field ``f``, and the name it is set under: a
+    stacked field as its own name says, else as its table's first run."""
+    if g is None:
+        return lg.TRACKED, f
+    if f in data.stacked and g.mode(f) == lg.TRACKED:
+        first = data.stacked[f][0]
+        return g.mode(first), first
+    return g.mode(f), f
 
 
 def fields_of(data: Data, group: str = "") -> List[str]:
     """The fields analysed for ``group``: not those it does not track."""
     g = data.group(group)
-    return [f for f in data.fields if not g or g.mode(f) != lg.OFF]
+    return [f for f in data.fields if _mode(data, g, f)[0] != lg.OFF]
 
 
 def _kind_in(data: Data, f: str, group: str) -> str:
     g = data.group(group)
-    if g and g.mode(f) == lg.YES_NO:
+    if _mode(data, g, f)[0] == lg.YES_NO:
         return TEXT
     return data.fields[f].kind
 
@@ -491,7 +582,7 @@ def correlation(data: Data, group: str = "", per: str = PER_ROW,
     whole = per_part(data, flat)
     fs = []
     for f in fields_of(data, group):
-        if _kind_in(data, f, group) != NUMBER:
+        if _kind_in(data, f, group) != NUMBER or data.fields[f].count:
             continue
         if len(set(_numbers(whole[f]).tolist())) >= 2:
             fs.append(f)

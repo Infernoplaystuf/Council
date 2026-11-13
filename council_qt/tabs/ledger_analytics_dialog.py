@@ -104,6 +104,15 @@ class AnalyticsDialog(QDialog):
             "Per part takes a per-flaw field's average over the part's flaws, as the "
             "template's AVERAGE columns do. A part-level field counts once per part either way.")
         bar.addWidget(self.per_choice)
+        self.stack_box = QCheckBox("Repeated tables as one field")
+        self.stack_box.setChecked(bool(self.data.stacked))
+        self.stack_box.setEnabled(bool(self.data.stacked) or self._has_runs())
+        self.stack_box.setToolTip(
+            "A table filled in once per run (Concealment 1, 2, 3 …) analysed as one field per "
+            "column: a part's runs averaged (a number) or its one value (a text), plus how "
+            "many runs it filled. Untick to see every run as its own field.")
+        self.stack_box.toggled.connect(self.on_stack)
+        bar.addWidget(self.stack_box)
         bar.addStretch(1)
         self.export_btn = QPushButton("Export…")
         self.export_btn.setToolTip(
@@ -211,6 +220,23 @@ class AnalyticsDialog(QDialog):
         self.by_choice.currentTextChanged.connect(lambda _t: self.refresh_trend())
         self.method_choice.currentTextChanged.connect(lambda _t: self.refresh_correlation())
         self.twins_box.toggled.connect(lambda _b: self.refresh_correlation())
+
+    def _has_runs(self) -> bool:
+        return any(la._RUN.match(f) for f in self.data.fields)
+
+    def on_stack(self, on: bool) -> None:
+        """The Ledger read again with its repeated tables stacked or not."""
+        self.data = la.load(self.data.csv, stack=on)
+        for box, items in ((self.field_choice, self.data.number_fields),
+                           (self.by_choice, self.data.date_fields + [PART_ORDER])):
+            keep = box.currentText()
+            box.blockSignals(True)
+            box.clear()
+            box.addItems(items)
+            if keep in items:
+                box.setCurrentText(keep)
+            box.blockSignals(False)
+        self.refresh()
 
     @staticmethod
     def _titled(text: str, w: QWidget) -> QWidget:
