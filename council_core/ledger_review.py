@@ -135,7 +135,8 @@ def load(path) -> Review:
         raise LedgerError(f"could not open the review {path.name}: {e}") from e
     try:
         try:
-            meta = json.loads(wb["_run"]["A1"].value or "{}")
+            from source_extract import read_run_meta
+            meta = read_run_meta(wb, path.name) if "_run" in wb.sheetnames else {}
         except Exception:                                   # noqa: BLE001
             meta = {}
         sources = [str(s) for s in meta.get("sources") or []]

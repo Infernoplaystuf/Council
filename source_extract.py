@@ -5090,11 +5090,95 @@ def write_review(path, run: Extraction, decisions: List[Decision], schema: Templ
             {"where": where, "parts": sorted({str(r.get(schema.id_field) or "")
                                               for r in rows} - {""})}
             for rows, where in run.filled_copies]
-    meta.append([json.dumps(data)], text=False)
+    meta.append(run_meta_cells(data), text=False)
     meta.ws.sheet_state = "hidden"
     meta.finish()
     wb.active = 1
     _save_wb(wb, Path(path))
+
+
+#: what one cell of a review's hidden _run sheet holds of its record: under
+#: Excel's 32,767-character cell limit, where openpyxl cuts a longer string
+#: as it writes it. A record of hundreds of long source paths was written
+#: cut, and Re-run and Apply then said the review "does not say which
+#: parent CSV and sources it was made from" (user, 2026-11-03)
+RUN_CELL_CHARS = 32000
+
+
+def run_meta_cells(data: Dict[str, Any]) -> List[str]:
+    """A review's run record as the cells of the _run sheet's first row,
+    none over RUN_CELL_CHARS; read back by read_run_meta. A cut never falls
+    beside a space (Excel keeps a cell's edge spaces only when told to)."""
+    text = json.dumps(data)
+    cells, i = [], 0
+    while i < len(text):
+        j = min(len(text), i + RUN_CELL_CHARS)
+        while i + 1 < j < len(text) and (text[j - 1].isspace() or text[j].isspace()):
+            j -= 1
+        cells.append(text[i:j])
+        i = j
+    return cells or ["{}"]
+
+
+def read_run_meta(wb, review_name: str = "the review") -> Dict[str, Any]:
+    """A review workbook's run record (openpyxl ``wb``, read-only or not):
+    the _run sheet's first row joined (run_meta_cells); when that cannot be
+    read - a record written in one cell before 2026-11-03, cut there - the
+    parent CSV and the sources the Read me sheet lists, with
+    ``recovered: True`` (the part and part-name pattern are not on it).
+    Raises LedgerError when neither says."""
+    meta: Optional[Dict[str, Any]] = None
+    if "_run" in wb.sheetnames:
+        try:
+            # read whole (list): a suspended read-only generator crashes
+            # lxml when it is collected after the workbook closed
+            rows = list(wb["_run"].iter_rows(min_row=1, max_row=1, values_only=True))
+            text = "".join(str(v) for v in (rows[0] if rows else ()) if v is not None)
+            got = json.loads(text) if text else None
+            meta = got if isinstance(got, dict) else None
+        except Exception:                                   # noqa: BLE001
+            meta = None
+    if meta is not None:
+        return meta
+    meta = _meta_from_readme(wb)
+    if meta is None:
+        raise LedgerError(f"{review_name} does not say which parent CSV and sources it "
+                          "was made from; run Extract instead")
+    return meta
+
+
+def _meta_from_readme(wb) -> Optional[Dict[str, Any]]:
+    """The parent CSV and sources write_review lists on the Read me sheet,
+    a cell each: what the run record holds that Apply and Re-run need."""
+    if "Read me" not in wb.sheetnames:
+        return None
+    try:
+        lines = [v for (v,) in wb["Read me"].iter_rows(max_col=1, values_only=True)]
+    except Exception:                                       # noqa: BLE001
+        return None
+    csv, sources, skipped, listing = "", [], [], False
+    for v in lines:
+        v = v if isinstance(v, str) else ""
+        if v.startswith("Parent CSV: "):
+            csv = v[len("Parent CSV: "):].strip()
+        elif v.strip() == "Sources:":
+            listing = True
+        elif listing:
+            if not v.startswith("  "):
+                listing = False
+                continue
+            name, cut, _ = v.strip().partition("   (not read:")
+            if name.strip():
+                sources.append(name.strip())
+                if cut:
+                    skipped.append(len(sources) - 1)
+    if not csv or not sources:
+        return None
+    meta: Dict[str, Any] = {"csv": csv, "sources": sources, "pattern_mask": "", "part": "",
+                            "recovered": True}
+    if skipped:
+        meta["read"] = [i for i in range(len(sources)) if i not in skipped]
+    return meta
 
 
 class _StreamSheet:
@@ -5437,11 +5521,13 @@ def apply_review(review_path, fill_dir=None, image_reader: Optional[ImageReader]
     prog.stage("reading the review workbook")
     review_path = Path(review_path)
     wb = openpyxl.load_workbook(review_path, data_only=True)
-    try:
-        meta = json.loads(wb["_run"]["A1"].value)
-    except Exception as e:
+    if "_run" not in wb.sheetnames:
         raise LedgerError(f"{review_path.name} is not a review workbook from "
-                          "source_extract.py (its hidden _run sheet is missing)") from e
+                          "source_extract.py (its hidden _run sheet is missing)")
+    meta = read_run_meta(wb, review_path.name)
+    if meta.get("recovered"):
+        prog.update("the review's run record was cut (a cell holds 32,767 characters): "
+                    "its parent CSV and sources were read from its Read me sheet")
     csv_path = meta["csv"]
     ledger = ParentCSV(csv_path)
     schema = ledger.schema
