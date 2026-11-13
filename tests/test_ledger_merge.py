@@ -626,3 +626,42 @@ def test_the_analyze_window_shows_each_copys_values_to_check(books):
     lo = dlg.left_out_table
     assert lo.rowCount() >= 1
     dlg.close()
+
+
+
+# ── .xls / .xlsb / protected copies through Excel (Andy's LMM Analysis
+# Studio script, 2026-11-13). Excel is not here: its read is stood in for. ─
+def _as_excel_book(xlsx: Path):
+    import excel_open
+    wb = openpyxl.load_workbook(xlsx, data_only=True)
+    book = excel_open.ExcelBook()
+    for ws in wb.worksheets:
+        book.sheets.append((ws.title, {rc: c.value for rc, c in ws._cells.items()
+                                       if c.value is not None}))
+    return book
+
+
+def test_an_old_xls_copy_is_read_through_excel(books, tmp_path, monkeypatch):
+    template, folder = books
+    real = fill(template, tmp_path / "old.xlsx", {"Part Number": "S-40", "Power (W)": 340},
+                {FOD: {it: 70 + i for i, it in enumerate(ITEMS)}})
+    (folder / "old.xls").write_bytes(b"not really an xls")   # Excel would open it
+    monkeypatch.setattr(lm, "_excel_here", lambda: True)
+    asked = []
+    monkeypatch.setattr(lm, "_read_with_excel",
+                        lambda p: asked.append(p.name) or _as_excel_book(real))
+    res = lm.merge(template, folder)
+    assert asked == ["old.xls"]
+    rows = [r for r in ParentCSV(res.csv).rows if r["Part Number"] == "S-40"]
+    assert rows[0]["Power (W)"] == "340"
+    assert [r[FOD] for r in rows] == [str(70 + i) for i in range(len(ITEMS))]
+    assert {p.file: p.reason for p in res.left_out}["old.xls"].startswith("read through Excel")
+
+
+def test_without_excel_an_old_xls_is_listed_with_what_to_do(books, monkeypatch):
+    template, folder = books
+    (folder / "old.xls").write_bytes(b"x")
+    monkeypatch.setattr(lm, "_excel_here", lambda: False)
+    res = lm.merge(template, folder)
+    why = {p.file: p.reason for p in res.left_out}["old.xls"]
+    assert "Windows with Excel installed" in why and "save it as .xlsx" in why

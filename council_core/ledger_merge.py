@@ -7,8 +7,13 @@ analysis on that data"; a sheet per filled file was picked).
 
 No model and no guessing: each copy is read from the template's own cells
 (the cells ``sample_ledger.read_template`` found for each field), so a copy
-must keep the template's layout. One whose layout differs is listed, not
-read: Extract (step 3) reads files of any layout by their labels.
+must keep the template's layout. A copy whose rows or columns moved (rows
+inserted, a table moved down) is read where its labels moved to (Placement)
+and listed so its values can be checked. One whose layout differs is listed,
+not read: Extract (step 3) reads files of any layout by their labels.
+.xls, .xlsb and rights-protected copies are read through the installed Excel
+(excel_open) on Windows. Every value read is listed with the cell it came
+from on the workbook's 'Check' sheet and in '<merged> - check.csv'.
 
     merge(template, folder, out_dir)  -> MergeResult
 
@@ -198,8 +203,12 @@ def find_files(folder, recursive: bool = True,
         if ext in EXCEL:
             books.append(p)
         elif ext in OLD_EXCEL:
-            problems.append(Problem(_rel(p, folder), f"{ext} cannot be read: save it as "
-                                                     ".xlsx in Excel, then merge again"))
+            if _excel_here():
+                books.append(p)             # read through Excel (read_copies)
+            else:
+                problems.append(Problem(_rel(p, folder), f"{ext} is read only on Windows "
+                                                         "with Excel installed: save it as "
+                                                         ".xlsx in Excel, then merge again"))
     return books, problems
 
 
@@ -208,6 +217,78 @@ def _rel(path: Path, folder: Path) -> str:
         return str(Path(path).relative_to(folder))
     except ValueError:
         return Path(path).name
+
+
+# ── workbooks openpyxl cannot open (Andy's LMM Analysis Studio script,
+# 2026-11-13: .xls, .xlsb and protected copies through Excel) ─────────────
+def _excel_here() -> bool:
+    try:
+        import excel_open
+        return excel_open.excel_available()
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _read_with_excel(path: Path):
+    """The workbook's cells through the Excel on this PC (excel_open: hidden,
+    macros off, read only, no copy written). Tests replace this."""
+    import excel_open
+    return excel_open.read_with_excel(path, want_pictures=False)
+
+
+class _Cell:
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
+class _Sheet:
+    """A sheet Excel read, shaped like the bit of an openpyxl one used here."""
+
+    def __init__(self, title: str, cells: Dict[Tuple[int, int], Any]):
+        self.title = title
+        self._cells = {rc: _Cell(v) for rc, v in cells.items()}
+
+    def __getitem__(self, a1: str) -> _Cell:
+        from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+        col, row = coordinate_from_string(a1)
+        return self._cells.get((row, column_index_from_string(col)), _Cell(None))
+
+
+class _ExcelBook:
+    def __init__(self, book):
+        self.worksheets = [_Sheet(n, c) for n, c in book.sheets]
+        self.sheetnames = [ws.title for ws in self.worksheets]
+
+    def __getitem__(self, name: str) -> _Sheet:
+        return self.worksheets[self.sheetnames.index(name)]
+
+    def close(self) -> None:
+        pass
+
+
+def _open_copy(path: Path):
+    """(workbook, through Excel?) or raises: openpyxl for .xlsx / .xlsm; the
+    installed Excel for .xls / .xlsb, and for a copy openpyxl cannot open
+    that Excel can (rights-protected, or an old workbook named .xlsx)."""
+    import openpyxl
+    if path.suffix.lower() in OLD_EXCEL:
+        return _ExcelBook(_read_with_excel(path)), True
+    try:
+        return openpyxl.load_workbook(path, data_only=True), False
+    except Exception as e:                                  # noqa: BLE001
+        try:
+            import excel_open
+            kind = excel_open.kind_of(path)
+        except Exception:                                   # noqa: BLE001
+            kind = "unknown"
+        if kind in ("rights", "legacy") and _excel_here():
+            return _ExcelBook(_read_with_excel(path)), True
+        if kind == "rights":
+            raise LedgerError("rights-protected: it is read through Excel, on Windows "
+                              "with Excel installed") from e
+        raise
 
 
 # ── reading one copy ────────────────────────────────────────────────────
@@ -485,14 +566,13 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
     what to say about it. A template of one sheet: every sheet laid out like
     it is a copy (a workbook with a sheet per part). Of several sheets: one
     copy, its sheets matched to the template's."""
-    import openpyxl
     name = _rel(path, folder)
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb, via_excel = _open_copy(path)
     except Exception as e:                                  # noqa: BLE001
         return [], [Problem(name, f"could not be opened: {e}")]
     try:
-        if ALL_DATA in wb.sheetnames and is_filled_template(path):
+        if not via_excel and ALL_DATA in wb.sheetnames and is_filled_template(path):
             return [], [Problem(name, "a merged workbook the Council made, not a copy")]
         tsheets = list(dict.fromkeys(f.sheet for f in schema.fields))
         cells = {ws.title: _cells(ws) for ws in wb.worksheets}
@@ -542,6 +622,9 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
             for r in rows:
                 r[schema.id_field] = pid
         copies.append(Copy(path, pid, rows, m, named, label, moved=dict(pl), audit=audit))
+        if via_excel:
+            notes.append(Problem(label, "read through Excel (openpyxl cannot open it): "
+                                        "values as Excel shows them", part=pid))
         for t, p in pl.items():
             notes.append(Problem(label, f"read with its layout moved{' on ' + t if len(tsheets) > 1 else ''}"
                                         f" ({p.describe()}): {p.share:.0%} of the template's "
