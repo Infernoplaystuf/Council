@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import openpyxl
+import pandas as pd
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -260,3 +261,30 @@ def test_analyze_opens_from_the_ledger_tab_and_a_part_opens_its_filled_template(
     dlg.on_part(part)
     assert tab.wait(60)
     assert tab.filled_dialog.part == part
+
+
+def test_how_sure_a_pair_is_goes_by_its_parts_not_its_flaw_rows(tmp_path, app_dir):
+    """Andy's LMM Analysis Studio script (2026-11-13): a part's flaws are not
+    independent, so 2 parts of 30 flaws each are 2 parts, not 60 values."""
+    path = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "few.csv").csv
+    rows = []
+    for p, base in ((1, 10.0), (2, 20.0)):
+        for i, item in enumerate(("1A", "2A", "3A", "1B", "2B", "3B")):
+            rows.append({"Part Number": f"S-{p}", "Flaw #": item, "Power (W)": str(300 + p),
+                         FOD: f"{base + i:.1f}", LENGTH: f"{(base + i) / 100 + 0.001 * i:.4f}",
+                         "source_file": f"b{p}.xlsx"})
+    ParentCSV(path).add_samples(rows)
+    c = la.correlation(la.load(path))
+    assert c.n.loc[FOD, LENGTH] == 12 and c.parts.loc[FOD, LENGTH] == 2
+    # too few parts: left blank, never "sure", however many flaw rows agree
+    assert pd.isna(c.r.loc[FOD, LENGTH]) and not c.sure.loc[FOD, LENGTH]
+    assert c.pairs().empty
+
+
+def test_the_pairs_list_says_how_many_parts_are_behind_each(related):
+    c = la.correlation(la.load(related))
+    pairs = c.pairs().set_index(["Field A", "Field B"])
+    assert "Parts" in pairs.columns
+    row = c.pairs()
+    fl = row[(row["Field A"].isin([FOD, LENGTH])) & (row["Field B"].isin([FOD, LENGTH]))].iloc[0]
+    assert fl["Values"] == 60 and fl["Parts"] == 20

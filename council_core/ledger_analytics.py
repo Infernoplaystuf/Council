@@ -54,6 +54,10 @@ KIND_SHARE = 0.8
 OUTLIER_Z = 3.5
 #: values a pair of fields needs in common before it is correlated
 CORR_MIN_N = 5
+#: parts a pair needs behind it: a part's flaws are not independent of each
+#: other, so how sure a pair is goes by its parts, not its flaw rows (Andy's
+#: LMM Analysis Studio script, 2026-11-13: "Independent_Parts")
+CORR_MIN_PARTS = 3
 #: charts written into the analysis workbook, at most
 CHART_LIMIT = 40
 
@@ -436,6 +440,7 @@ class Correlation:
     n: pd.DataFrame
     sure: pd.DataFrame                # bool: significant after the FDR correction
     note: str = ""
+    parts: Optional[pd.DataFrame] = None   # how many parts each pair's values come from
 
     def pairs(self, most: int = 0, twins: bool = False) -> pd.DataFrame:
         """Each pair once, strongest first. ``twins``: also a field against
@@ -450,9 +455,11 @@ class Correlation:
                 out.append({"Field A": a, "Field B": b, "r": round(float(r), 3),
                             "Strength": strength(r), "p": float(self.p.loc[a, b]),
                             "Sure": "yes" if self.sure.loc[a, b] else "no",
-                            "Values": int(self.n.loc[a, b])})
+                            "Values": int(self.n.loc[a, b]),
+                            "Parts": (int(self.parts.loc[a, b]) if self.parts is not None
+                                      else int(self.n.loc[a, b]))})
         res = pd.DataFrame(out, columns=["r", "Strength", "Sure", "Field A", "Field B",
-                                         "Values", "p"])
+                                         "Values", "Parts", "p"])
         if len(res):
             res = res.reindex(res["r"].abs().sort_values(ascending=False).index)
             res["p"] = [float(f"{v:.3g}") for v in res["p"]]
@@ -509,22 +516,74 @@ def correlation(data: Data, group: str = "", per: str = PER_ROW,
                 if data.fields[a].per_item or data.fields[b].per_item:
                     for k in ("corr", "p_values", "n", "significant_fdr"):
                         res[k].loc[a, b] = flaws[k].loc[a, b]
-    r, p = res["corr"].copy(), res["p_values"].copy()
-    n, sure = res["n"].astype(int), res["significant_fdr"].astype(bool)
-    few = n < CORR_MIN_N
-    r, p = r.mask(few), p.mask(few)
+    r = res["corr"].copy()
+    n = res["n"].astype(int)
+    parts = _parts_behind(data, flat, whole, fs, per)
+    few = (n < CORR_MIN_N) | (parts < CORR_MIN_PARTS)
+    r = r.mask(few)
     for f in fs:
         r.loc[f, f] = 1.0
+    p, sure = _sure_by_parts(r, parts, fs)
+    p = p.mask(few)
     sure = sure & ~few
-    c = Correlation(method, fs, r, p, n, sure)
+    c = Correlation(method, fs, r, p, n, sure, parts=parts)
     strong = c.pairs()
     strong = strong[(strong["r"].abs() >= 0.6) & (strong["Sure"] == "yes")]
     c.note = (f"{len(strong)} pair(s) strongly correlated and sure (|r| 0.6 or more, "
-              "significant after correcting for the number of pairs; a field against its own "
+              "significant after correcting for the number of pairs, judged by the number "
+              "of parts behind each pair, not its flaw rows; a field against its own "
               "inspectors' readings not counted). A correlation is "
               "not a cause: check the pair's chart." if len(strong) else
               "No pair is both strongly correlated (|r| 0.6 or more) and sure.")
     return c
+
+
+def _parts_behind(data: Data, flat: pd.DataFrame, whole: pd.DataFrame,
+                  fs: List[str], per: str) -> pd.DataFrame:
+    """Per pair, the parts that have both values (on a flaw row when either
+    is a per-flaw field read per flaw, else once per part)."""
+    ids_flat = flat[data.id_field].astype(str).to_numpy()
+    ids_whole = whole[data.id_field].astype(str).to_numpy()
+    ok_flat = {f: np.array([to_number(v) is not None for v in flat[f]]) for f in fs}
+    ok_whole = {f: np.array([to_number(v) is not None for v in whole[f]]) for f in fs}
+    out = pd.DataFrame(0, index=fs, columns=fs, dtype=int)
+    for i, a in enumerate(fs):
+        for b in fs[i:]:
+            by_flaw = per == PER_ROW and (data.fields[a].per_item or data.fields[b].per_item)
+            ok, ids = ((ok_flat, ids_flat) if by_flaw else (ok_whole, ids_whole))
+            k = len(set(ids[ok[a] & ok[b]]))
+            out.loc[a, b] = out.loc[b, a] = k
+    return out
+
+
+def _sure_by_parts(r: pd.DataFrame, parts: pd.DataFrame, fs: List[str],
+                   alpha: float = 0.05):
+    """p of each r with the number of parts as its sample size (a part's
+    flaws count once between them), and which pairs are sure after
+    Benjamini-Hochberg across the pairs."""
+    from scipy import stats as st
+    p = pd.DataFrame(np.nan, index=fs, columns=fs, dtype=float)
+    sure = pd.DataFrame(False, index=fs, columns=fs, dtype=bool)
+    tests = []
+    for i, a in enumerate(fs):
+        for b in fs[i + 1:]:
+            v, k = r.loc[a, b], int(parts.loc[a, b])
+            if pd.isna(v) or k < 3:
+                continue
+            v = float(np.clip(v, -0.999999999, 0.999999999))
+            t = v * math.sqrt((k - 2) / (1 - v * v))
+            pv = float(2 * st.t.sf(abs(t), k - 2))
+            p.loc[a, b] = p.loc[b, a] = pv
+            tests.append((pv, a, b))
+    tests.sort()
+    m = len(tests)
+    last = 0
+    for rank, (pv, _a, _b) in enumerate(tests, 1):
+        if pv <= alpha * rank / m:
+            last = rank
+    for pv, a, b in tests[:last]:
+        sure.loc[a, b] = sure.loc[b, a] = True
+    return p, sure
 
 
 def correlation_figure(c: Correlation):
