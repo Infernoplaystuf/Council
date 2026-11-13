@@ -269,6 +269,27 @@ class AnalyticsDialog(QDialog):
         split.setSizes([600, 500])
         cl.addWidget(split, 1)
         self.tabs.addTab(corr, "Correlation")
+        # Plots: a field's spread (the script's Statistics / Plots)
+        plots = QWidget()
+        pl = QVBoxLayout(plots)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Plot:"))
+        self.plot_choice = QComboBox()
+        self.plot_choice.addItems(la.PLOTS)
+        row.addWidget(self.plot_choice)
+        row.addWidget(QLabel("Field:"))
+        self.plot_field = QComboBox()
+        self.plot_field.addItems(self.data.number_fields)
+        row.addWidget(self.plot_field, 1)
+        row.addWidget(QLabel("Split by:"))
+        self.plot_by = QComboBox()
+        self.plot_by.addItems(["(nothing)"] + la.box_groups(self.data))
+        row.addWidget(self.plot_by)
+        pl.addLayout(row)
+        self.plot_box = QVBoxLayout()
+        pl.addLayout(self.plot_box, 1)
+        self.plot_canvas = None
+        self.tabs.addTab(plots, "Plots")
         # Outliers
         self.outlier_table = _table()
         self.outlier_table.cellDoubleClicked.connect(
@@ -288,6 +309,8 @@ class AnalyticsDialog(QDialog):
         self.method_choice.currentTextChanged.connect(lambda _t: self.refresh_correlation())
         self.twins_box.toggled.connect(lambda _b: self.refresh_correlation())
         self.data_find.textChanged.connect(lambda _t: self.refresh_data())
+        for w in (self.plot_choice, self.plot_field, self.plot_by):
+            w.currentTextChanged.connect(lambda _t: self.refresh_plot())
         self.check_status.currentTextChanged.connect(lambda _t: self.refresh_check_cells())
         self.check_find.textChanged.connect(lambda _t: self.refresh_check_cells())
 
@@ -298,7 +321,9 @@ class AnalyticsDialog(QDialog):
         """The Ledger read again with its repeated tables stacked or not."""
         self.data = la.load(self.data.csv, stack=on)
         for box, items in ((self.field_choice, self.data.number_fields),
-                           (self.by_choice, self.data.date_fields + [PART_ORDER])):
+                           (self.by_choice, self.data.date_fields + [PART_ORDER]),
+                           (self.plot_field, self.data.number_fields),
+                           (self.plot_by, ["(nothing)"] + la.box_groups(self.data))):
             keep = box.currentText()
             box.blockSignals(True)
             box.clear()
@@ -349,8 +374,18 @@ class AnalyticsDialog(QDialog):
         fill_table(self.left_out_table, la.left_out_of_correlation(d, g))
         self.refresh_data()
         self.refresh_check()
+        self.refresh_plot()
         self.refresh_trend()
         self.refresh_correlation()
+
+    def refresh_plot(self) -> None:
+        kind = self.plot_choice.currentText()
+        self.plot_field.setEnabled(kind != la.PCA)
+        self.plot_by.setEnabled(kind == la.BOX)
+        by = self.plot_by.currentText()
+        fig = la.plot_figure(self.data, kind, self.plot_field.currentText(),
+                             "" if by == "(nothing)" else by, self.group, self.per)
+        self.plot_canvas = self._swap(self.plot_box, self.plot_canvas, fig)
 
     def refresh_data(self) -> None:
         d = self.data

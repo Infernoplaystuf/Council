@@ -320,3 +320,19 @@ def test_a_repeated_table_is_one_field_per_column(tmp_path, app_dir):
     assert not any("Concealment 1" in f for f in c.fields)
     # unticked: every run its own field again
     assert "Concealment 1: Amplitude" in la.load(path, stack=False).fields
+
+
+def test_plots_show_a_fields_spread(related):
+    """Andy's LMM Analysis Studio script (2026-11-13): histogram, box plot by
+    group, normal Q-Q and PCA explained variance."""
+    d = la.load(related)
+    assert la.box_groups(d)[0] == la.BLOCK
+    for kind in la.PLOTS:
+        fig = la.plot_figure(d, kind, FOD, la.BLOCK)
+        assert fig.axes and fig.axes[0].has_data(), kind
+    box = la.plot_figure(d, la.BOX, FOD, la.BLOCK).axes[0]
+    assert [t.get_text().split("\n")[0] for t in box.get_xticklabels()] == ["A"]
+    p = la.pca(d)
+    assert p["Running total %"].iloc[-1] == pytest.approx(100.0)
+    # Power and Scan Speed move together exactly: one direction explains them both
+    assert p["Explains %"].iloc[0] > 40

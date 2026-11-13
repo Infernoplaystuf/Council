@@ -799,6 +799,148 @@ def scatter_figure(data: Data, a: str, b: str, group: str = "", per: str = PER_R
     return fig
 
 
+# ── distribution plots (Andy's LMM Analysis Studio script, 2026-11-13) ──
+HISTOGRAM, BOX, QQ, PCA = "Histogram", "Box plot", "Normal Q-Q", "PCA explained variance"
+PLOTS = [HISTOGRAM, BOX, QQ, PCA]
+#: "Box plot by" the flaw's block: the letters at the end of its item ('3A' -> 'A')
+BLOCK = "Flaw block (A, B, C…)"
+
+
+def _values(data: Data, f: str, group: str, per: str) -> pd.DataFrame:
+    """Field ``f``'s numbers with their row (per flaw for a per-flaw field
+    read per flaw, else once per part)."""
+    flat = rows(data, group)
+    df = flat if (per == PER_ROW and data.fields[f].per_item) else per_part(data, flat)
+    out = df.copy()
+    out["_v"] = [to_number(v) for v in df[f]]
+    return out[out["_v"].notna()]
+
+
+def box_groups(data: Data) -> List[str]:
+    """What a box plot can split a field by: the flaw's block, and the text
+    fields with 2 to 12 different values."""
+    out = [BLOCK] if data.item_field else []
+    for f, info in data.fields.items():
+        if info.kind == TEXT:
+            n = data.frame[f][data.frame[f].str.strip() != ""].nunique()
+            if 2 <= n <= 12:
+                out.append(f)
+    return out
+
+
+def _block(item: str) -> str:
+    m = re.search(r"([A-Za-z]+)\s*$", str(item))
+    return m.group(1).upper() if m else ""
+
+
+def plot_figure(data: Data, kind: str, f: str = "", by: str = "", group: str = "",
+                per: str = PER_ROW):
+    """A histogram (mean and median marked), a box plot of ``f`` by ``by``, a
+    normal Q-Q plot, or how much of the number fields' spread the first
+    principal components explain."""
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(6.5, 4.2), dpi=100)
+    ax = fig.add_subplot(111)
+
+    def say(text):
+        ax.text(0.5, 0.5, text, ha="center", va="center", wrap=True, fontsize=9)
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+    if kind == PCA:
+        return _pca(data, group, per, fig, ax, say)
+    if not f or f not in data.fields:
+        return say("Pick a number field.")
+    v = _values(data, f, group, per)
+    a = v["_v"].to_numpy(float)
+    name = label(f, data.fields[f].unit, 60)
+    if len(a) < 2:
+        return say(f"{name}: fewer than 2 numbers to plot.")
+    if kind == HISTOGRAM:
+        ax.hist(a, bins="auto", color="#3b6ea5", edgecolor="white", alpha=0.9)
+        ax.axvline(a.mean(), color="#c0392b", linestyle="--", linewidth=1,
+                   label=f"mean {a.mean():.4g}")
+        ax.axvline(float(np.median(a)), color="#333333", linestyle=":", linewidth=1,
+                   label=f"median {np.median(a):.4g}")
+        ax.legend(fontsize=7)
+        ax.set_xlabel(name, fontsize=8)
+        ax.set_ylabel("How many", fontsize=8)
+        ax.set_title(f"{len(a)} values", fontsize=9)
+    elif kind == BOX:
+        if by == BLOCK:
+            keys = [_block(i) for i in v.get(data.item_field, pd.Series([""] * len(v)))]
+        elif by and by in v.columns:
+            keys = [str(x).strip() for x in v[by]]
+        else:
+            keys = [""] * len(v)
+        groups: Dict[str, List[float]] = {}
+        for k, x in zip(keys, a):
+            groups.setdefault(k or "(blank)", []).append(x)
+        names = sorted(groups, key=sample_sort_key)
+        ax.boxplot([groups[k] for k in names], showfliers=True)
+        ax.set_xticks(range(1, len(names) + 1))
+        ax.set_xticklabels([f"{k}\n({len(groups[k])})" for k in names], fontsize=7)
+        ax.set_ylabel(name, fontsize=8)
+        ax.set_xlabel(label(by, "", 40) if by and by != BLOCK else (by or ""), fontsize=8)
+    elif kind == QQ:
+        from scipy import stats as st
+        (osm, osr), (slope, icpt, r) = st.probplot(a, dist="norm")
+        ax.scatter(osm, osr, s=12, color="#3b6ea5")
+        ax.plot(osm, slope * np.asarray(osm) + icpt, color="#c0392b", linewidth=1)
+        ax.set_xlabel("Normal quantiles", fontsize=8)
+        ax.set_ylabel(name, fontsize=8)
+        ax.set_title(f"Points on the line mean a normal spread (r = {r:.3f})", fontsize=9)
+    else:
+        return say(f"Unknown plot: {kind}")
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def pca(data: Data, group: str = "", per: str = PER_ROW) -> Optional[pd.DataFrame]:
+    """The share of the number fields' spread each principal component
+    explains (fields filled on 60% of rows, blanks filled by their median,
+    each field scaled), or None when too few fields or rows."""
+    flat = rows(data, group)
+    per_flaw = per == PER_ROW and any(data.fields[f].per_item for f in data.number_fields)
+    df = flat if per_flaw else per_part(data, flat)
+    cols = {}
+    for f in fields_of(data, group):
+        if _kind_in(data, f, group) != NUMBER or data.fields[f].count:
+            continue
+        x = pd.Series([to_number(v) for v in df[f]], dtype=float)
+        if x.notna().sum() >= max(3, 0.6 * len(df)) and x.nunique() > 1:
+            cols[f] = x.fillna(x.median())
+    if len(cols) < 2 or len(df) < 3:
+        return None
+    m = pd.DataFrame(cols).to_numpy(float)
+    m = (m - m.mean(axis=0)) / m.std(axis=0, ddof=1)
+    sv = np.linalg.svd(m, compute_uv=False)
+    share = sv ** 2 / float((sv ** 2).sum())
+    k = min(12, len(share))
+    return pd.DataFrame({"Component": range(1, k + 1), "Explains %": 100 * share[:k],
+                         "Running total %": 100 * np.cumsum(share)[:k]})
+
+
+def _pca(data, group, per, fig, ax, say):
+    res = pca(data, group, per)
+    if res is None:
+        return say("Fewer than 2 number fields filled on most rows: nothing for PCA.")
+    ax.bar(res["Component"], res["Explains %"], color="#3b6ea5", label="each")
+    ax.plot(res["Component"], res["Running total %"], marker="o", color="#c0392b",
+            label="running total")
+    ax.set_ylim(0, 105)
+    ax.set_xlabel("Principal component", fontsize=8)
+    ax.set_ylabel("Spread explained (%)", fontsize=8)
+    ax.set_title("How many independent directions the number fields vary in", fontsize=9)
+    ax.legend(fontsize=7)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
 # ── charts ──────────────────────────────────────────────────────────────
 def label(fname: str, unit: str = "", most: int = 30) -> str:
     """A chart's name for a field: its section dropped, its unit once, the
