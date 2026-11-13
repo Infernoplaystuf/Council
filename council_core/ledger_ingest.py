@@ -559,7 +559,7 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
             "own reviews / filled templates): "
             + ", ".join(sorted({p.name for p in skipped_files}))[:200])
     say(f"reading {len(files)} workbooks…")
-    report = part_finder = None
+    report = part_finder = spread = None
     label_examples: List[Any] = []
     if assist:
         from council_core import ledger_llm, ledger_teach
@@ -568,10 +568,13 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         # ``assist`` is the model the user picked ('ollama:<name>' or a GGUF
         # path); True alone means Council's own choice. Asked only while it
         # answers: one failure, one problem line (ledger_llm.one_shot).
-        chat = ledger_llm.one_shot(chat or (ledger_llm.chat_for(assist, should_stop=stop)
-                                            if isinstance(assist, str) else
-                                            ledger_llm.council_chat(should_stop=stop)),
-                                   report, stop)
+        base = chat or (ledger_llm.chat_for(assist, should_stop=stop)
+                        if isinstance(assist, str) else
+                        ledger_llm.council_chat(should_stop=stop))
+        # other machines that take shared work answer too (ledger_spread)
+        from council_core import ledger_spread
+        spread = ledger_spread.build(base, should_stop=stop)
+        chat = ledger_llm.one_shot(spread or base, report, stop)
         # the user's answers in Teach go in as examples (few-shot)
         label_examples = ledger_teach.label_examples(csv_path, ledger.schema)
         part_examples = ledger_teach.part_examples(csv_path) + [
@@ -581,17 +584,26 @@ def _extract(csv_path, sources, review_path, part, use_images, image_reader,
         def part_finder(name, grids):
             return ledger_llm.find_part(name, grids, pattern_mask, chat, report,
                                         examples=part_examples)
+        if spread is not None:
+            # asked several at a time while the next workbooks are read
+            part_finder = ledger_spread.PartAsker(spread, part_finder)
     import pptx_open
-    with pptx_open.user_pairings(csv_path):           # your text box <-> table links
-        run = extract(ledger.schema, files, mapping, ignore,
-                      image_dir=out.with_name(out.stem + "_images"),
-                      image_reader=image_reader, part=part, use_images=use_images,
-                      progress=prog, pattern_mask=pattern_mask, cancel=cancel, log=log,
-                      part_finder=part_finder, taught=taught,
-                      pattern_strict=not pattern_saved,
-                      # the records already accepted are worked answers too,
-                      # and the filled example's
-                      examples=list(ledger.rows) + example_rows)
+    try:
+        with pptx_open.user_pairings(csv_path):       # your text box <-> table links
+            run = extract(ledger.schema, files, mapping, ignore,
+                          image_dir=out.with_name(out.stem + "_images"),
+                          image_reader=image_reader, part=part, use_images=use_images,
+                          progress=prog, pattern_mask=pattern_mask, cancel=cancel,
+                          log=log, part_finder=part_finder, taught=taught,
+                          pattern_strict=not pattern_saved,
+                          # the records already accepted are worked answers
+                          # too, and the filled example's
+                          examples=list(ledger.rows) + example_rows)
+    finally:
+        if hasattr(part_finder, "close"):
+            part_finder.close()
+    if report is not None and spread is not None:
+        report.machines = spread.summary()
     read_all = False
     if report is not None and not run.cancelled:
         rules = "every value the rules found is in this review"
@@ -753,10 +765,16 @@ def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
         from council_core import ledger_llm
         report = ledger_llm.AssistReport()
         stop = cancel.is_set if cancel is not None else None
-        chat = ledger_llm.one_shot(chat or (ledger_llm.chat_for(assist, should_stop=stop)
-                                            if isinstance(assist, str) else
-                                            ledger_llm.council_chat(should_stop=stop)),
-                                   report, stop)
+        base = chat or (ledger_llm.chat_for(assist, should_stop=stop)
+                        if isinstance(assist, str) else
+                        ledger_llm.council_chat(should_stop=stop))
+        # other machines that take shared work answer too (ledger_spread):
+        # every header layout is asked at once
+        from council_core import ledger_spread
+        spread = ledger_spread.build(base, should_stop=stop)
+        chat = ledger_llm.one_shot(spread or base, report, stop)
+        if spread is not None:
+            chat.spread = spread                          # type: ignore[attr-defined]
     run = ledger_records.extract(csv_path, files, chat=chat, progress=prog, cancel=cancel,
                                  report=report)
     if report is not None:
@@ -768,6 +786,9 @@ def _extract_records(csv_path, sources, review_path, prog, cancel, assist,
     if assist:
         assist_line = (f"Council's model ({run.model or 'not answering'}) was asked about "
                        f"{run.model_asked} header layout(s); its answers are amber")
+        shared = getattr(getattr(chat, "spread", None), "summary", lambda: "")()
+        if shared:
+            assist_line += f". Shared across machines: {shared}"
     return ExtractSummary(str(out), len(files), cells, pre, cells - pre,
                           sum(1 for u in run.tables if u.use == "skipped"), 0, 0,
                           list(run.problems), list(run.open_failures), list(run.timings),

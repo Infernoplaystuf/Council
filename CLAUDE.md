@@ -198,7 +198,9 @@ same list.
 - Several PCs as Council machines: Machines & roles' "Add a PC…" (a setup
   .bat for the other PC: Ollama on the network, a firewall rule for this PC
   only), Test selected, Models on selected… (list, download on press, remove
-  after a yes), the "Model for shared work" Connections reads with:
+  after a yes), the "Model for shared work" Connections and the Ledger
+  (`council_core/ledger_spread.py`: part and header questions on several
+  machines, the review unchanged) read with:
   `docs/handoff/multi_pc_nodes_2026-11-13.md`.
 - Council's own plugins (plugin.json shared with Typhon, kind "tab", all off
   until ticked in the Settings tab, guarded tab build, plugin data folder):

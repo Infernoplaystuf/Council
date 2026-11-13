@@ -2138,6 +2138,13 @@ def _weak_tables(uses: List[TableUse], col_fields, run: RecordRun) -> None:
 
 def _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report,
                explained=None) -> None:
+    if getattr(chat, "spread", None) is not None:
+        # several machines answer (council_core.ledger_spread): every
+        # layout's question at once, the answers used in the same order
+        _ask_model_spread(uses, col_fields, recipe, chat, run, prog, stopped, report)
+        if not run.cancelled:
+            _remap(uses, col_fields, recipe, run, explained)
+        return
     asked = 0
     tried: Set[str] = set()
     names = [f.name for f in col_fields]
@@ -2186,6 +2193,77 @@ def _ask_model(uses, col_fields, recipe, chat, run, prog, stopped, report,
         run.model = model
         recipe.model_cache.setdefault(sig, {}).update(got)
     run.model_asked = asked
+    _remap(uses, col_fields, recipe, run, explained)
+
+
+def _ask_model_spread(uses, col_fields, recipe, chat, run, prog, stopped,
+                      report) -> None:
+    """_ask_model's questions all at once on chat.spread's machines: the
+    same layouts chosen the same way (each once, at most MODEL_MAX_LAYOUTS),
+    the same problem lines, the answers put in the recipe in order."""
+    tried: Set[str] = set()
+    names = [f.name for f in col_fields]
+    files_with_records = {u.table.path for u in uses if u.use == "records"}
+    jobs = []
+    for u in uses:
+        t = u.table
+        if u.use == "lookup" or t.orient != "rows":
+            continue
+        if u.use == "skipped" and (t.path in files_with_records or len(t.rows) < 2
+                                   or len(t.cols) < 2):
+            continue
+        sig = t.signature
+        if sig in tried:
+            continue
+        tried.add(sig)
+        mapped_j = {m.j for m in u.maps}
+        free = [n for n in names if n not in {m.field for m in u.maps}]
+        todo = [j for j in range(len(t.cols)) if j not in mapped_j and t.keys[j][0]
+                and t.keys[j][0] not in recipe.model_cache.get(sig, {})]
+        if not free or not todo:
+            continue
+        if len(jobs) >= MODEL_MAX_LAYOUTS:
+            run.problems.append(f"Council's model was asked about {MODEL_MAX_LAYOUTS} header "
+                                "layouts; the rest wait for the next Extract")
+            break
+        jobs.append((t, sig, todo, free))
+    if not jobs:
+        run.model_asked = 0
+        return
+    if stopped():
+        run.cancelled = True
+        run.model_asked = 0
+        return
+    prog.update(f"asking Council's model about {len(jobs)} header layout(s) on "
+                f"{len(chat.spread.machines)} machines")
+    from council_core import ledger_llm
+    results = chat.spread.map([
+        (lambda t=t, todo=todo, free=free:
+         ask_model_headers(t, todo, free, chat, recipe, notes=run.explanations))
+        for t, sig, todo, free in jobs])
+    asked = 0
+    for (t, sig, _todo, _free), (value, e) in zip(jobs, results):
+        if e is not None:
+            if isinstance(e, ledger_llm.ModelUnavailable):
+                continue                                  # said once, by one_shot
+            line = f"Council's model did not answer about {t.file} › {t.sheet}: {e}"
+            if isinstance(e, ledger_llm.ModelFailedAgain):
+                line = f"Council's model did not answer about {t.file} › {t.sheet} " \
+                       "(the same error as above)"
+            run.problems.append(line)
+            continue
+        got, model = value
+        asked += 1
+        run.model = model
+        recipe.model_cache.setdefault(sig, {}).update(got)
+    if stopped():
+        run.cancelled = True
+    run.model_asked = asked
+
+
+def _remap(uses, col_fields, recipe, run, explained) -> None:
+    """Every table mapped again with the model's answers in the recipe."""
+    asked = run.model_asked
     if asked:
         memo: Dict[tuple, List[ColMap]] = {}
         for u in uses:

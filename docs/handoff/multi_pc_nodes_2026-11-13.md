@@ -48,10 +48,37 @@ main PC. The list is Machines & roles (`council_core/node_routing.py`,
   Apothecary's nodes (still only with `COUNCIL_REMOTE_NODES=1`); a machine in
   both is listed once.
 
-## N2 (next)
+## N2: the Ledger's model questions on several machines
 
-Ledger Extract's model questions spread over `sharing_nodes()` the way the
-Connections build shares its passages.
+`council_core/ledger_spread.py`. With "Ask Council's model" ticked, the
+Ledger asks this PC (the model picked for the Ledger, one at a time) AND
+every machine that takes shared work (`node_routing.sharing_nodes()`), each
+with its own model, up to its "Calls at once". No machine set up that way:
+nothing changes. `COUNCIL_LEDGER_SPREAD=0` turns it off.
+
+* **Template Ledger, part questions.** `ledger_ingest` wraps the part finder
+  in a `PartAsker`; `source_extract._extract_all` then runs a `_Pipeline`:
+  a part-less workbook's question is submitted and the next workbooks are
+  read meanwhile; `_extract_one` hands back the rest of the workbook
+  (`_finish_one`) and the pipeline calls it IN FILE ORDER once the answer is
+  in, so the review is the same as asked on this PC alone (pinned by
+  `tests/test_ledger_spread.py`). At most twice the machines' calls wait at
+  a time. Files the helper processes read are put in their turn too.
+* **Table template, header layouts.** `ledger_records._ask_model_spread`
+  picks the same layouts (each once, at most MODEL_MAX_LAYOUTS) and asks them
+  all at once; answers go into the recipe in order.
+* **A machine that fails** is not asked again in that run and its question
+  goes to another machine that has not tried it. Only when all fail does
+  `ledger_llm.one_shot` see a failure.
+* **One thread at a time outside the model**: find_part, one_shot and the
+  AssistReport were written for one thread, so each question holds a baton
+  (`Spread.run`) and lets go only while a machine thinks (`Spread.__call__`).
+* **Cancel** while answers are out: those workbooks are left out (what their
+  reading added to the run's lists is taken out by recorded positions,
+  latest first) and the run is a cancelled one.
+* The summary says who answered: "Shared across machines: pc2 answered 14,
+  this PC answered 9" (`AssistReport.machines`).
+* The one question about left-over labels stays one question.
 
 ## Not done / limits
 

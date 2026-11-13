@@ -30,7 +30,9 @@ field names and the part numbers the user confirmed - never other values.
 Backend: council_engine.local_chat first - the user's GGUF, or the role's
 Ollama - then a US-origin Ollama on this PC / the Pi nodes Council itself
 enabled (source_extract.suggest_mappings_for_labels' order). Nothing leaves
-the user's machines.
+the user's machines. With machines set up for shared work in Machines &
+roles, the part and header questions are spread over them
+(council_core.ledger_spread).
 """
 from __future__ import annotations
 
@@ -610,6 +612,9 @@ class AssistReport:
     #: Cancel stopped the question being asked (one_shot): the model did
     #: not fail, and no problem line says it did not answer.
     cancelled: bool = False
+    #: Which machines answered when the questions were shared out
+    #: (council_core.ledger_spread.Spread.summary), '' when this PC alone.
+    machines: str = ""
 
     def _ran_out(self) -> str:
         """Why a model that timed out was not asked again: one slow workbook
@@ -676,8 +681,9 @@ class AssistReport:
                    "stopped answering and was not asked again")
         tail = (f". Then it {stopped}: {down}" if down else "") + (
             f". Then {stop}" if self.cancelled else "")
+        shared = f" Shared across machines: {self.machines}." if self.machines else ""
         return _end("Council's model" + (f" ({name})" if name else "") + ": "
-                    + "; ".join(bits) + f" — {what}" + tail)
+                    + "; ".join(bits) + f" — {what}" + tail) + shared
 
 
 def _end(text: str) -> str:
