@@ -439,8 +439,37 @@ def list_cameras() -> Dict[str, Any]:
     else:
         summary = "No cameras found — see the notes."
     _console([summary] + [f"  {r}" for r in rows] + [f"  note: {n}"
-                                                      for n in notes])
+                                                      for n in notes]
+             + _scan_context(host))
     return {"rows": rows, "summary": summary, "notes": notes}
+
+
+def _scan_context(host: Any) -> List[str]:
+    """Where the scan looked, for the Command Prompt: which Python ran it
+    (check.bat and a double-clicked run.bat can find different ones), which
+    camera the app is set up for (a Prophesee set-up never searches for a
+    Basler), and pypylon's GenTL path. Never raises."""
+    import sys
+    out = [f"  scanned with Python {sys.version.split()[0]} at "
+           f"{sys.executable}"]
+    try:
+        if host is not None:
+            out.append("  plugin Typhon: the camera plugins it runs were "
+                       "searched")
+        else:
+            choice = current_choice()
+            out.append("  set up for: " + {
+                "basler": "Basler (Basler and simulated cameras searched)",
+                "prophesee": "Prophesee (Basler cameras are NOT searched; "
+                             "run Camera setup and pick Basler)",
+            }.get(choice or "", "no camera chosen (every backend searched)"))
+        import os
+        from council_core import pylon_env
+        path = os.environ.get(pylon_env.ENV, "")
+        out.append(f"  {pylon_env.ENV}: {path or '(not set)'}")
+    except Exception:                                   # noqa: BLE001
+        pass
+    return out
 
 
 def _console(lines) -> None:

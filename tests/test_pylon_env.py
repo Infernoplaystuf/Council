@@ -151,3 +151,30 @@ def test_the_command_prompt_gets_the_camera_list(capsys, monkeypatch):
     monkeypatch.setenv(pe.QUIET_ENV, "1")
     frame_camera.list_cameras()
     assert pe.PREFIX not in capsys.readouterr().err, "can be silenced"
+
+
+def test_the_command_prompt_says_where_the_scan_looked(capsys, monkeypatch):
+    """check.bat saw the camera, the app did not (Andy, 13 November): the
+    console now names the Python the scan ran in, the camera the app is
+    set up for, and the GenTL path, so the two can be compared."""
+    monkeypatch.delenv(pe.QUIET_ENV, raising=False)
+    import frame_camera
+    monkeypatch.setattr(frame_camera, "current_choice", lambda: "prophesee")
+    frame_camera.list_cameras()
+    err = capsys.readouterr().err
+    assert "scanned with Python" in err and sys.executable in err
+    assert "Basler cameras are NOT searched" in err
+    assert pe.ENV in err
+
+
+def test_the_wizard_scan_sets_the_gentl_path_before_pypylon(monkeypatch):
+    """The set-up wizard's "Scan Basler cameras" imported pypylon without
+    prepare(): run first, it left the app's later camera list blind to a
+    CXP camera."""
+    from council_core import basler_scan
+    calls = []
+    monkeypatch.setattr(pe, "prepare", lambda *a, **k: calls.append(1) or [])
+    monkeypatch.setitem(sys.modules, "pypylon", None)   # import fails fast
+    basler_scan.scan(test_grab=False, pnp=lambda a: None,
+                     gentl_changed=lambda: None)
+    assert calls, "prepare() ran before the pypylon import"

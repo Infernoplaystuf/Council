@@ -124,6 +124,12 @@ def prepare(*, registry: Optional[List[str]] = None,
             added.append(folder)
     if added:
         os.environ[ENV] = os.pathsep.join(now)
+        if "pypylon" in sys.modules:
+            # Too late for this process: pylon read the path when pypylon
+            # was imported. Say so rather than leave a silent empty list.
+            console("pypylon was imported before the GenTL path was set; "
+                    "a CoaXPress camera may stay hidden until Typhon is "
+                    "restarted. Please report this.")
     _prepared = added
     return list(added)
 
