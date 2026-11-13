@@ -198,7 +198,8 @@ def test_the_readme_covers_setting_up_a_new_machine(exported):
 def test_run_bat_finds_python_or_says_how_to_get_it(exported):
     for name in ("run.bat", "check.bat"):
         bat = (exported.folder / name).read_text(encoding="utf-8")
-        assert "where python" in bat and "where py " in bat, name
+        assert "python -c" in bat and "py -3 -c" in bat, name
+        assert 'if exist "%PYTHON%\\python.exe"' in bat, name
         assert "No Python found" in bat and "pause" in bat, name
     assert "check.bat" in (exported.folder / "run.bat").read_text(
         encoding="utf-8"), "an error points at the check"
@@ -236,3 +237,57 @@ def test_the_setup_check_names_a_missing_package(exported, tmp_path):
     assert done.returncode == 1
     assert "no_such_package_xyz: MISSING" in done.stdout
     assert "PROBLEM: no_such_package_xyz is not installed" in done.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="runs check.bat")
+@pytest.mark.parametrize("setting", ["folder", "nonsense", "exe"])
+def test_check_bat_copes_with_a_python_setting_that_is_a_folder(
+        exported, setting):
+    """A lab PC had PYTHON set to the Python313 FOLDER; run.bat ran it and
+    cmd said "...\\Python313 is not recognized as an internal or external
+    command" (Andy, 13 November 2026). A folder is followed to its
+    python.exe, a PYTHON that does not run is passed over."""
+    import subprocess
+    exe = Path(sys.executable)
+    value = {"folder": str(exe.parent), "nonsense": r"C:\no\such\python",
+             "exe": str(exe)}[setting]
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("COUNCIL_", "TYPHON_", "FRAME_CLASSES"))}
+    env["PYTHON"] = value
+    if setting == "nonsense":
+        env["PATH"] = str(exe.parent) + os.pathsep + env.get("PATH", "")
+    done = subprocess.run(["cmd", "/c", str(exported.folder / "check.bat")],
+                          cwd=str(exported.folder), env=env, input="\r\n",
+                          capture_output=True, text=True, timeout=300)
+    out = done.stdout + done.stderr
+    assert "is not recognized" not in out, out[-2000:]
+    assert "All set" in out, out[-2000:]
+    assert done.returncode == 0, out[-2000:]
+
+
+def test_an_activated_environment_s_python_is_used(exported, tmp_path):
+    """Started from inside an activated venv (or conda env), run.bat /
+    check.bat (run.sh / check.sh) use THAT environment's Python, whatever
+    PYTHON or PATH say (Andy, 13 November 2026)."""
+    import subprocess
+    venv = tmp_path / "env"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip",
+                    "--system-site-packages", str(venv)], check=True,
+                   timeout=120)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("COUNCIL_", "TYPHON_", "FRAME_CLASSES",
+                                "CONDA_"))}
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PYTHON"] = str(tmp_path / "no_such_python")
+    if sys.platform == "win32":
+        argv = ["cmd", "/c", str(exported.folder / "check.bat")]
+        want = venv / "Scripts" / "python.exe"
+    else:
+        argv = ["sh", str(exported.folder / "check.sh")]
+        want = venv / "bin" / "python"
+    done = subprocess.run(argv, cwd=str(exported.folder), env=env,
+                          input="\r\n", capture_output=True, text=True,
+                          timeout=300)
+    out = done.stdout + done.stderr
+    assert f"at {want}" in out, out[-2000:]
+    assert done.returncode == 0 and "All set" in out, out[-2000:]
