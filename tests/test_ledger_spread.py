@@ -250,10 +250,12 @@ def test_header_layouts_are_asked_at_once(tmp_path, vault, monkeypatch):
                    "sex": "Gender"}
             return json.dumps({"mappings": [{"header": h, "field": ans.get(h)}
                                             for h in heads]}), "fake-granite"
-    monkeypatch.setattr(ls, "node_chat", lambda *a, **k: Headers("pc2", 0.2))
+    # each answer takes 1 s: building a question (done one at a time) took
+    # over 0.2 s on a slow Windows runner, so 0.2 s answers never overlapped
+    monkeypatch.setattr(ls, "node_chat", lambda *a, **k: Headers("pc2", 1.0))
     _machines(vault, nr.Node("pc2", "http://10.0.0.5:11434", True, 2, "gemma3:12b"))
     ex = li._extract_records(csv, files, tmp_path / "r.xlsx", _NoProg(), None,
-                             "ollama:none", chat=Headers("here", 0.2))
+                             "ollama:none", chat=Headers("here", 1.0))
     assert Fake.most >= 2
     assert "3 header layout(s)" in ex.assist and "Shared across machines" in ex.assist
     assert ex.records == 6
