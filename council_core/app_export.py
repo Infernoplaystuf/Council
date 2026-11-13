@@ -71,6 +71,10 @@ CHECK_SCRIPT = "check_setup.py"
 
 #: Never copied out of a project folder.
 SKIP_NAMES = {"__pycache__", ".pytest_cache", ".git", "logs"}
+#: The camera set-up is per machine (council_core/camera_setup.py: "a fresh
+#: machine gets a fresh wizard"): the Council PC's choice, copied, set the
+#: lab PC's Typhon up for a Prophesee and it never looked for its Basler.
+SKIP_FILES = {"camera_setup.json"}
 SKIP_SUFFIXES = {".pyc", ".pyo"}
 
 #: Import name -> the name pip installs it under, where they differ.
@@ -376,6 +380,7 @@ def _copy_project(src: Path, dest: Path) -> List[str]:
     for path in sorted(src.rglob("*")):
         rel = path.relative_to(src)
         if any(p in SKIP_NAMES for p in rel.parts) or \
+                rel.as_posix() in SKIP_FILES or \
                 path.suffix in SKIP_SUFFIXES or not path.is_file():
             continue
         target = dest / rel
@@ -700,6 +705,9 @@ IF SOMETHING GOES WRONG
   "No module named ..."      Step 2 was missed or used another Python: run
                              it with the Python run.bat uses (check.bat
                              prints which one).
+  Only simulated cameras     Click Camera setup and choose the camera this
+                             PC has (a Prophesee set-up never looks for a
+                             Basler).
   No camera in the list      Close the pylon Viewer, then run check.bat from
                              the same environment as the app. Its "Basler /
                              pylon in detail" part says which Python and

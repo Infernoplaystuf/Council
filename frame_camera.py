@@ -417,7 +417,22 @@ def list_cameras() -> Dict[str, Any]:
 
     host = _plugin_host()
     if host is None:
-        found = cameras.discover(_backends_for(current_choice()))
+        choice = current_choice()
+        chosen = _backends_for(choice)
+        found = cameras.discover(chosen)
+        if chosen is not None and not any(
+                c.backend == choice for c in found.cameras):
+            # Set up for a camera this PC has none of (its SDK missing, or
+            # none plugged in): look for every kind rather than show only
+            # the simulated ones. The Council PC's Prophesee set-up, copied
+            # with an exported Typhon, hid the lab PC's Basler (13 November).
+            every = cameras.discover(None)
+            if any(not c.backend == "simulated" for c in every.cameras):
+                every.notes.insert(0, (
+                    f"This app is set up for {choice.title()}, but none was "
+                    f"found, so every kind of camera was searched. Click "
+                    f"Camera setup to choose the camera this PC has."))
+                found = every
     else:
         # A "Typhon (plugins)" project: the camera plugins it runs, less
         # the families its set-up did not tick — the same scan, the same

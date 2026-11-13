@@ -119,3 +119,8 @@ machine but an older console or environment never inherits.
   typed in an activated environment can find different ones), the camera the
   app is set up for (a Prophesee set-up never searches for a Basler), and
   `GENICAM_GENTL64_PATH`.
+- The cause on Andy's lab PC: the exported Typhon carried the Council PC's
+  `camera_setup.json` (set up for Prophesee), so it searched only for an
+  EVK4 and the simulated cameras. An export now leaves `camera_setup.json`
+  behind (it is per machine), and an app set up for a camera kind it finds
+  none of searches every kind, with a note to run Camera setup.
