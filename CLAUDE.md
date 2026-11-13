@@ -202,6 +202,11 @@ same list.
   (`council_core/ledger_spread.py`: part and header questions on several
   machines, the review unchanged) read with:
   `docs/handoff/multi_pc_nodes_2026-11-13.md`.
+- Ideas from Andy's LMM Analysis Studio script in the Ledger: the merge
+  following moved rows / columns, .xls and protected copies through Excel, the
+  Check sheet and page, parts-based correlation, repeated tables as one field,
+  the Plots page and the Equations page (`council_core/ledger_equations.py`):
+  `docs/handoff/ledger_lmm_script_2026-11-13.md`.
 - Council's own plugins (plugin.json shared with Typhon, kind "tab", all off
   until ticked in the Settings tab, guarded tab build, plugin data folder):
   `docs/handoff/app_plugins_2026-11-05.md`.

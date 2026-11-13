@@ -626,9 +626,18 @@ if "frame_camera" in sys.modules or os.path.isfile(
                 say(f"  {info.label}")
             if not found:
                 say("  None seen: is the camera plugged in and powered, and "
-                    "does the pylon Viewer see it?")
+                    "does the pylon Viewer see it? (Close pylon Viewer "
+                    "before starting the app.)")
         else:
             say(f"Basler (pylon): not available ({hint})")
+        say("")
+        say("Basler / pylon in detail (each camera opened and closed again):")
+        try:
+            from council_core import pylon_env
+            for line in pylon_env.full_lines():
+                say(f"  {line}")
+        except Exception as exc:
+            say(f"  pylon report stopped: {type(exc).__name__}: {exc}")
         import frame_camera
         rows = frame_camera.list_cameras().get("rows", [])
         say(f"The app's camera list: {len(rows)}")
@@ -691,10 +700,18 @@ IF SOMETHING GOES WRONG
   "No module named ..."      Step 2 was missed or used another Python: run
                              it with the Python run.bat uses (check.bat
                              prints which one).
-  No camera in the list      check.bat says whether pylon is installed and
-                             which cameras it sees. If pylon sees none, open
-                             the pylon Viewer: if it does not see the camera
-                             either, it is the cable, power or driver.
+  No camera in the list      Close the pylon Viewer, then run check.bat from
+                             the same environment as the app. Its "Basler /
+                             pylon in detail" part says which Python and
+                             pypylon are used, the transport layers pypylon
+                             has (a CXP camera needs a CoaXPress / GenTL one:
+                             install the pylon Software Suite with 'CXP
+                             Camera Support' ticked), the GENICAM_GENTL64_PATH
+                             entries and their .cti producers, and each
+                             camera opened: its input lines and trigger
+                             sources. The app also prints its camera list
+                             and any open error in its Command Prompt
+                             (lines starting [Typhon camera]).
   The window closes at once  Start it from a Command Prompt (run.bat) to
                              read the error, or run check.bat.
   Moving to a new version    Export again from the Council into a new

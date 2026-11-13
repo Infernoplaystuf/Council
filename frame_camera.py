@@ -438,7 +438,21 @@ def list_cameras() -> Dict[str, Any]:
         summary = f"{len(found.cameras)} camera(s) found."
     else:
         summary = "No cameras found — see the notes."
+    _console([summary] + [f"  {r}" for r in rows] + [f"  note: {n}"
+                                                      for n in notes])
     return {"rows": rows, "summary": summary, "notes": notes}
+
+
+def _console(lines) -> None:
+    """The camera list and any open failure, in the Command Prompt the app
+    was started from too (council_core.pylon_env.console), so a camera
+    problem can be read there without the window (Andy, 13 November)."""
+    try:
+        from council_core import pylon_env
+        for line in lines:
+            pylon_env.console(str(line))
+    except Exception:                                   # noqa: BLE001
+        pass
 
 
 def _backends_for(choice: Optional[str]):
@@ -625,7 +639,11 @@ def connect(which: Any) -> Dict[str, Any]:
             raise RuntimeError("a camera is already open — disconnect first")
         info = _chosen(which)
         if host is None:
-            device = cameras.open_camera(info)
+            try:
+                device = cameras.open_camera(info)
+            except Exception as exc:
+                _console([f"could not open {info.label}: {exc}"])
+                raise
         else:
             # A "Typhon (plugins)" project opens through the camera plugin
             # of the camera's family, which confirms onto the slot what the
@@ -637,7 +655,11 @@ def connect(which: Any) -> Dict[str, Any]:
             if other is not None and other is not slot:
                 raise RuntimeError(f"that camera is in use as {other.name} — "
                                    f"disconnect it there first")
-            device = host.open_camera(info, camera=slot.name)
+            try:
+                device = host.open_camera(info, camera=slot.name)
+            except Exception as exc:
+                _console([f"could not open {info.label}: {exc}"])
+                raise
         # What the camera says it is once open (an event camera's sensor is
         # read then, never at discovery — cameras.identify): the identity
         # presets and the run's camera record use.
@@ -681,6 +703,7 @@ def connect(which: Any) -> Dict[str, Any]:
         # Its name in the rig could not be kept (camera_rig.json damaged,
         # or not writable): said, never in the way of the camera.
         said += f" Note: {named}."
+    _console([said])
     return {
         "summary": said,
         "area": _area_text(area),

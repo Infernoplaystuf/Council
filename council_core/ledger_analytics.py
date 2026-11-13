@@ -37,7 +37,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -54,6 +54,10 @@ KIND_SHARE = 0.8
 OUTLIER_Z = 3.5
 #: values a pair of fields needs in common before it is correlated
 CORR_MIN_N = 5
+#: parts a pair needs behind it: a part's flaws are not independent of each
+#: other, so how sure a pair is goes by its parts, not its flaw rows (Andy's
+#: LMM Analysis Studio script, 2026-11-13: "Independent_Parts")
+CORR_MIN_PARTS = 3
 #: charts written into the analysis workbook, at most
 CHART_LIMIT = 40
 
@@ -67,6 +71,7 @@ class FieldInfo:
     unit: str = ""
     section: str = ""
     per_item: bool = False
+    count: bool = False           # a count the analysis made (runs filled): not correlated
 
 
 @dataclass
@@ -78,6 +83,9 @@ class Data:
     fields: Dict[str, FieldInfo]  # analysed fields, in template order
     groups: List[lg.Group] = field(default_factory=list)
     _facts: Optional[Dict[str, lg.PartFacts]] = None
+    #: a repeated table's fields taken as one: 'Concealment: Media Run Time'
+    #: -> ['Concealment 1: Media Run Time', 'Concealment 2: …', …]
+    stacked: Dict[str, List[str]] = field(default_factory=dict)
 
     @property
     def parts(self) -> List[str]:
@@ -139,8 +147,9 @@ def _varies_within_parts(frame: pd.DataFrame, id_field: str, col: str) -> bool:
     return False
 
 
-def load(csv) -> Data:
-    """The parent CSV, ready to analyse."""
+def load(csv, stack: bool = True) -> Data:
+    """The parent CSV, ready to analyse. ``stack``: a repeated table's runs
+    taken as one field each (see _stack_repeats); False: each run its own."""
     ledger = ParentCSV(csv)
     frame = pd.DataFrame(ledger.rows, columns=ledger.columns).fillna("").astype(str)
     schema = ledger.schema
@@ -158,8 +167,83 @@ def load(csv) -> Data:
         info[col] = FieldInfo(col, _kind(col, frame[col].tolist()),
                               unit=tf.unit if tf else "", section=tf.section if tf else "",
                               per_item=per_item)
-    return Data(csv=str(csv), frame=frame, id_field=ledger.id_field,
+    data = Data(csv=str(csv), frame=frame, id_field=ledger.id_field,
                 item_field=item_field, fields=info, groups=lg.load_groups(csv))
+    if stack and schema:
+        _stack_repeats(data, schema)
+    return data
+
+
+_RUN = re.compile(r"^(?P<section>.+?) (?P<run>\d+): (?P<label>.+)$")
+#: the field a stacked table adds: how many of its runs a part filled
+RUNS_FILLED = "runs filled"
+
+
+def _stack_repeats(data: Data, schema) -> None:
+    """A repeated table (Concealment 1..7, each run a row) as one field per
+    column: a part's runs averaged for a number, its one value for a text
+    (several different: listed), and '<table>: runs filled'. Andy's LMM
+    Analysis Studio script (2026-11-13) does the same; run against run is
+    not a relation worth listing. The numbered fields stay in the CSV."""
+    groups: Dict[Tuple[str, str], List[Tuple[int, str]]] = {}
+    for f in schema.fields:
+        m = _RUN.match(f.name)
+        if f.layout != "repeat" or not m or f.name not in data.fields:
+            continue
+        groups.setdefault((m["section"], m["label"]), []).append((int(m["run"]), f.name))
+    tables: Dict[str, List[str]] = {}
+    new_info: Dict[str, FieldInfo] = {}
+    for (section, lab), runs in groups.items():
+        if len(runs) < 2:
+            continue
+        names = [n for _r, n in sorted(runs)]
+        name = f"{section}: {lab}"
+        if name in data.frame.columns:
+            continue
+        kinds = {data.fields[n].kind for n in names} - {EMPTY}
+        kind = NUMBER if kinds == {NUMBER} else DATE if kinds == {DATE} else (
+            TEXT if kinds else EMPTY)
+        col = []
+        for _i, row in data.frame[names].iterrows():
+            vals = [str(v).strip() for v in row if str(v).strip()]
+            if kind == NUMBER:
+                nums = [n for n in map(to_number, vals) if n is not None]
+                col.append(f"{sum(nums) / len(nums):.6g}" if nums else "")
+            else:
+                distinct = list(dict.fromkeys(vals))
+                col.append(distinct[0] if len(distinct) == 1 else "; ".join(distinct))
+        data.frame[name] = pd.Series(col, index=data.frame.index, dtype=object)
+        first = data.fields[names[0]]
+        new_info[name] = FieldInfo(name, kind, unit=first.unit, section=section,
+                                   per_item=False)
+        data.stacked[name] = names
+        tables.setdefault(section, []).extend(names)
+    if not data.stacked:
+        return
+    for section, names in tables.items():
+        runs = sorted({int(_RUN.match(n)["run"]) for n in names})
+        filled = []
+        for _i, row in data.frame[names].iterrows():
+            have = {int(_RUN.match(n)["run"]) for n in names if str(row[n]).strip()}
+            filled.append(str(len([r for r in runs if r in have])))
+        name = f"{section}: {RUNS_FILLED}"
+        if name not in data.frame.columns:
+            data.frame[name] = pd.Series(filled, index=data.frame.index, dtype=object)
+            new_info[name] = FieldInfo(name, NUMBER, section=section, count=True)
+    # the stacked fields where the table's first run was, the runs left out
+    out: Dict[str, FieldInfo] = {}
+    gone = {n for ns in data.stacked.values() for n in ns}
+    placed = set()
+    for f, inf in data.fields.items():
+        if f in gone:
+            m = _RUN.match(f)
+            for name, ni in new_info.items():
+                if ni.section == m["section"] and name not in placed:
+                    out[name] = ni
+                    placed.add(name)
+            continue
+        out[f] = inf
+    data.fields = out
 
 
 # ── slicing ─────────────────────────────────────────────────────────────
@@ -179,23 +263,34 @@ def rows(data: Data, group: str = "") -> pd.DataFrame:
     keep = {p.lower() for p in lg.members(g, _facts(data), data.csv)}
     df = df[df[data.id_field].str.lower().isin(keep)].copy()
     for f in data.fields:
-        mode = g.mode(f)
+        mode, key = _mode(data, g, f)
         if mode == lg.OFF:
             df[f] = ""
         elif mode == lg.YES_NO:
-            df[f] = [lg.as_yes_no(v, g.yes_no.get(f, "")) for v in df[f]]
+            df[f] = [lg.as_yes_no(v, g.yes_no.get(key, "")) for v in df[f]]
     return df
+
+
+def _mode(data: Data, g: Optional[lg.Group], f: str) -> Tuple[str, str]:
+    """How group ``g`` treats field ``f``, and the name it is set under: a
+    stacked field as its own name says, else as its table's first run."""
+    if g is None:
+        return lg.TRACKED, f
+    if f in data.stacked and g.mode(f) == lg.TRACKED:
+        first = data.stacked[f][0]
+        return g.mode(first), first
+    return g.mode(f), f
 
 
 def fields_of(data: Data, group: str = "") -> List[str]:
     """The fields analysed for ``group``: not those it does not track."""
     g = data.group(group)
-    return [f for f in data.fields if not g or g.mode(f) != lg.OFF]
+    return [f for f in data.fields if _mode(data, g, f)[0] != lg.OFF]
 
 
 def _kind_in(data: Data, f: str, group: str) -> str:
     g = data.group(group)
-    if g and g.mode(f) == lg.YES_NO:
+    if _mode(data, g, f)[0] == lg.YES_NO:
         return TEXT
     return data.fields[f].kind
 
@@ -436,6 +531,7 @@ class Correlation:
     n: pd.DataFrame
     sure: pd.DataFrame                # bool: significant after the FDR correction
     note: str = ""
+    parts: Optional[pd.DataFrame] = None   # how many parts each pair's values come from
 
     def pairs(self, most: int = 0, twins: bool = False) -> pd.DataFrame:
         """Each pair once, strongest first. ``twins``: also a field against
@@ -450,9 +546,11 @@ class Correlation:
                 out.append({"Field A": a, "Field B": b, "r": round(float(r), 3),
                             "Strength": strength(r), "p": float(self.p.loc[a, b]),
                             "Sure": "yes" if self.sure.loc[a, b] else "no",
-                            "Values": int(self.n.loc[a, b])})
+                            "Values": int(self.n.loc[a, b]),
+                            "Parts": (int(self.parts.loc[a, b]) if self.parts is not None
+                                      else int(self.n.loc[a, b]))})
         res = pd.DataFrame(out, columns=["r", "Strength", "Sure", "Field A", "Field B",
-                                         "Values", "p"])
+                                         "Values", "Parts", "p"])
         if len(res):
             res = res.reindex(res["r"].abs().sort_values(ascending=False).index)
             res["p"] = [float(f"{v:.3g}") for v in res["p"]]
@@ -484,7 +582,7 @@ def correlation(data: Data, group: str = "", per: str = PER_ROW,
     whole = per_part(data, flat)
     fs = []
     for f in fields_of(data, group):
-        if _kind_in(data, f, group) != NUMBER:
+        if _kind_in(data, f, group) != NUMBER or data.fields[f].count:
             continue
         if len(set(_numbers(whole[f]).tolist())) >= 2:
             fs.append(f)
@@ -509,22 +607,135 @@ def correlation(data: Data, group: str = "", per: str = PER_ROW,
                 if data.fields[a].per_item or data.fields[b].per_item:
                     for k in ("corr", "p_values", "n", "significant_fdr"):
                         res[k].loc[a, b] = flaws[k].loc[a, b]
-    r, p = res["corr"].copy(), res["p_values"].copy()
-    n, sure = res["n"].astype(int), res["significant_fdr"].astype(bool)
-    few = n < CORR_MIN_N
-    r, p = r.mask(few), p.mask(few)
+    r = res["corr"].copy()
+    n = res["n"].astype(int)
+    parts = _parts_behind(data, flat, whole, fs, per)
+    few = (n < CORR_MIN_N) | (parts < CORR_MIN_PARTS)
+    r = r.mask(few)
     for f in fs:
         r.loc[f, f] = 1.0
+    p, sure = _sure_by_parts(r, parts, fs)
+    p = p.mask(few)
     sure = sure & ~few
-    c = Correlation(method, fs, r, p, n, sure)
+    c = Correlation(method, fs, r, p, n, sure, parts=parts)
     strong = c.pairs()
     strong = strong[(strong["r"].abs() >= 0.6) & (strong["Sure"] == "yes")]
     c.note = (f"{len(strong)} pair(s) strongly correlated and sure (|r| 0.6 or more, "
-              "significant after correcting for the number of pairs; a field against its own "
+              "significant after correcting for the number of pairs, judged by the number "
+              "of parts behind each pair, not its flaw rows; a field against its own "
               "inspectors' readings not counted). A correlation is "
               "not a cause: check the pair's chart." if len(strong) else
               "No pair is both strongly correlated (|r| 0.6 or more) and sure.")
     return c
+
+
+def _parts_behind(data: Data, flat: pd.DataFrame, whole: pd.DataFrame,
+                  fs: List[str], per: str) -> pd.DataFrame:
+    """Per pair, the parts that have both values (on a flaw row when either
+    is a per-flaw field read per flaw, else once per part)."""
+    ids_flat = flat[data.id_field].astype(str).to_numpy()
+    ids_whole = whole[data.id_field].astype(str).to_numpy()
+    ok_flat = {f: np.array([to_number(v) is not None for v in flat[f]]) for f in fs}
+    ok_whole = {f: np.array([to_number(v) is not None for v in whole[f]]) for f in fs}
+    out = pd.DataFrame(0, index=fs, columns=fs, dtype=int)
+    for i, a in enumerate(fs):
+        for b in fs[i:]:
+            by_flaw = per == PER_ROW and (data.fields[a].per_item or data.fields[b].per_item)
+            ok, ids = ((ok_flat, ids_flat) if by_flaw else (ok_whole, ids_whole))
+            k = len(set(ids[ok[a] & ok[b]]))
+            out.loc[a, b] = out.loc[b, a] = k
+    return out
+
+
+def _sure_by_parts(r: pd.DataFrame, parts: pd.DataFrame, fs: List[str],
+                   alpha: float = 0.05):
+    """p of each r with the number of parts as its sample size (a part's
+    flaws count once between them), and which pairs are sure after
+    Benjamini-Hochberg across the pairs."""
+    from scipy import stats as st
+    p = pd.DataFrame(np.nan, index=fs, columns=fs, dtype=float)
+    sure = pd.DataFrame(False, index=fs, columns=fs, dtype=bool)
+    tests = []
+    for i, a in enumerate(fs):
+        for b in fs[i + 1:]:
+            v, k = r.loc[a, b], int(parts.loc[a, b])
+            if pd.isna(v) or k < 3:
+                continue
+            v = float(np.clip(v, -0.999999999, 0.999999999))
+            t = v * math.sqrt((k - 2) / (1 - v * v))
+            pv = float(2 * st.t.sf(abs(t), k - 2))
+            p.loc[a, b] = p.loc[b, a] = pv
+            tests.append((pv, a, b))
+    tests.sort()
+    m = len(tests)
+    last = 0
+    for rank, (pv, _a, _b) in enumerate(tests, 1):
+        if pv <= alpha * rank / m:
+            last = rank
+    for pv, a, b in tests[:last]:
+        sure.loc[a, b] = sure.loc[b, a] = True
+    return p, sure
+
+
+# ── checking the values (Andy's LMM Analysis Studio script, 2026-11-13:
+# a mapping audit, a reason for every blank, why a variable is missing) ──
+def left_out_of_correlation(data: Data, group: str = "") -> pd.DataFrame:
+    """Each field and whether it is in the correlation; when not, why."""
+    flat = rows(data, group)
+    whole = per_part(data, flat)
+    out = []
+    for f in fields_of(data, group):
+        info, kind = data.fields[f], _kind_in(data, f, group)
+        a = _numbers(whole[f] if not info.per_item else flat[f])
+        distinct = len(set(a.tolist()))
+        why = ("a count the analysis made" if info.count else
+               "a text field" if kind == TEXT else "a date" if kind == DATE else
+               "nothing filled in" if kind == EMPTY else
+               "no numbers" if not len(a) else
+               "only one value" if len(a) == 1 else
+               "never varies" if distinct < 2 else "")
+        out.append({"Field": f, "Kind": kind, "In the correlation": "no" if why else "yes",
+                    "Why not": why, "Numbers": int(len(a)), "Different values": distinct})
+    res = pd.DataFrame(out, columns=["Field", "In the correlation", "Why not", "Kind",
+                                     "Numbers", "Different values"])
+    if len(res):
+        res = res.sort_values("In the correlation", kind="stable").reset_index(drop=True)
+    return res
+
+
+def merge_check(data: Data) -> Optional[pd.DataFrame]:
+    """What a merge read from each copy, cell by cell (ledger_merge's Check),
+    or None for a Ledger the merge did not make."""
+    from council_core import ledger_merge
+    return ledger_merge.read_check(data.csv)
+
+
+def check_by_file(check: pd.DataFrame) -> pd.DataFrame:
+    """A row per copy: how many of its values were read in place, read at a
+    moved cell, blank, or on a sheet not found."""
+    from council_core import ledger_merge as lm
+    out = []
+    for (f, part), sub in check.groupby(["File", "Part"], sort=False):
+        st = sub["Status"].value_counts()
+        out.append({"File": f, "Part": part, "Read": int(st.get(lm.READ, 0)),
+                    "Read at moved cell": int(st.get(lm.MOVED, 0)),
+                    "Blank in the copy": int(st.get(lm.BLANK, 0)),
+                    "Sheet not found": int(st.get(lm.NO_SHEET, 0))})
+    res = pd.DataFrame(out, columns=["File", "Part", "Read", "Read at moved cell",
+                                     "Blank in the copy", "Sheet not found"])
+    if len(res):
+        res = res.sort_values(["Read at moved cell", "Sheet not found", "Blank in the copy"],
+                              ascending=False, kind="stable").reset_index(drop=True)
+    return res
+
+
+def find_rows(df: pd.DataFrame, text: str) -> pd.DataFrame:
+    """The rows with ``text`` (any case) in any column."""
+    text = (text or "").strip().lower()
+    if not text or df.empty:
+        return df
+    hit = df.astype(str).apply(lambda col: col.str.lower().str.contains(text, regex=False))
+    return df[hit.any(axis=1)]
 
 
 def correlation_figure(c: Correlation):
@@ -582,6 +793,148 @@ def scatter_figure(data: Data, a: str, b: str, group: str = "", per: str = PER_R
             ax.plot(line, m * line + k, color="#c0392b", linewidth=1)
     for setter, f in ((ax.set_xlabel, a), (ax.set_ylabel, b)):
         setter(label(f, data.fields[f].unit, 48), fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+# ── distribution plots (Andy's LMM Analysis Studio script, 2026-11-13) ──
+HISTOGRAM, BOX, QQ, PCA = "Histogram", "Box plot", "Normal Q-Q", "PCA explained variance"
+PLOTS = [HISTOGRAM, BOX, QQ, PCA]
+#: "Box plot by" the flaw's block: the letters at the end of its item ('3A' -> 'A')
+BLOCK = "Flaw block (A, B, C…)"
+
+
+def _values(data: Data, f: str, group: str, per: str) -> pd.DataFrame:
+    """Field ``f``'s numbers with their row (per flaw for a per-flaw field
+    read per flaw, else once per part)."""
+    flat = rows(data, group)
+    df = flat if (per == PER_ROW and data.fields[f].per_item) else per_part(data, flat)
+    out = df.copy()
+    out["_v"] = [to_number(v) for v in df[f]]
+    return out[out["_v"].notna()]
+
+
+def box_groups(data: Data) -> List[str]:
+    """What a box plot can split a field by: the flaw's block, and the text
+    fields with 2 to 12 different values."""
+    out = [BLOCK] if data.item_field else []
+    for f, info in data.fields.items():
+        if info.kind == TEXT:
+            n = data.frame[f][data.frame[f].str.strip() != ""].nunique()
+            if 2 <= n <= 12:
+                out.append(f)
+    return out
+
+
+def _block(item: str) -> str:
+    m = re.search(r"([A-Za-z]+)\s*$", str(item))
+    return m.group(1).upper() if m else ""
+
+
+def plot_figure(data: Data, kind: str, f: str = "", by: str = "", group: str = "",
+                per: str = PER_ROW):
+    """A histogram (mean and median marked), a box plot of ``f`` by ``by``, a
+    normal Q-Q plot, or how much of the number fields' spread the first
+    principal components explain."""
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(6.5, 4.2), dpi=100)
+    ax = fig.add_subplot(111)
+
+    def say(text):
+        ax.text(0.5, 0.5, text, ha="center", va="center", wrap=True, fontsize=9)
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+    if kind == PCA:
+        return _pca(data, group, per, fig, ax, say)
+    if not f or f not in data.fields:
+        return say("Pick a number field.")
+    v = _values(data, f, group, per)
+    a = v["_v"].to_numpy(float)
+    name = label(f, data.fields[f].unit, 60)
+    if len(a) < 2:
+        return say(f"{name}: fewer than 2 numbers to plot.")
+    if kind == HISTOGRAM:
+        ax.hist(a, bins="auto", color="#3b6ea5", edgecolor="white", alpha=0.9)
+        ax.axvline(a.mean(), color="#c0392b", linestyle="--", linewidth=1,
+                   label=f"mean {a.mean():.4g}")
+        ax.axvline(float(np.median(a)), color="#333333", linestyle=":", linewidth=1,
+                   label=f"median {np.median(a):.4g}")
+        ax.legend(fontsize=7)
+        ax.set_xlabel(name, fontsize=8)
+        ax.set_ylabel("How many", fontsize=8)
+        ax.set_title(f"{len(a)} values", fontsize=9)
+    elif kind == BOX:
+        if by == BLOCK:
+            keys = [_block(i) for i in v.get(data.item_field, pd.Series([""] * len(v)))]
+        elif by and by in v.columns:
+            keys = [str(x).strip() for x in v[by]]
+        else:
+            keys = [""] * len(v)
+        groups: Dict[str, List[float]] = {}
+        for k, x in zip(keys, a):
+            groups.setdefault(k or "(blank)", []).append(x)
+        names = sorted(groups, key=sample_sort_key)
+        ax.boxplot([groups[k] for k in names], showfliers=True)
+        ax.set_xticks(range(1, len(names) + 1))
+        ax.set_xticklabels([f"{k}\n({len(groups[k])})" for k in names], fontsize=7)
+        ax.set_ylabel(name, fontsize=8)
+        ax.set_xlabel(label(by, "", 40) if by and by != BLOCK else (by or ""), fontsize=8)
+    elif kind == QQ:
+        from scipy import stats as st
+        (osm, osr), (slope, icpt, r) = st.probplot(a, dist="norm")
+        ax.scatter(osm, osr, s=12, color="#3b6ea5")
+        ax.plot(osm, slope * np.asarray(osm) + icpt, color="#c0392b", linewidth=1)
+        ax.set_xlabel("Normal quantiles", fontsize=8)
+        ax.set_ylabel(name, fontsize=8)
+        ax.set_title(f"Points on the line mean a normal spread (r = {r:.3f})", fontsize=9)
+    else:
+        return say(f"Unknown plot: {kind}")
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def pca(data: Data, group: str = "", per: str = PER_ROW) -> Optional[pd.DataFrame]:
+    """The share of the number fields' spread each principal component
+    explains (fields filled on 60% of rows, blanks filled by their median,
+    each field scaled), or None when too few fields or rows."""
+    flat = rows(data, group)
+    per_flaw = per == PER_ROW and any(data.fields[f].per_item for f in data.number_fields)
+    df = flat if per_flaw else per_part(data, flat)
+    cols = {}
+    for f in fields_of(data, group):
+        if _kind_in(data, f, group) != NUMBER or data.fields[f].count:
+            continue
+        x = pd.Series([to_number(v) for v in df[f]], dtype=float)
+        if x.notna().sum() >= max(3, 0.6 * len(df)) and x.nunique() > 1:
+            cols[f] = x.fillna(x.median())
+    if len(cols) < 2 or len(df) < 3:
+        return None
+    m = pd.DataFrame(cols).to_numpy(float)
+    m = (m - m.mean(axis=0)) / m.std(axis=0, ddof=1)
+    sv = np.linalg.svd(m, compute_uv=False)
+    share = sv ** 2 / float((sv ** 2).sum())
+    k = min(12, len(share))
+    return pd.DataFrame({"Component": range(1, k + 1), "Explains %": 100 * share[:k],
+                         "Running total %": 100 * np.cumsum(share)[:k]})
+
+
+def _pca(data, group, per, fig, ax, say):
+    res = pca(data, group, per)
+    if res is None:
+        return say("Fewer than 2 number fields filled on most rows: nothing for PCA.")
+    ax.bar(res["Component"], res["Explains %"], color="#3b6ea5", label="each")
+    ax.plot(res["Component"], res["Running total %"], marker="o", color="#c0392b",
+            label="running total")
+    ax.set_ylim(0, 105)
+    ax.set_xlabel("Principal component", fontsize=8)
+    ax.set_ylabel("Spread explained (%)", fontsize=8)
+    ax.set_title("How many independent directions the number fields vary in", fontsize=9)
+    ax.legend(fontsize=7)
     ax.tick_params(labelsize=7)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()

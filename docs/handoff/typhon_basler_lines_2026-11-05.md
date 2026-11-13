@@ -79,3 +79,30 @@ here has run on a real camera yet: `tools/basler_line_test.py` is that step.
   shortest pulse the fallback catches over USB and GigE.
 - A Camera Link CC line is offered for exact runs as before; the watcher
   does not read it.
+
+## pypylon not seeing a CXP camera that pylon Viewer sees (13 November 2026)
+
+Andy's boA9344-30cm on a CXP grabber worked in pylon Viewer; the exported
+Typhon listed no camera. pypylon's Windows wheel has no CXP transport layer
+since 4.0.0: it reaches a CXP camera only through a GenTL producer (*.cti) on
+GENICAM_GENTL64_PATH, which the pylon Software Suite installer sets for the
+machine but an older console or environment never inherits.
+
+- `council_core/pylon_env.py`: `prepare()` (called by
+  `BaslerBackend.sdk()` before pypylon's first import) adds the machine's
+  and user's GENICAM_GENTL64_PATH from the registry, else the folders under
+  Program Files\Basler holding a .cti, to this process's path only
+  (`COUNCIL_NO_GENTL_SEARCH=1` turns it off). `report()` / `words()`: pypylon
+  version, transport layers, devices, the path. `full_lines()`: plus Python
+  and environment, pylon installs, each path entry's .cti files, and each
+  camera opened (sensor, input lines and levels, hardware trigger sources,
+  CxpTrigger notes, what Typhon can watch). `python -m council_core.pylon_env`
+  prints it.
+- `cameras.discover`'s no-Basler note carries `words()`; `frame_camera`
+  prints the camera list, notes, Connect and open failures to the Command
+  Prompt as `[Typhon camera] …` (`COUNCIL_QUIET_CAMERA_CONSOLE=1` silences).
+- The exported app's check.bat prints `full_lines()`; basler_line_test.py
+  prints `words()` when no camera is found.
+- Not verified on real hardware: whether a GenTL producer on the path shows
+  in pypylon as its own transport layer, and what the Suite's CXP .cti is
+  called. Tests: `tests/test_pylon_env.py` (fake pylon, temporary folders).

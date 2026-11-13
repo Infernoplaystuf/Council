@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import openpyxl
+import pandas as pd
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -28,6 +29,7 @@ from sample_ledger import FILLED_MARK, LedgerError, ParentCSV  # noqa: E402
 FOD = "Flaw Attributes: Laser Team FOD (um)"
 LENGTH = "Flaw Attributes: Flaw Length (in)"
 MEDIA = "Concealment 1: Media"
+MEDIA_ALL = "Concealment: Media"      # the runs stacked (2026-11-13)
 JB = FOD + " [JB]"
 
 
@@ -61,7 +63,8 @@ def test_fields_get_their_kind_unit_and_level(csv):
     assert d.fields[FOD].kind == la.NUMBER and d.fields[FOD].per_item
     assert not d.fields["Power (W)"].per_item
     assert d.fields["Date"].kind == la.DATE
-    assert d.fields[MEDIA].kind == la.TEXT
+    assert d.fields[MEDIA_ALL].kind == la.TEXT and MEDIA not in d.fields
+    assert la.load(csv, stack=False).fields[MEDIA].kind == la.TEXT
     assert d.fields[LENGTH].kind == la.EMPTY
     assert d.parts[:3] == ["S-1", "S-2", "S-3"] and len(d.parts) == 20
     assert la.to_number("1,200") == 1200 and la.to_number("12.5 um") == 12.5
@@ -73,7 +76,7 @@ def test_coverage_counts_part_fields_per_part_and_flaw_fields_per_flaw(csv):
     cov = la.coverage(la.load(csv)).set_index("Field")
     assert (cov.loc["Power (W)", "Filled"], cov.loc["Power (W)", "Could hold"]) == (20, 20)
     assert (cov.loc[FOD, "Filled"], cov.loc[FOD, "Could hold"]) == (60, 60)
-    assert cov.loc[MEDIA, "Filled %"] == 50.0
+    assert cov.loc[MEDIA_ALL, "Filled %"] == 50.0
     assert cov.loc[LENGTH, "Filled"] == 0
     missing = la.missing_by_part(la.load(csv))
     # odd parts have no Media, so they are blank on one more field
@@ -88,7 +91,7 @@ def test_summary_counts_a_part_level_field_once_per_part(csv):
     assert s.loc["Power (W)", "Min"] == 301 and s.loc["Power (W)", "Max"] == 320
     assert s.loc[FOD, "Count"] == 60 and s.loc[FOD, "Max"] == 500
     assert s.loc["Date", "Min"] == "2025-01-15" and s.loc["Date", "Max"] == "2025-10-15"
-    assert s.loc[MEDIA, "Most common"] == "ceramic (10)"
+    assert s.loc[MEDIA_ALL, "Most common"] == "ceramic (10)"
     by_part = la.summary(d, per=la.PER_PART).set_index("Field")
     assert by_part.loc[FOD, "Count"] == 20                  # each part's average
 
@@ -186,7 +189,7 @@ def test_a_group_takes_its_parts_and_leaves_out_fields_it_does_not_track(csv):
     assert "Power (W)" not in la.fields_of(d, "Early")
     s = la.summary(d, "Early").set_index("Field")
     assert "Power (W)" not in s.index
-    assert s.loc[MEDIA, "Most common"] == "No (2), Yes (1)"
+    assert s.loc[MEDIA_ALL, "Most common"] == "No (2), Yes (1)"
 
 
 def test_export_writes_the_analysis_workbook_beside_the_ledger(csv):
@@ -260,3 +263,76 @@ def test_analyze_opens_from_the_ledger_tab_and_a_part_opens_its_filled_template(
     dlg.on_part(part)
     assert tab.wait(60)
     assert tab.filled_dialog.part == part
+
+
+def test_how_sure_a_pair_is_goes_by_its_parts_not_its_flaw_rows(tmp_path, app_dir):
+    """Andy's LMM Analysis Studio script (2026-11-13): a part's flaws are not
+    independent, so 2 parts of 30 flaws each are 2 parts, not 60 values."""
+    path = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "few.csv").csv
+    rows = []
+    for p, base in ((1, 10.0), (2, 20.0)):
+        for i, item in enumerate(("1A", "2A", "3A", "1B", "2B", "3B")):
+            rows.append({"Part Number": f"S-{p}", "Flaw #": item, "Power (W)": str(300 + p),
+                         FOD: f"{base + i:.1f}", LENGTH: f"{(base + i) / 100 + 0.001 * i:.4f}",
+                         "source_file": f"b{p}.xlsx"})
+    ParentCSV(path).add_samples(rows)
+    c = la.correlation(la.load(path))
+    assert c.n.loc[FOD, LENGTH] == 12 and c.parts.loc[FOD, LENGTH] == 2
+    # too few parts: left blank, never "sure", however many flaw rows agree
+    assert pd.isna(c.r.loc[FOD, LENGTH]) and not c.sure.loc[FOD, LENGTH]
+    assert c.pairs().empty
+
+
+def test_the_pairs_list_says_how_many_parts_are_behind_each(related):
+    c = la.correlation(la.load(related))
+    pairs = c.pairs().set_index(["Field A", "Field B"])
+    assert "Parts" in pairs.columns
+    row = c.pairs()
+    fl = row[(row["Field A"].isin([FOD, LENGTH])) & (row["Field B"].isin([FOD, LENGTH]))].iloc[0]
+    assert fl["Values"] == 60 and fl["Parts"] == 20
+
+
+def test_a_repeated_table_is_one_field_per_column(tmp_path, app_dir):
+    """Andy's LMM Analysis Studio script (2026-11-13): Concealment 1, 2, 3 are
+    runs of one table; a part's runs are averaged, not run 1 set against run 2."""
+    path = li.create_parent(make_template(tmp_path / "T.xlsx"), tmp_path / "runs.csv").csv
+    rows = []
+    for p in range(1, 7):
+        for item in ("1A", "2A"):
+            rows.append({"Part Number": f"S-{p}", "Flaw #": item, "Power (W)": str(300 + p),
+                         "Concealment 1: Amplitude": str(10 * p),
+                         "Concealment 2: Amplitude": str(10 * p + 2) if p % 2 else "",
+                         "Concealment 1: Media": "steel",
+                         "Concealment 2: Media": "steel" if p % 2 else "",
+                         "source_file": f"b{p}.xlsx"})
+    ParentCSV(path).add_samples(rows)
+    d = la.load(path)
+    amp = "Concealment: Amplitude"
+    assert d.stacked[amp] == ["Concealment 1: Amplitude", "Concealment 2: Amplitude",
+                              "Concealment 3: Amplitude"]
+    assert d.fields[amp].kind == la.NUMBER and not d.fields[amp].per_item
+    assert "Concealment 1: Amplitude" not in d.fields
+    first = la.rows(d)[la.rows(d)["Part Number"] == "S-1"].iloc[0]
+    assert first[amp] == "11" and first["Concealment: Media"] == "steel"
+    assert first["Concealment: runs filled"] == "2"
+    c = la.correlation(d)
+    assert c.r.loc["Power (W)", amp] > 0.99
+    assert not any("Concealment 1" in f for f in c.fields)
+    # unticked: every run its own field again
+    assert "Concealment 1: Amplitude" in la.load(path, stack=False).fields
+
+
+def test_plots_show_a_fields_spread(related):
+    """Andy's LMM Analysis Studio script (2026-11-13): histogram, box plot by
+    group, normal Q-Q and PCA explained variance."""
+    d = la.load(related)
+    assert la.box_groups(d)[0] == la.BLOCK
+    for kind in la.PLOTS:
+        fig = la.plot_figure(d, kind, FOD, la.BLOCK)
+        assert fig.axes and fig.axes[0].has_data(), kind
+    box = la.plot_figure(d, la.BOX, FOD, la.BLOCK).axes[0]
+    assert [t.get_text().split("\n")[0] for t in box.get_xticklabels()] == ["A"]
+    p = la.pca(d)
+    assert p["Running total %"].iloc[-1] == pytest.approx(100.0)
+    # Power and Scan Speed move together exactly: one direction explains them both
+    assert p["Explains %"].iloc[0] > 40
