@@ -26,6 +26,7 @@ note Typhon shows when no Basler camera is found.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -216,8 +217,14 @@ def console(line: str) -> None:
     (never in the way: a closed console is ignored)."""
     if os.environ.get(QUIET_ENV, "").strip() not in ("", "0"):
         return
+    # stderr, not stdout: a program reading the app's printed output is not
+    # disturbed; and plain ASCII, so no console code page (cp1252 turns
+    # "\u00b7" into a byte a UTF-8 reader rejects) can garble or break it.
+    text = f"{PREFIX} {line}".replace("\u00b7", "-").replace("\u2014", "-")
+    text = text.encode("ascii", "replace").decode("ascii")
     try:
-        print(f"{PREFIX} {line}", flush=True)
+        sys.stderr.write(text + "\n")
+        sys.stderr.flush()
     except Exception:                                   # noqa: BLE001
         pass
 

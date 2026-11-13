@@ -137,9 +137,17 @@ def test_the_command_prompt_gets_the_camera_list(capsys, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     import frame_camera
     out = frame_camera.list_cameras()
-    printed = capsys.readouterr().out
+    said = capsys.readouterr()
+    # stderr, not stdout: tests and tools that read the app's printed
+    # output (its last lines, as JSON) must not get these lines in it.
+    assert pe.PREFIX not in said.out
+    printed = said.err
     assert f"{pe.PREFIX} {out['summary']}" in printed
     assert "note:" in printed
+    # Plain ASCII: a cp1252 console turned the row's middle dot into a
+    # byte a UTF-8 reader of the app's output rejected.
+    assert any("\u00b7" in r for r in out["rows"]), "a row has a middle dot"
+    assert printed.isascii()
     monkeypatch.setenv(pe.QUIET_ENV, "1")
     frame_camera.list_cameras()
-    assert pe.PREFIX not in capsys.readouterr().out, "can be silenced"
+    assert pe.PREFIX not in capsys.readouterr().err, "can be silenced"
