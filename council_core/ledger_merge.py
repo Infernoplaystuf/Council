@@ -75,6 +75,7 @@ class Copy:
     sheets: Dict[str, str]    # template sheet -> the copy's sheet it was read from
     named_by_file: bool = False
     label: str = ""           # file name, '[sheet]' after it when a file has several
+    moved: Dict[str, "Placement"] = field(default_factory=dict)  # template sheet -> where it moved
 
 
 @dataclass
@@ -227,12 +228,15 @@ def layout_share(cells: Dict[Tuple[int, int], Any], words: Dict[Tuple[int, int],
 def match_sheets(cells: Dict[str, Dict[Tuple[int, int], Any]],
                  layout: Dict[str, Dict[Tuple[int, int], str]],
                  template_sheets: Sequence[str],
-                 min_share: float = MIN_MATCH) -> Dict[str, str]:
+                 min_share: float = MIN_MATCH,
+                 placements: Optional[Dict[str, "Placement"]] = None) -> Dict[str, str]:
     """Template sheet -> the copy's sheet laid out like it (``min_share`` of
     the template's words in the same cells): the one of the same name when
     it is, else the best laid-out one not taken yet. A template sheet with
     too few words to tell (a blank page) takes the copy's sheet of the same
-    name, or the one in the same place.
+    name, or the one in the same place. ``placements``: when given, a sheet
+    whose rows or columns moved is matched too (``min_share`` of the words
+    found where they moved), and its Placement put in it.
     ``cells``: the copy's sheets (title -> {(row, col): value}), in order."""
     from council_core.ledger_examples import LAYOUT_MIN_WORDS
     names = list(cells)
@@ -253,11 +257,125 @@ def match_sheets(cells: Dict[str, Dict[Tuple[int, int], Any]],
         best = max(shares, key=shares.get, default=None)
         if best is not None and shares[best] >= min_share:
             out[t] = best
+            continue
+        if placements is None:
+            continue
+        # no sheet in place: one whose rows / columns moved (same name first)
+        tried = {n: place(cells[n], words) for n in free}
+        best = max(tried, key=lambda n: (tried[n].share, n == t), default=None)
+        if best is not None and tried[best].share >= min_share and tried[best].moved:
+            out[t] = best
+            placements[t] = tried[best]
     return out
 
 
 def best_share(cells: Dict[str, Dict[Tuple[int, int], Any]], words) -> float:
-    return max((layout_share(c, words) for c in cells.values()), default=0.0)
+    return max((max(layout_share(c, words), place(c, words).share)
+                for c in cells.values()), default=0.0)
+
+
+# ── a copy whose rows or columns moved ──────────────────────────────────
+# Andy, 2026-11-13 (from his LMM Analysis Studio script): a copy with rows
+# inserted or deleted, or a table moved down, is still a copy - read each
+# value at the place its labels moved to. Still no model and no guessing:
+# the template's rows and columns are lined up with the copy's by the labels
+# they hold, in order, and a value is read where its row and column went.
+@dataclass
+class Placement:
+    """Where a template sheet's rows and columns are in a copy's sheet."""
+    rows: Dict[int, int]            # template row -> the copy's row (anchors)
+    cols: Dict[int, int]            # template column -> the copy's column (anchors)
+    share: float = 0.0              # the template's labels found where they moved
+
+    @staticmethod
+    def _go(anchors: Dict[int, int], n: int) -> int:
+        """n moved as the nearest anchor at or before it moved (the label
+        above a value, or to its left); before every anchor, as the first."""
+        if not anchors or n in anchors:
+            return anchors.get(n, n)
+        keys = sorted(anchors)
+        before = [k for k in keys if k <= n]
+        k = before[-1] if before else keys[0]
+        return n + anchors[k] - k
+
+    def cell(self, row: int, col: int) -> Tuple[int, int]:
+        return self._go(self.rows, row), self._go(self.cols, col)
+
+    def a1(self, address: str) -> str:
+        from openpyxl.utils.cell import (column_index_from_string, coordinate_from_string,
+                                         get_column_letter)
+        col, row = coordinate_from_string(address)
+        r, c = self.cell(row, column_index_from_string(col))
+        return f"{get_column_letter(c)}{r}"
+
+    @property
+    def moved(self) -> bool:
+        return any(k != v for k, v in self.rows.items()) or any(
+            k != v for k, v in self.cols.items())
+
+    def describe(self) -> str:
+        """'rows from 5 on are 2 lower; columns from D on are 1 to the right'."""
+        from openpyxl.utils import get_column_letter
+        out = []
+        for what, anchors, name in (("rows", self.rows, str),
+                                    ("columns", self.cols, get_column_letter)):
+            last = 0
+            for k in sorted(anchors):
+                d = anchors[k] - k
+                if d != last:
+                    side = (("lower" if d > 0 else "higher") if what == "rows"
+                            else ("to the right" if d > 0 else "to the left"))
+                    out.append(f"{what} from {name(k)} on are {abs(d)} {side}"
+                               if d else f"{what} from {name(k)} on are back in place")
+                    last = d
+        return "; ".join(out) or "in place"
+
+
+def _line_up(template: Dict[int, frozenset], copy: Dict[int, frozenset]) -> Dict[int, int]:
+    """Template rows (or columns) paired with the copy's by the labels they
+    hold, kept in order (a diff of the two lists): equal ones, and in a run
+    of changed ones those sharing most of their labels."""
+    from difflib import SequenceMatcher
+    t_keys, c_keys = sorted(template), sorted(copy)
+    t_sig = [template[k] for k in t_keys]
+    c_sig = [copy[k] for k in c_keys]
+    sm = SequenceMatcher(None, t_sig, c_sig, autojunk=False)
+    pairs: Dict[int, int] = {}
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                pairs[t_keys[i]] = c_keys[j]
+        elif op == "replace":
+            j = j1
+            for i in range(i1, i2):
+                for jj in range(j, j2):
+                    a, b = t_sig[i], c_sig[jj]
+                    if len(a & b) * 2 >= max(len(a), len(b)):
+                        pairs[t_keys[i]] = c_keys[jj]
+                        j = jj + 1
+                        break
+    return pairs
+
+
+def place(cells: Dict[Tuple[int, int], Any], words: Dict[Tuple[int, int], str]
+          ) -> Placement:
+    """How the template sheet (its ``words``) lines up with a copy's sheet,
+    and the share of its labels found once rows and columns are moved."""
+    from council_core.ledger_examples import _norm
+    vocab = set(words.values())
+    seen = {rc: _norm(v) for rc, v in cells.items() if isinstance(v, str)}
+    seen = {rc: w for rc, w in seen.items() if w in vocab}
+
+    def by(axis: int, src) -> Dict[int, frozenset]:
+        out: Dict[int, set] = {}
+        for rc, w in src.items():
+            out.setdefault(rc[axis], set()).add(w)
+        return {k: frozenset(v) for k, v in out.items()}
+    p = Placement(_line_up(by(0, words), by(0, seen)), _line_up(by(1, words), by(1, seen)))
+    if words:
+        p.share = sum(1 for (r, c), w in words.items()
+                      if seen.get(p.cell(r, c)) == w) / len(words)
+    return p
 
 
 def _entered(schema: TemplateSchema, rows: List[Dict[str, str]]) -> int:
@@ -274,10 +392,16 @@ def _entered(schema: TemplateSchema, rows: List[Dict[str, str]]) -> int:
     return n
 
 
-def _rows_from(schema: TemplateSchema, ws_of: Dict[str, Any]) -> List[Dict[str, str]]:
+def _rows_from(schema: TemplateSchema, ws_of: Dict[str, Any],
+               placed: Optional[Dict[str, Placement]] = None) -> List[Dict[str, str]]:
+    placed = placed or {}
+
     def get(f, item: str) -> str:
         ws = ws_of.get(f.sheet)
-        return _text(ws[f.cells[item]].value) if ws is not None else ""
+        if ws is None:
+            return ""
+        p = placed.get(f.sheet)
+        return _text(ws[p.a1(f.cells[item]) if p else f.cells[item]].value)
     part = {f.name: get(f, "") for f in schema.fields if not f.per_item}
     if not schema.item_field:
         return [part]
@@ -309,7 +433,8 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
             return [], [Problem(name, "a merged workbook the Council made, not a copy")]
         tsheets = list(dict.fromkeys(f.sheet for f in schema.fields))
         cells = {ws.title: _cells(ws) for ws in wb.worksheets}
-        found = match_sheets(cells, layout, tsheets, min_share)
+        placed: Dict[str, Placement] = {}
+        found = match_sheets(cells, layout, tsheets, min_share, placed)
         id_sheet = schema.field(schema.id_field).sheet
         if id_sheet not in found:
             words = layout.get(id_sheet, {})
@@ -320,22 +445,24 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
                                       f"(needs {min_share:.0%}); read it with Extract "
                                       "instead. Template labels not in place: "
                                       + ", ".join(f"'{w}'" for w in gone) + more)]
-        sets = [found]
+        sets = [(found, placed)]
         if len(tsheets) == 1:                # more sheets laid out like the template
             rest = [t for t in cells if t != found[id_sheet]]
             while rest:
+                more_placed: Dict[str, Placement] = {}
                 more = match_sheets({t: cells[t] for t in rest}, layout, tsheets,
-                                    min_share)
+                                    min_share, more_placed)
                 if id_sheet not in more:
                     break
-                sets.append(more)
+                sets.append((more, more_placed))
                 rest.remove(more[id_sheet])
-        read = [(m, _rows_from(schema, {t: wb[s] for t, s in m.items()})) for m in sets]
+        read = [(m, pl, _rows_from(schema, {t: wb[s] for t, s in m.items()}, pl))
+                for m, pl in sets]
     finally:
         wb.close()
     copies, notes = [], []
     several = len(read) > 1
-    for m, rows in read:
+    for m, pl, rows in read:
         label = f"{name} [{m[id_sheet]}]" if several else name
         pid = xl_text(rows[0].get(schema.id_field, "")).strip()
         if not pid and not _entered(schema, rows):
@@ -348,7 +475,12 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
             pid, named = (path.stem if not several else f"{path.stem} {m[id_sheet]}"), True
             for r in rows:
                 r[schema.id_field] = pid
-        copies.append(Copy(path, pid, rows, m, named, label))
+        copies.append(Copy(path, pid, rows, m, named, label, moved=dict(pl)))
+        for t, p in pl.items():
+            notes.append(Problem(label, f"read with its layout moved{' on ' + t if len(tsheets) > 1 else ''}"
+                                        f" ({p.describe()}): {p.share:.0%} of the template's "
+                                        "labels found where they moved. Check its values.",
+                                 part=pid))
         missing = [t for t in tsheets if t not in m]
         if missing:
             notes.append(Problem(label, f"sheet(s) {', '.join(missing)} not found laid out "

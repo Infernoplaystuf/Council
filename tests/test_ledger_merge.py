@@ -521,3 +521,62 @@ def test_a_skipped_file_says_which_labels_are_missing(books):
     why = {p.file: p.reason for p in res.left_out}["half.xlsx"]
     gone = list(dict.fromkeys(list(words.values())[len(words) // 2:]))
     assert f"'{gone[0]}'" in why and "more)" in why
+
+
+# ── a copy whose rows or columns moved (Andy, 2026-11-13, from his LMM
+# Analysis Studio script: a copy with inserted rows must still merge) ───────
+def _moved_copy(template: Path, out: Path, part: str, rows_at=(), cols_at=()) -> Path:
+    """A filled copy (Power 333, FOD 50+i per flaw), then rows / columns
+    inserted where the copy's author added them."""
+    fill(template, out, {"Part Number": part, "Power (W)": 333},
+         {FOD: {it: 50 + i for i, it in enumerate(ITEMS)}})
+    wb = openpyxl.load_workbook(out)
+    ws = wb.worksheets[0]
+    for r in sorted(rows_at, reverse=True):
+        ws.insert_rows(r, 1)
+    for c in sorted(cols_at, reverse=True):
+        ws.insert_cols(c, 1)
+    wb.save(out)
+    return out
+
+
+def test_a_copy_with_rows_inserted_is_read_where_its_labels_moved(books):
+    template, folder = books
+    _moved_copy(template, folder / "rows added.xlsx", "S-30", rows_at=(4, 4))
+    assert lm.label_layout(template, read_template(template))   # sanity
+    res = lm.merge(template, folder)
+    got = {c.part: c for c in res.copies}
+    assert "S-30" in got and got["S-30"].moved
+    rows = [r for r in ParentCSV(res.csv).rows if r["Part Number"] == "S-30"]
+    assert rows[0]["Power (W)"] == "333"
+    assert [r[FOD] for r in rows] == [str(50 + i) for i in range(len(ITEMS))]
+    note = {p.file: p.reason for p in res.left_out}["rows added.xlsx"]
+    assert note.startswith("read with its layout moved (rows from 5 on are 2 lower)")
+    assert "Check its values" in note
+
+
+def test_a_row_inside_a_table_and_a_column_before_it_are_followed(books):
+    template, folder = books
+    schema = read_template(template)
+    fod_row = openpyxl.utils.cell.coordinate_from_string(
+        schema.field(FOD).cells[ITEMS[0]])[1]
+    # a row added inside the first flaw table and a column added before column C
+    _moved_copy(template, folder / "inside.xlsx", "S-31", rows_at=(fod_row + 1,),
+                cols_at=(3,))
+    res = lm.merge(template, folder)
+    assert "S-31" in {c.part for c in res.copies}
+    rows = [r for r in ParentCSV(res.csv).rows if r["Part Number"] == "S-31"]
+    assert [r[FOD] for r in rows] == [str(50 + i) for i in range(len(ITEMS))]
+    assert rows[0]["Power (W)"] == "333"
+
+
+def test_a_workbook_that_is_not_a_copy_is_still_skipped(books):
+    template, folder = books
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r in range(1, 30):
+        ws.cell(r, 1, f"Unrelated label {r}")
+        ws.cell(r, 2, r * 3)
+    wb.save(folder / "other.xlsx")
+    res = lm.merge(template, folder)
+    assert {p.file: p.reason for p in res.left_out}["other.xlsx"].startswith("skipped:")
