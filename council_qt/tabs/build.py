@@ -23,6 +23,11 @@ time, with Undo turn, the grouped review and Merge.
                    widgets.build_agent); Review and merge brings it here.
     Snapshot to vault   a copy of the open file in the vault (the Librarian),
                    reported in the Council transcript.
+    New physics model…  a physics model folder (council_core.physics_project):
+                   one of the worked examples, or a goal the Physics modeller
+                   plans in Agent mode. A model folder gets a "Model" page
+                   beside "Code" (council_qt.widgets.physics_panel): inputs,
+                   Run model, results, charts, connected data, Calibrate.
 
 It replaced the Code and IDE tabs (retired 2026-10-30).
 
@@ -79,10 +84,12 @@ from council_core import build_chat as bc
 from council_core import build_files as bf
 from council_core import code_highlight as ch
 from council_core import ide_trust, paths
+from council_core import physics_project as pp
 
 from ..view import ViewHelpers, amp
 from ..widgets.build_chat import ChatPanel
 from ..widgets.code_editor import CodeEditor, FindBar, mono_font
+from ..widgets.physics_panel import ModelPanel, PhysicsActions
 
 #: How many output lines the Run pane keeps (as the IDE tab's).
 MAX_OUTPUT_LINES = 5_000
@@ -108,7 +115,8 @@ class BuildActions:
                  review: Optional[Callable[[str], tuple]] = None,
                  show_preview: Optional[Callable[[str, str], None]] = None,
                  agent=None, models_source: Optional[Callable] = None,
-                 snapshot: Optional[Callable[[str], object]] = None):
+                 snapshot: Optional[Callable[[str], object]] = None,
+                 physics: Optional[PhysicsActions] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         app = paths.app_dir()
         self.state_file = Path(state_file) if state_file else app / "build_tab.json"
@@ -123,6 +131,8 @@ class BuildActions:
         self.agent = agent or ba.Agent(self.vault_dir)
         self.models_source = models_source
         self.snapshot = snapshot or self._snapshot
+        # the Model page and "New physics model…" (council_qt.widgets.physics_panel)
+        self.physics = physics or PhysicsActions()
 
     # -- the defaults ------------------------------------------------------
     @staticmethod
@@ -350,6 +360,11 @@ class BuildTab(ViewHelpers, QWidget):
         self.snapshot_btn = self._button(row, "Snapshot to vault", self.on_snapshot)
         self.snapshot_btn.setToolTip("A copy of the open file in the vault, where "
                                      "the Council's search finds it.")
+        self.physics_btn = self._button(row, "New physics model…", self.on_new_physics)
+        self.physics_btn.setToolTip(
+            "A physics model from a goal or a worked example (PVC pipe organ, radio "
+            "antenna, eddy currents, water erosion), built from Council's tested physics "
+            "blocks and informed by data you connect: a folder, a Ledger or Connections.")
         row.addStretch(1)
         outer.addLayout(row)
 
@@ -388,7 +403,14 @@ class BuildTab(ViewHelpers, QWidget):
         self.find_bar = FindBar()
         self.find_bar.hide()
         col.addWidget(self.find_bar)
-        right.addWidget(editors)
+        # "Code" and, for a physics model folder, "Model"
+        self.workspace = QTabWidget()
+        self.workspace.setDocumentMode(True)
+        self.workspace.addTab(editors, "Code")
+        self.model_panel = ModelPanel(self, self.actions.physics)
+        self.workspace.addTab(self.model_panel, "Model")
+        self.workspace.setTabVisible(1, False)
+        right.addWidget(self.workspace)
 
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
@@ -441,6 +463,51 @@ class BuildTab(ViewHelpers, QWidget):
         self._turns = []
         self._show_session()
         self._remember()
+        self._show_model()
+
+    # -- physics models (council_core.physics_project) ---------------------------
+    def _show_model(self) -> None:
+        """The Model page for a physics model folder, hidden for any other."""
+        is_model = self.model_panel.set_folder(self.root)
+        self.workspace.setTabVisible(1, is_model)
+        if not is_model:
+            self.workspace.setCurrentIndex(0)
+
+    def on_new_physics(self) -> None:
+        """A new physics model: an example (ready to run) or a goal (the
+        Physics modeller plans it in Agent mode; nothing is built before Go)."""
+        if not self._leave_session_check():
+            return
+        got = self.actions.physics.ask_new(self.actions.vault_dir, self)
+        if not got:
+            return
+        try:
+            dest = pp.create(got["dest"], example=got.get("example", ""),
+                             goal=got.get("goal", ""), title=got.get("title", ""))
+        except (pp.PhysicsError, OSError) as exc:
+            self.say(str(exc))
+            return
+        self.open_folder(dest)
+        self.workspace.setCurrentIndex(1)
+        if got.get("example"):
+            self.say(f"Made {dest.name} from the {pp.EXAMPLES[got['example']][0]} example: "
+                     "set the inputs and Run model. Its tests run with Test.")
+            return
+        self.say(f"Made {dest.name}. The Physics modeller is planning it: approve the plan "
+                 "in the chat to build it.")
+        self.plan_physics(got["goal"])
+
+    def plan_physics(self, goal: str) -> None:
+        """Agent mode, the Physics modeller, the goal as the request."""
+        panel = self.chat_panel
+        panel.set_mode("agent")
+        panel.agent_mode.fill_profiles()
+        idx = panel.profile_box.findText("Physics modeller")
+        if idx >= 0:
+            panel.profile_box.setCurrentIndex(idx)
+        request = pp.goal_request(goal, pp.links(self.root) if self.root else [])
+        panel.input.setPlainText(request)
+        panel.send()
 
     def _show_session(self) -> None:
         s = self.session
@@ -1221,6 +1288,9 @@ class BuildTab(ViewHelpers, QWidget):
         """A job was merged into the folder: show the files as they are now."""
         self._reload_docs()
         self.refresh_tree()
+        self._show_model()
+        if self.model_panel.folder is not None:
+            self.model_panel.reload()
 
     def _reload_docs(self) -> None:
         """Every open file read again from disk (after a revert), and a tab

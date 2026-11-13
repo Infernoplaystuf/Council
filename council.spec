@@ -159,6 +159,12 @@ datas = [
     # The example Qt apps gui_reference reads as TEXT into a coding agent's
     # prompt (the Code tab's "Qt app builder"); never imported by the app.
     ("examples/qt_apps",          "examples/qt_apps"),
+    # Physics models (council_core.physics_project): the worked examples are
+    # copied into a new model folder, and physics_kit is copied in beside the
+    # model, because the model runs with the user's own Python (the Build
+    # tab's sandbox), so both must be files on disk.
+    ("examples/physics_models",   "examples/physics_models"),
+    ("physics_kit",               "physics_kit"),
     # The Build tab's sandbox hook: a sitecustomize put on the PYTHONPATH of
     # the user's own Python when the Build tab runs code (council_core.
     # build_sandbox), so it must be .py files on disk, not frozen modules.

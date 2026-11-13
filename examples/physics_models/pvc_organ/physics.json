@@ -1,0 +1,12 @@
+{
+  "goal": "",
+  "example": "pvc_organ",
+  "data": [
+    {
+      "kind": "folder",
+      "target": "sample_data",
+      "name": "Sample measured pipes",
+      "question": ""
+    }
+  ]
+}

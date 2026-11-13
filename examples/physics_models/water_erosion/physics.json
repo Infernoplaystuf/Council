@@ -1,0 +1,12 @@
+{
+  "goal": "",
+  "example": "water_erosion",
+  "data": [
+    {
+      "kind": "folder",
+      "target": "sample_data",
+      "name": "Sample erosion tests",
+      "question": ""
+    }
+  ]
+}
