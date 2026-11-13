@@ -393,12 +393,20 @@ def _write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-#: Finds a Python that RUNS, not one that is merely named: a PYTHON setting
+#: The Python of an activated venv or conda env first, then PYTHON, then
+#: python on PATH, then the py launcher. Finds a Python that RUNS, not one
+#: that is merely named: a PYTHON setting
 #: may name the Python folder rather than python.exe (seen on a lab PC:
 #: "...\\Python313 is not recognized as an internal or external command"),
 #: and "python" on PATH may be the Microsoft Store stub. Each candidate is
 #: tried with -c before it is used.
 _FIND_PYTHON = [
+    # An activated environment wins: started from inside a venv or a conda
+    # env, the app runs in that env's Python (Andy, 13 November).
+    "if defined VIRTUAL_ENV if exist \"%VIRTUAL_ENV%\\Scripts\\python.exe\" "
+    "set \"PYTHON=%VIRTUAL_ENV%\\Scripts\\python.exe\" && goto have_python",
+    "if defined CONDA_PREFIX if exist \"%CONDA_PREFIX%\\python.exe\" "
+    "set \"PYTHON=%CONDA_PREFIX%\\python.exe\" && goto have_python",
     "if not defined PYTHON goto find_python",
     "if exist \"%PYTHON%\\python.exe\" set \"PYTHON=%PYTHON%\\python.exe\"",
     "\"%PYTHON%\" -c \"import sys\" >nul 2>nul && goto have_python",
@@ -416,6 +424,19 @@ _FIND_PYTHON = [
     "pause",
     "exit /b 9009",
     ":have_python",
+]
+
+
+#: The same order for run.sh / check.sh.
+_FIND_PYTHON_SH = [
+    "if [ -n \"$VIRTUAL_ENV\" ] && [ -x \"$VIRTUAL_ENV/bin/python\" ]; then",
+    "  PYTHON=\"$VIRTUAL_ENV/bin/python\"",
+    "elif [ -n \"$CONDA_PREFIX\" ] && [ -x \"$CONDA_PREFIX/bin/python\" ]; then",
+    "  PYTHON=\"$CONDA_PREFIX/bin/python\"",
+    "elif [ -n \"$PYTHON\" ] && [ -d \"$PYTHON\" ]; then",
+    "  PYTHON=\"$PYTHON/bin/python3\"",
+    "fi",
+    "PYTHON=\"${PYTHON:-python3}\"",
 ]
 
 
@@ -474,8 +495,9 @@ def _sh(name: str) -> str:
         "export TYPHON_PLUGIN_HOME=\"$HERE/data/plugin_home\"",
         "export FRAME_CLASSES_STORE=\"$HERE/data/classifiers\"",
         "export COUNCIL_SKIP_PATH_MIGRATION=1",
+        *_FIND_PYTHON_SH,
         "cd \"$HERE\"",
-        "exec \"${PYTHON:-python3}\" \"$HERE/main.py\" \"$@\"", ""])
+        "exec \"$PYTHON\" \"$HERE/main.py\" \"$@\"", ""])
 
 
 def _check_sh() -> str:
@@ -484,7 +506,8 @@ def _check_sh() -> str:
         "# Checks this machine can run the app (changes nothing).",
         "HERE=\"$(cd \"$(dirname \"$0\")\" && pwd)\"",
         "cd \"$HERE\"",
-        f"exec \"${{PYTHON:-python3}}\" \"$HERE/{CHECK_SCRIPT}\" \"$@\"", ""])
+        *_FIND_PYTHON_SH,
+        f"exec \"$PYTHON\" \"$HERE/{CHECK_SCRIPT}\" \"$@\"", ""])
 
 
 def _requirements(required: Sequence[str], optional: Sequence[str]) -> str:
@@ -634,9 +657,12 @@ RUN IT
 
 SET UP A NEW MACHINE
   1. Python 3.11 or newer (python.org). On Windows tick "Add python.exe to
-     PATH" in the installer. run.bat uses, in order: PYTHON if it is set,
-     python on PATH, then the py launcher. To use one Python in
-     particular, open a Command Prompt here and
+     PATH" in the installer. run.bat uses, in order: the Python of the
+     environment you started it from (an activated venv or conda env),
+     PYTHON if it is set, python on PATH, then the py launcher. To use
+     an environment, activate it and start run.bat from that same
+     window. To use one Python in particular, open a Command Prompt here
+     and
          set PYTHON=C:\\Python311\\python.exe
          run.bat
   2. The packages, with the same Python:

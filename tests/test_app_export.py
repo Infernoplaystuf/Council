@@ -263,3 +263,31 @@ def test_check_bat_copes_with_a_python_setting_that_is_a_folder(
     assert "is not recognized" not in out, out[-2000:]
     assert "All set" in out, out[-2000:]
     assert done.returncode == 0, out[-2000:]
+
+
+def test_an_activated_environment_s_python_is_used(exported, tmp_path):
+    """Started from inside an activated venv (or conda env), run.bat /
+    check.bat (run.sh / check.sh) use THAT environment's Python, whatever
+    PYTHON or PATH say (Andy, 13 November 2026)."""
+    import subprocess
+    venv = tmp_path / "env"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip",
+                    "--system-site-packages", str(venv)], check=True,
+                   timeout=120)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("COUNCIL_", "TYPHON_", "FRAME_CLASSES",
+                                "CONDA_"))}
+    env["VIRTUAL_ENV"] = str(venv)
+    env["PYTHON"] = str(tmp_path / "no_such_python")
+    if sys.platform == "win32":
+        argv = ["cmd", "/c", str(exported.folder / "check.bat")]
+        want = venv / "Scripts" / "python.exe"
+    else:
+        argv = ["sh", str(exported.folder / "check.sh")]
+        want = venv / "bin" / "python"
+    done = subprocess.run(argv, cwd=str(exported.folder), env=env,
+                          input="\r\n", capture_output=True, text=True,
+                          timeout=300)
+    out = done.stdout + done.stderr
+    assert f"at {want}" in out, out[-2000:]
+    assert done.returncode == 0 and "All set" in out, out[-2000:]
