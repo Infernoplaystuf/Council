@@ -290,6 +290,10 @@ class AnalyticsDialog(QDialog):
         pl.addLayout(self.plot_box, 1)
         self.plot_canvas = None
         self.tabs.addTab(plots, "Plots")
+        # Equations: fitted, tested on unseen parts, predicted, graphed
+        from .ledger_equations_page import EquationsPage
+        self.equations = EquationsPage(self)
+        self.tabs.addTab(self.equations, "Equations")
         # Outliers
         self.outlier_table = _table()
         self.outlier_table.cellDoubleClicked.connect(
@@ -375,6 +379,8 @@ class AnalyticsDialog(QDialog):
         self.refresh_data()
         self.refresh_check()
         self.refresh_plot()
+        if hasattr(self, "equations"):
+            self.equations.reload()
         self.refresh_trend()
         self.refresh_correlation()
 
