@@ -331,6 +331,7 @@ def probe_lines(sdk: Any = None) -> List[str]:
                                  "Triggered runs from a cable cannot work")
             except Exception as exc:                    # noqa: BLE001
                 lines.append(f"  trigger sources unreadable: {exc}")
+            lines.extend(exposure_lines(getattr(device, "_cam", None)))
             try:
                 watch = tuple(device.trigger_inputs())
                 lines.append("  Typhon can watch (snapshot/record): "
@@ -341,6 +342,84 @@ def probe_lines(sdk: Any = None) -> List[str]:
         finally:
             try:
                 device.close()
+            except Exception:                           # noqa: BLE001
+                pass
+    return lines
+
+
+def _node(cam: Any, name: str) -> Any:
+    node = getattr(cam, name, None)
+    if node is None:
+        return None
+    try:
+        readable = getattr(node, "IsReadable", None)
+        if callable(readable) and not readable():
+            return None
+    except Exception:                                   # noqa: BLE001
+        return None
+    return node
+
+
+def _symbols(node: Any) -> List[str]:
+    try:
+        return [str(s) for s in (node.Symbolics or ())]
+    except Exception:                                   # noqa: BLE001
+        return []
+
+
+def exposure_lines(cam: Any) -> List[str]:
+    """What this camera itself says about exposure and triggering, for a
+    long exposure (NIR) built from a trigger (Andy, 13 November): the
+    exposure modes it offers (TriggerWidth is "exposure as long as the
+    trigger is high"), its exposure time range, the trigger selectors, its
+    shutter mode, and whether exposure overlaps readout. Read from the
+    camera, so it is this model and firmware's answer, whatever the
+    documentation says. Never raises; missing nodes are said."""
+    if cam is None:
+        return []
+    lines: List[str] = []
+    mode = _node(cam, "ExposureMode")
+    modes = _symbols(mode) if mode is not None else []
+    lines.append("  exposure modes: " + (", ".join(modes) or
+                                         "not offered (Timed only)"))
+    if modes and "TriggerWidth" not in modes:
+        lines.append("  no TriggerWidth: the exposure cannot follow the "
+                     "trigger's length; a long exposure has to be built "
+                     "from several frames (summed)")
+    for name in ("ExposureTime", "ExposureTimeAbs"):
+        node = _node(cam, name)
+        if node is None:
+            continue
+        try:
+            lines.append(f"  exposure time: {float(node.Min):g} to "
+                         f"{float(node.Max):g} us (now "
+                         f"{float(node.Value):g} us)")
+        except Exception as exc:                        # noqa: BLE001
+            lines.append(f"  exposure time unreadable: {exc}")
+        break
+    else:
+        lines.append("  exposure time: no ExposureTime node")
+    for label, name in (("trigger selectors", "TriggerSelector"),
+                        ("sensor shutter modes", "SensorShutterMode"),
+                        ("pixel formats", "PixelFormat")):
+        node = _node(cam, name)
+        if node is not None:
+            found = _symbols(node)
+            if found:
+                lines.append(f"  {label}: {', '.join(found)}")
+    node = _node(cam, "ExposureOverlapTimeMax")
+    if node is not None:
+        try:
+            lines.append(f"  exposure overlaps readout: up to "
+                         f"{float(node.Value):g} us (ExposureOverlapTimeMax)")
+        except Exception:                               # noqa: BLE001
+            pass
+    for name in ("SensorName", "DeviceSensorName"):
+        node = _node(cam, name)
+        if node is not None:
+            try:
+                lines.append(f"  sensor: {node.Value}")
+                break
             except Exception:                           # noqa: BLE001
                 pass
     return lines

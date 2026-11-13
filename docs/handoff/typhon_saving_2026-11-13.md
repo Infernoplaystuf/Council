@@ -56,3 +56,16 @@ images") and said to start on the code items.
 3. Mono12p kept packed in raw runs.
 4. Proposal only: a long NIR exposure from the trigger (sum, max, mean of the
    frames while the line is active); questions to Andy in the doc.
+
+## The NIR long exposure: what the camera says (13 November, later)
+
+Basler's online pages for the boA9344-30cm (draft, "not in series production
+yet") could not be read here: their model tables render in the browser. So
+`check.bat` now asks the camera itself (`pylon_env.exposure_lines`, in the
+"Basler / pylon in detail" part): its ExposureMode entries (is TriggerWidth
+there?), the ExposureTime range, TriggerSelector entries, SensorShutterMode,
+PixelFormat entries, ExposureOverlapTimeMax and the sensor name. Checked on
+pypylon's emulator (Timed, TriggerWidth, TriggerControlled; 1 us to 10 s).
+The long-exposure design (sum / max / mean of the frames while the trigger
+line is active) works whatever it says; the answer only decides whether a
+single trigger-width exposure is an alternative.
