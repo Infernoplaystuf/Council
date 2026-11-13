@@ -22,7 +22,9 @@ from typing import Callable, Optional
 
 import pandas as pd
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton,
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit,
+                               QPushButton,
                                QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
                                QVBoxLayout, QWidget)
 
@@ -31,16 +33,24 @@ from sample_ledger import LedgerError
 
 ALL = "All parts"
 PART_ORDER = "Part order"
+ANY = "Any status"
+#: rows a grid shows at most (the export and the workbook hold them all)
+SHOW_ROWS = 2000
 
 
-def fill_table(table: QTableWidget, df: pd.DataFrame) -> None:
-    """``df`` into ``table``, read only; numbers sort as numbers."""
+def fill_table(table: QTableWidget, df: pd.DataFrame, grey_blanks: bool = False,
+               shade: Optional[Callable[[pd.Series], Optional[str]]] = None) -> None:
+    """``df`` into ``table``, read only; numbers sort as numbers.
+    ``grey_blanks``: an empty cell greyed. ``shade(row)``: a colour for the
+    whole row, or None."""
     table.setSortingEnabled(False)
     table.clear()
     table.setColumnCount(len(df.columns))
     table.setRowCount(len(df))
     table.setHorizontalHeaderLabels([str(c) for c in df.columns])
+    grey = QColor("#e4e4e4")
     for r, row in enumerate(df.itertuples(index=False)):
+        colour = shade(df.iloc[r]) if shade else None
         for c, v in enumerate(row):
             it = QTableWidgetItem()
             if isinstance(v, (int, float)) and not isinstance(v, bool):
@@ -49,6 +59,10 @@ def fill_table(table: QTableWidget, df: pd.DataFrame) -> None:
                 it.setText("" if v is None else (v.isoformat() if hasattr(v, "isoformat")
                                                  else str(v)))
             it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+            if colour:
+                it.setBackground(QColor(colour))
+            elif grey_blanks and (v is None or str(v).strip() == ""):
+                it.setBackground(grey)
             table.setItem(r, c, it)
     table.resizeColumnsToContents()
     table.setSortingEnabled(True)
@@ -104,6 +118,15 @@ class AnalyticsDialog(QDialog):
             "Per part takes a per-flaw field's average over the part's flaws, as the "
             "template's AVERAGE columns do. A part-level field counts once per part either way.")
         bar.addWidget(self.per_choice)
+        self.stack_box = QCheckBox("Repeated tables as one field")
+        self.stack_box.setChecked(bool(self.data.stacked))
+        self.stack_box.setEnabled(bool(self.data.stacked) or self._has_runs())
+        self.stack_box.setToolTip(
+            "A table filled in once per run (Concealment 1, 2, 3 …) analysed as one field per "
+            "column: a part's runs averaged (a number) or its one value (a text), plus how "
+            "many runs it filled. Untick to see every run as its own field.")
+        self.stack_box.toggled.connect(self.on_stack)
+        bar.addWidget(self.stack_box)
         bar.addStretch(1)
         self.export_btn = QPushButton("Export…")
         self.export_btn.setToolTip(
@@ -124,7 +147,60 @@ class AnalyticsDialog(QDialog):
         page.addWidget(self._titled("What is filled, per field", self.coverage_table))
         page.addWidget(self._titled("Parts with the most fields left blank",
                                     self.missing_table))
+        self.left_out_table = _table()
+        page.addWidget(self._titled("Fields in the correlation, and why the others are not",
+                                    self.left_out_table))
         self.tabs.addTab(page, "Coverage")
+        # Data: every row, searchable, blanks grey (the script's Verify Data)
+        data_page = QWidget()
+        dl = QVBoxLayout(data_page)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Find:"))
+        self.data_find = QLineEdit()
+        self.data_find.setPlaceholderText("rows with this text in any column (a part, a value…)")
+        row.addWidget(self.data_find, 1)
+        dl.addLayout(row)
+        self.data_note = QLabel()
+        dl.addWidget(self.data_note)
+        self.data_table = _table()
+        self.data_table.cellDoubleClicked.connect(
+            lambda r, _c: self._open_part(self.data_table, r))
+        dl.addWidget(self.data_table, 1)
+        self.tabs.addTab(data_page, "Data")
+        # Check: what a merge read from each copy, cell by cell
+        check_page = QWidget()
+        kl = QVBoxLayout(check_page)
+        self.check_note = QLabel()
+        self.check_note.setWordWrap(True)
+        kl.addWidget(self.check_note)
+        split = QSplitter(Qt.Vertical)
+        self.check_files = _table()
+        self.check_files.currentCellChanged.connect(
+            lambda r, _c, _r0, _c0: self.refresh_check_cells())
+        split.addWidget(self._titled(
+            "Each copy: its values read in place, read where its layout moved, or blank. "
+            "Click one to see its values.", self.check_files))
+        cells = QWidget()
+        cv = QVBoxLayout(cells)
+        cv.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Show:"))
+        self.check_status = QComboBox()
+        from council_core import ledger_merge as lm
+        self.check_status.addItems([ANY, lm.MOVED, lm.BLANK, lm.READ, lm.NO_SHEET])
+        row.addWidget(self.check_status)
+        row.addWidget(QLabel("Find:"))
+        self.check_find = QLineEdit()
+        self.check_find.setPlaceholderText("a field, a cell, a value…")
+        row.addWidget(self.check_find, 1)
+        cv.addLayout(row)
+        self.check_cells = _table()
+        self.check_cells.cellDoubleClicked.connect(
+            lambda r, _c: self._open_part(self.check_cells, r))
+        cv.addWidget(self.check_cells, 1)
+        split.addWidget(cells)
+        kl.addWidget(split, 1)
+        self.tabs.addTab(check_page, "Check")
         # Summary
         self.summary_table = _table()
         self.tabs.addTab(self._titled("Each field: numbers, dates or most common values",
@@ -193,6 +269,31 @@ class AnalyticsDialog(QDialog):
         split.setSizes([600, 500])
         cl.addWidget(split, 1)
         self.tabs.addTab(corr, "Correlation")
+        # Plots: a field's spread (the script's Statistics / Plots)
+        plots = QWidget()
+        pl = QVBoxLayout(plots)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Plot:"))
+        self.plot_choice = QComboBox()
+        self.plot_choice.addItems(la.PLOTS)
+        row.addWidget(self.plot_choice)
+        row.addWidget(QLabel("Field:"))
+        self.plot_field = QComboBox()
+        self.plot_field.addItems(self.data.number_fields)
+        row.addWidget(self.plot_field, 1)
+        row.addWidget(QLabel("Split by:"))
+        self.plot_by = QComboBox()
+        self.plot_by.addItems(["(nothing)"] + la.box_groups(self.data))
+        row.addWidget(self.plot_by)
+        pl.addLayout(row)
+        self.plot_box = QVBoxLayout()
+        pl.addLayout(self.plot_box, 1)
+        self.plot_canvas = None
+        self.tabs.addTab(plots, "Plots")
+        # Equations: fitted, tested on unseen parts, predicted, graphed
+        from .ledger_equations_page import EquationsPage
+        self.equations = EquationsPage(self)
+        self.tabs.addTab(self.equations, "Equations")
         # Outliers
         self.outlier_table = _table()
         self.outlier_table.cellDoubleClicked.connect(
@@ -211,6 +312,30 @@ class AnalyticsDialog(QDialog):
         self.by_choice.currentTextChanged.connect(lambda _t: self.refresh_trend())
         self.method_choice.currentTextChanged.connect(lambda _t: self.refresh_correlation())
         self.twins_box.toggled.connect(lambda _b: self.refresh_correlation())
+        self.data_find.textChanged.connect(lambda _t: self.refresh_data())
+        for w in (self.plot_choice, self.plot_field, self.plot_by):
+            w.currentTextChanged.connect(lambda _t: self.refresh_plot())
+        self.check_status.currentTextChanged.connect(lambda _t: self.refresh_check_cells())
+        self.check_find.textChanged.connect(lambda _t: self.refresh_check_cells())
+
+    def _has_runs(self) -> bool:
+        return any(la._RUN.match(f) for f in self.data.fields)
+
+    def on_stack(self, on: bool) -> None:
+        """The Ledger read again with its repeated tables stacked or not."""
+        self.data = la.load(self.data.csv, stack=on)
+        for box, items in ((self.field_choice, self.data.number_fields),
+                           (self.by_choice, self.data.date_fields + [PART_ORDER]),
+                           (self.plot_field, self.data.number_fields),
+                           (self.plot_by, ["(nothing)"] + la.box_groups(self.data))):
+            keep = box.currentText()
+            box.blockSignals(True)
+            box.clear()
+            box.addItems(items)
+            if keep in items:
+                box.setCurrentText(keep)
+            box.blockSignals(False)
+        self.refresh()
 
     @staticmethod
     def _titled(text: str, w: QWidget) -> QWidget:
@@ -250,8 +375,79 @@ class AnalyticsDialog(QDialog):
         fill_table(self.missing_table, la.missing_by_part(d, g))
         fill_table(self.summary_table, la.summary(d, g, self.per))
         fill_table(self.outlier_table, la.outliers(d, g, self.per))
+        fill_table(self.left_out_table, la.left_out_of_correlation(d, g))
+        self.refresh_data()
+        self.refresh_check()
+        self.refresh_plot()
+        if hasattr(self, "equations"):
+            self.equations.reload()
         self.refresh_trend()
         self.refresh_correlation()
+
+    def refresh_plot(self) -> None:
+        kind = self.plot_choice.currentText()
+        self.plot_field.setEnabled(kind != la.PCA)
+        self.plot_by.setEnabled(kind == la.BOX)
+        by = self.plot_by.currentText()
+        fig = la.plot_figure(self.data, kind, self.plot_field.currentText(),
+                             "" if by == "(nothing)" else by, self.group, self.per)
+        self.plot_canvas = self._swap(self.plot_box, self.plot_canvas, fig)
+
+    def refresh_data(self) -> None:
+        d = self.data
+        df = la.rows(d, self.group)
+        cols = [c for c in [d.id_field, d.item_field, *d.fields] if c and c in df.columns]
+        hits = la.find_rows(df[cols], self.data_find.text())
+        self.data_note.setText(
+            f"{len(hits)} of {len(df)} row(s)" + (f"; the first {SHOW_ROWS} shown"
+                                                  if len(hits) > SHOW_ROWS else "")
+            + ". Grey: left blank. Double-click a row to check its part's sources.")
+        fill_table(self.data_table, hits.head(SHOW_ROWS).rename(
+            columns={d.id_field: "Part"}), grey_blanks=True)
+
+    def refresh_check(self) -> None:
+        self.check = la.merge_check(self.data)
+        if self.check is None:
+            self.check_note.setText(
+                "This Ledger was not made by 'Merge filled copies…' (or was merged before "
+                "the check was kept: merge it again). Extract's values are checked in "
+                "Review by clicking.")
+            fill_table(self.check_files, pd.DataFrame())
+            fill_table(self.check_cells, pd.DataFrame())
+            return
+        files = la.check_by_file(self.check)
+        moved = int((files["Read at moved cell"] > 0).sum()) if len(files) else 0
+        self.check_note.setText(
+            f"{len(files)} {'copy' if len(files) == 1 else 'copies'}, {len(self.check)} "
+            "value(s) read. "
+            + (f"{moved} {'copy' if moved == 1 else 'copies'} read where the layout moved "
+               "(yellow): check those first. "
+               if moved else "Every copy was read at the template's own cells. ")
+            + "Files left out are on the merged workbook's 'Not merged' sheet.")
+        fill_table(self.check_files, files,
+                   shade=lambda r: "#fff2cc" if r["Read at moved cell"] else None)
+        if self.check_files.rowCount():
+            self.check_files.setCurrentCell(0, 0)
+        self.refresh_check_cells()
+
+    def refresh_check_cells(self) -> None:
+        from council_core import ledger_merge as lm
+        if getattr(self, "check", None) is None:
+            return
+        t, r = self.check_files, self.check_files.currentRow()
+        df = self.check
+        if 0 <= r < t.rowCount():
+            cols = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+            f = t.item(r, cols.index("File")).text()
+            df = df[df["File"] == f]
+        st = self.check_status.currentText()
+        if st != ANY:
+            df = df[df["Status"] == st]
+        df = la.find_rows(df, self.check_find.text())
+        fill_table(self.check_cells, df.head(SHOW_ROWS),
+                   shade=lambda row: ("#fff2cc" if row["Status"] == lm.MOVED else
+                                      "#e4e4e4" if row["Status"] in (lm.BLANK, lm.NO_SHEET)
+                                      else None))
 
     def refresh_trend(self) -> None:
         f = self.field_choice.currentText()

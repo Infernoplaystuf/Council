@@ -79,7 +79,7 @@ def test_every_copy_is_merged_into_one_workbook_with_a_sheet_each(books):
     assert res.merged == 6 and res.parts == 6 and not res.problems
     assert Path(res.csv).parent == folder.with_name("filled merged")
     wb = openpyxl.load_workbook(res.workbook)
-    assert wb.sheetnames == ["All data"] + [f"S-{p}" for p in range(1, 7)]
+    assert wb.sheetnames == ["All data", "Check"] + [f"S-{p}" for p in range(1, 7)]
     assert lm.NOT_MERGED not in wb.sheetnames            # nothing to say
     # each sheet is the template filled with that copy's values
     schema = read_template(template)
@@ -260,7 +260,7 @@ def test_a_copy_of_several_pages_is_merged_page_by_page(tmp_path, app_dir):
     assert row["Date"] == "2026-01-02" and row["Page 2: Date"] == "2026-02-02"
     assert row["Hardness (HRC)"] == "52"
     wb = openpyxl.load_workbook(res.workbook)
-    assert wb.sheetnames[1:3] == ["K-1 Page 1", "K-1 Page 2"]
+    assert wb.sheetnames[2:4] == ["K-1 Page 1", "K-1 Page 2"]
     assert wb["K-3 Page 2"]["C2"].value == 53
 
 
@@ -521,3 +521,147 @@ def test_a_skipped_file_says_which_labels_are_missing(books):
     why = {p.file: p.reason for p in res.left_out}["half.xlsx"]
     gone = list(dict.fromkeys(list(words.values())[len(words) // 2:]))
     assert f"'{gone[0]}'" in why and "more)" in why
+
+
+# ── a copy whose rows or columns moved (Andy, 2026-11-13, from his LMM
+# Analysis Studio script: a copy with inserted rows must still merge) ───────
+def _moved_copy(template: Path, out: Path, part: str, rows_at=(), cols_at=()) -> Path:
+    """A filled copy (Power 333, FOD 50+i per flaw), then rows / columns
+    inserted where the copy's author added them."""
+    fill(template, out, {"Part Number": part, "Power (W)": 333},
+         {FOD: {it: 50 + i for i, it in enumerate(ITEMS)}})
+    wb = openpyxl.load_workbook(out)
+    ws = wb.worksheets[0]
+    for r in sorted(rows_at, reverse=True):
+        ws.insert_rows(r, 1)
+    for c in sorted(cols_at, reverse=True):
+        ws.insert_cols(c, 1)
+    wb.save(out)
+    return out
+
+
+def test_a_copy_with_rows_inserted_is_read_where_its_labels_moved(books):
+    template, folder = books
+    _moved_copy(template, folder / "rows added.xlsx", "S-30", rows_at=(4, 4))
+    assert lm.label_layout(template, read_template(template))   # sanity
+    res = lm.merge(template, folder)
+    got = {c.part: c for c in res.copies}
+    assert "S-30" in got and got["S-30"].moved
+    rows = [r for r in ParentCSV(res.csv).rows if r["Part Number"] == "S-30"]
+    assert rows[0]["Power (W)"] == "333"
+    assert [r[FOD] for r in rows] == [str(50 + i) for i in range(len(ITEMS))]
+    note = {p.file: p.reason for p in res.left_out}["rows added.xlsx"]
+    assert note.startswith("read with its layout moved (rows from 5 on are 2 lower)")
+    assert "Check its values" in note
+
+
+def test_a_row_inside_a_table_and_a_column_before_it_are_followed(books):
+    template, folder = books
+    schema = read_template(template)
+    fod_row = openpyxl.utils.cell.coordinate_from_string(
+        schema.field(FOD).cells[ITEMS[0]])[1]
+    # a row added inside the first flaw table and a column added before column C
+    _moved_copy(template, folder / "inside.xlsx", "S-31", rows_at=(fod_row + 1,),
+                cols_at=(3,))
+    res = lm.merge(template, folder)
+    assert "S-31" in {c.part for c in res.copies}
+    rows = [r for r in ParentCSV(res.csv).rows if r["Part Number"] == "S-31"]
+    assert [r[FOD] for r in rows] == [str(50 + i) for i in range(len(ITEMS))]
+    assert rows[0]["Power (W)"] == "333"
+
+
+def test_a_workbook_that_is_not_a_copy_is_still_skipped(books):
+    template, folder = books
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r in range(1, 30):
+        ws.cell(r, 1, f"Unrelated label {r}")
+        ws.cell(r, 2, r * 3)
+    wb.save(folder / "other.xlsx")
+    res = lm.merge(template, folder)
+    assert {p.file: p.reason for p in res.left_out}["other.xlsx"].startswith("skipped:")
+
+
+
+# ── the Check sheet: every value and the cell it came from (Andy's LMM
+# Analysis Studio script, 2026-11-13: mapping audit, a reason per blank) ───
+def test_every_value_is_listed_with_the_cell_it_was_read_from(books):
+    template, folder = books
+    _moved_copy(template, folder / "rows added.xlsx", "S-30", rows_at=(4, 4))
+    res = lm.merge(template, folder)
+    check = lm.read_check(res.csv)
+    assert list(check.columns) == lm.CHECK_COLS
+    s1 = check[(check["Part"] == "S-1") & (check["Field"] == "Power (W)")].iloc[0]
+    assert s1["Status"] == lm.READ and s1["Value"] == "303"
+    assert s1["Read from"] == s1["Template cell"]
+    moved = check[(check["Part"] == "S-30") & (check["Field"] == FOD)]
+    assert set(moved["Status"]) == {lm.MOVED}
+    assert all(int(r[1:]) == int(t[1:]) + 2 for r, t in
+               zip(moved["Read from"], moved["Template cell"]))
+    blank = check[(check["Part"] == "S-1") & (check["Field"] == "Scan Speed (mm/s)")]
+    assert set(blank["Status"]) == {lm.BLANK}
+    wb = openpyxl.load_workbook(res.workbook)
+    assert wb[lm.CHECK].max_row == len(check) + 1
+
+
+def test_the_analyze_window_shows_each_copys_values_to_check(books):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from council_qt.tabs.ledger_analytics_dialog import AnalyticsDialog
+    QApplication.instance() or QApplication([])
+    template, folder = books
+    _moved_copy(template, folder / "rows added.xlsx", "S-30", rows_at=(4, 4))
+    res = lm.merge(template, folder)
+    dlg = AnalyticsDialog(la.load(res.csv))
+    assert "1 copy read where the layout moved" in dlg.check_note.text()
+    t = dlg.check_files
+    cols = [t.horizontalHeaderItem(c).text() for c in range(t.columnCount())]
+    assert t.item(0, cols.index("File")).text() == "rows added.xlsx"     # moved ones first
+    dlg.check_status.setCurrentText(lm.MOVED)
+    assert dlg.check_cells.rowCount() > 0
+    dlg.check_find.setText("Power")
+    assert dlg.check_cells.rowCount() == 0          # Power sits above the inserted rows
+    dlg.data_find.setText("S-30")
+    assert dlg.data_table.rowCount() == len(ITEMS)
+    lo = dlg.left_out_table
+    assert lo.rowCount() >= 1
+    dlg.close()
+
+
+
+# ── .xls / .xlsb / protected copies through Excel (Andy's LMM Analysis
+# Studio script, 2026-11-13). Excel is not here: its read is stood in for. ─
+def _as_excel_book(xlsx: Path):
+    import excel_open
+    wb = openpyxl.load_workbook(xlsx, data_only=True)
+    book = excel_open.ExcelBook()
+    for ws in wb.worksheets:
+        book.sheets.append((ws.title, {rc: c.value for rc, c in ws._cells.items()
+                                       if c.value is not None}))
+    return book
+
+
+def test_an_old_xls_copy_is_read_through_excel(books, tmp_path, monkeypatch):
+    template, folder = books
+    real = fill(template, tmp_path / "old.xlsx", {"Part Number": "S-40", "Power (W)": 340},
+                {FOD: {it: 70 + i for i, it in enumerate(ITEMS)}})
+    (folder / "old.xls").write_bytes(b"not really an xls")   # Excel would open it
+    monkeypatch.setattr(lm, "_excel_here", lambda: True)
+    asked = []
+    monkeypatch.setattr(lm, "_read_with_excel",
+                        lambda p: asked.append(p.name) or _as_excel_book(real))
+    res = lm.merge(template, folder)
+    assert asked == ["old.xls"]
+    rows = [r for r in ParentCSV(res.csv).rows if r["Part Number"] == "S-40"]
+    assert rows[0]["Power (W)"] == "340"
+    assert [r[FOD] for r in rows] == [str(70 + i) for i in range(len(ITEMS))]
+    assert {p.file: p.reason for p in res.left_out}["old.xls"].startswith("read through Excel")
+
+
+def test_without_excel_an_old_xls_is_listed_with_what_to_do(books, monkeypatch):
+    template, folder = books
+    (folder / "old.xls").write_bytes(b"x")
+    monkeypatch.setattr(lm, "_excel_here", lambda: False)
+    res = lm.merge(template, folder)
+    why = {p.file: p.reason for p in res.left_out}["old.xls"]
+    assert "Windows with Excel installed" in why and "save it as .xlsx" in why

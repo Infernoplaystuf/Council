@@ -7,8 +7,13 @@ analysis on that data"; a sheet per filled file was picked).
 
 No model and no guessing: each copy is read from the template's own cells
 (the cells ``sample_ledger.read_template`` found for each field), so a copy
-must keep the template's layout. One whose layout differs is listed, not
-read: Extract (step 3) reads files of any layout by their labels.
+must keep the template's layout. A copy whose rows or columns moved (rows
+inserted, a table moved down) is read where its labels moved to (Placement)
+and listed so its values can be checked. One whose layout differs is listed,
+not read: Extract (step 3) reads files of any layout by their labels.
+.xls, .xlsb and rights-protected copies are read through the installed Excel
+(excel_open) on Windows. Every value read is listed with the cell it came
+from on the workbook's 'Check' sheet and in '<merged> - check.csv'.
 
     merge(template, folder, out_dir)  -> MergeResult
 
@@ -36,7 +41,10 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from sample_ledger import (SOURCE_COL, LedgerError, ParentCSV, TemplateSchema,
                            _text, _typed, is_filled_template, mark_filled,
@@ -54,7 +62,14 @@ OLD_EXCEL = (".xls", ".xlsb")
 MIN_MATCH = 0.75
 ALL_DATA = "All data"
 NOT_MERGED = "Not merged"
+CHECK = "Check"
 FILE_COL = "File"
+#: what the Check sheet says of each value (Andy's LMM Analysis Studio
+#: script, 2026-11-13: a mapping audit and a reason for every blank)
+READ, MOVED, BLANK, NO_SHEET = ("read", "read at moved cell", "blank in the copy",
+                                "sheet not found")
+CHECK_COLS = [FILE_COL, "Part", "Field", "Item", "Template cell", "Read from", "Value",
+              "Status"]
 
 
 @dataclass
@@ -75,6 +90,9 @@ class Copy:
     sheets: Dict[str, str]    # template sheet -> the copy's sheet it was read from
     named_by_file: bool = False
     label: str = ""           # file name, '[sheet]' after it when a file has several
+    moved: Dict[str, "Placement"] = field(default_factory=dict)  # template sheet -> where it moved
+    #: (field, item, template cell, cell read in the copy ('' none), value, status)
+    audit: List[Tuple[str, str, str, str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -122,6 +140,46 @@ def default_out_dir(folder) -> Path:
     return folder.with_name(f"{folder.name} merged")
 
 
+def check_path(csv) -> Path:
+    """Where a merge writes what it read from each copy, cell by cell (read by
+    the Analyze window's Check page)."""
+    csv = Path(csv)
+    return csv.with_name(f"{csv.stem} - check.csv")
+
+
+def check_rows(res: "MergeResult") -> List[List[str]]:
+    """Each value of each copy: file, part, field, item, template cell, the
+    cell read, the value, and its status (read / read at moved cell / blank
+    in the copy / sheet not found)."""
+    return [[c.label, c.part, fname, item, tcell, cell, value, status]
+            for c in res.copies for fname, item, tcell, cell, value, status in c.audit]
+
+
+def _write_check(res: "MergeResult", path: Path) -> None:
+    import csv as _csv
+    tmp = path.with_name(path.name + ".writing")
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as fh:
+        w = _csv.writer(fh)
+        w.writerow(CHECK_COLS)
+        w.writerows(check_rows(res))
+    try:
+        os.replace(tmp, path)
+    except PermissionError as e:
+        tmp.unlink(missing_ok=True)
+        raise LedgerError(f"could not write {path.name}: it is probably open in Excel. "
+                          "Close it and merge again.") from e
+
+
+def read_check(csv) -> Optional[pd.DataFrame]:
+    """What a merge read from each copy (check_path), or None when the Ledger
+    is not a merge or was merged before the check was kept."""
+    import pandas as pd
+    path = check_path(csv)
+    if not path.is_file():
+        return None
+    return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+
+
 def output_paths(template, out_dir) -> Tuple[Path, Path]:
     stem = Path(template).stem
     out = Path(out_dir)
@@ -145,8 +203,12 @@ def find_files(folder, recursive: bool = True,
         if ext in EXCEL:
             books.append(p)
         elif ext in OLD_EXCEL:
-            problems.append(Problem(_rel(p, folder), f"{ext} cannot be read: save it as "
-                                                     ".xlsx in Excel, then merge again"))
+            if _excel_here():
+                books.append(p)             # read through Excel (read_copies)
+            else:
+                problems.append(Problem(_rel(p, folder), f"{ext} is read only on Windows "
+                                                         "with Excel installed: save it as "
+                                                         ".xlsx in Excel, then merge again"))
     return books, problems
 
 
@@ -155,6 +217,78 @@ def _rel(path: Path, folder: Path) -> str:
         return str(Path(path).relative_to(folder))
     except ValueError:
         return Path(path).name
+
+
+# ── workbooks openpyxl cannot open (Andy's LMM Analysis Studio script,
+# 2026-11-13: .xls, .xlsb and protected copies through Excel) ─────────────
+def _excel_here() -> bool:
+    try:
+        import excel_open
+        return excel_open.excel_available()
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def _read_with_excel(path: Path):
+    """The workbook's cells through the Excel on this PC (excel_open: hidden,
+    macros off, read only, no copy written). Tests replace this."""
+    import excel_open
+    return excel_open.read_with_excel(path, want_pictures=False)
+
+
+class _Cell:
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+
+class _Sheet:
+    """A sheet Excel read, shaped like the bit of an openpyxl one used here."""
+
+    def __init__(self, title: str, cells: Dict[Tuple[int, int], Any]):
+        self.title = title
+        self._cells = {rc: _Cell(v) for rc, v in cells.items()}
+
+    def __getitem__(self, a1: str) -> _Cell:
+        from openpyxl.utils.cell import column_index_from_string, coordinate_from_string
+        col, row = coordinate_from_string(a1)
+        return self._cells.get((row, column_index_from_string(col)), _Cell(None))
+
+
+class _ExcelBook:
+    def __init__(self, book):
+        self.worksheets = [_Sheet(n, c) for n, c in book.sheets]
+        self.sheetnames = [ws.title for ws in self.worksheets]
+
+    def __getitem__(self, name: str) -> _Sheet:
+        return self.worksheets[self.sheetnames.index(name)]
+
+    def close(self) -> None:
+        pass
+
+
+def _open_copy(path: Path):
+    """(workbook, through Excel?) or raises: openpyxl for .xlsx / .xlsm; the
+    installed Excel for .xls / .xlsb, and for a copy openpyxl cannot open
+    that Excel can (rights-protected, or an old workbook named .xlsx)."""
+    import openpyxl
+    if path.suffix.lower() in OLD_EXCEL:
+        return _ExcelBook(_read_with_excel(path)), True
+    try:
+        return openpyxl.load_workbook(path, data_only=True), False
+    except Exception as e:                                  # noqa: BLE001
+        try:
+            import excel_open
+            kind = excel_open.kind_of(path)
+        except Exception:                                   # noqa: BLE001
+            kind = "unknown"
+        if kind in ("rights", "legacy") and _excel_here():
+            return _ExcelBook(_read_with_excel(path)), True
+        if kind == "rights":
+            raise LedgerError("rights-protected: it is read through Excel, on Windows "
+                              "with Excel installed") from e
+        raise
 
 
 # ── reading one copy ────────────────────────────────────────────────────
@@ -227,12 +361,15 @@ def layout_share(cells: Dict[Tuple[int, int], Any], words: Dict[Tuple[int, int],
 def match_sheets(cells: Dict[str, Dict[Tuple[int, int], Any]],
                  layout: Dict[str, Dict[Tuple[int, int], str]],
                  template_sheets: Sequence[str],
-                 min_share: float = MIN_MATCH) -> Dict[str, str]:
+                 min_share: float = MIN_MATCH,
+                 placements: Optional[Dict[str, "Placement"]] = None) -> Dict[str, str]:
     """Template sheet -> the copy's sheet laid out like it (``min_share`` of
     the template's words in the same cells): the one of the same name when
     it is, else the best laid-out one not taken yet. A template sheet with
     too few words to tell (a blank page) takes the copy's sheet of the same
-    name, or the one in the same place.
+    name, or the one in the same place. ``placements``: when given, a sheet
+    whose rows or columns moved is matched too (``min_share`` of the words
+    found where they moved), and its Placement put in it.
     ``cells``: the copy's sheets (title -> {(row, col): value}), in order."""
     from council_core.ledger_examples import LAYOUT_MIN_WORDS
     names = list(cells)
@@ -253,11 +390,125 @@ def match_sheets(cells: Dict[str, Dict[Tuple[int, int], Any]],
         best = max(shares, key=shares.get, default=None)
         if best is not None and shares[best] >= min_share:
             out[t] = best
+            continue
+        if placements is None:
+            continue
+        # no sheet in place: one whose rows / columns moved (same name first)
+        tried = {n: place(cells[n], words) for n in free}
+        best = max(tried, key=lambda n: (tried[n].share, n == t), default=None)
+        if best is not None and tried[best].share >= min_share and tried[best].moved:
+            out[t] = best
+            placements[t] = tried[best]
     return out
 
 
 def best_share(cells: Dict[str, Dict[Tuple[int, int], Any]], words) -> float:
-    return max((layout_share(c, words) for c in cells.values()), default=0.0)
+    return max((max(layout_share(c, words), place(c, words).share)
+                for c in cells.values()), default=0.0)
+
+
+# ── a copy whose rows or columns moved ──────────────────────────────────
+# Andy, 2026-11-13 (from his LMM Analysis Studio script): a copy with rows
+# inserted or deleted, or a table moved down, is still a copy - read each
+# value at the place its labels moved to. Still no model and no guessing:
+# the template's rows and columns are lined up with the copy's by the labels
+# they hold, in order, and a value is read where its row and column went.
+@dataclass
+class Placement:
+    """Where a template sheet's rows and columns are in a copy's sheet."""
+    rows: Dict[int, int]            # template row -> the copy's row (anchors)
+    cols: Dict[int, int]            # template column -> the copy's column (anchors)
+    share: float = 0.0              # the template's labels found where they moved
+
+    @staticmethod
+    def _go(anchors: Dict[int, int], n: int) -> int:
+        """n moved as the nearest anchor at or before it moved (the label
+        above a value, or to its left); before every anchor, as the first."""
+        if not anchors or n in anchors:
+            return anchors.get(n, n)
+        keys = sorted(anchors)
+        before = [k for k in keys if k <= n]
+        k = before[-1] if before else keys[0]
+        return n + anchors[k] - k
+
+    def cell(self, row: int, col: int) -> Tuple[int, int]:
+        return self._go(self.rows, row), self._go(self.cols, col)
+
+    def a1(self, address: str) -> str:
+        from openpyxl.utils.cell import (column_index_from_string, coordinate_from_string,
+                                         get_column_letter)
+        col, row = coordinate_from_string(address)
+        r, c = self.cell(row, column_index_from_string(col))
+        return f"{get_column_letter(c)}{r}"
+
+    @property
+    def moved(self) -> bool:
+        return any(k != v for k, v in self.rows.items()) or any(
+            k != v for k, v in self.cols.items())
+
+    def describe(self) -> str:
+        """'rows from 5 on are 2 lower; columns from D on are 1 to the right'."""
+        from openpyxl.utils import get_column_letter
+        out = []
+        for what, anchors, name in (("rows", self.rows, str),
+                                    ("columns", self.cols, get_column_letter)):
+            last = 0
+            for k in sorted(anchors):
+                d = anchors[k] - k
+                if d != last:
+                    side = (("lower" if d > 0 else "higher") if what == "rows"
+                            else ("to the right" if d > 0 else "to the left"))
+                    out.append(f"{what} from {name(k)} on are {abs(d)} {side}"
+                               if d else f"{what} from {name(k)} on are back in place")
+                    last = d
+        return "; ".join(out) or "in place"
+
+
+def _line_up(template: Dict[int, frozenset], copy: Dict[int, frozenset]) -> Dict[int, int]:
+    """Template rows (or columns) paired with the copy's by the labels they
+    hold, kept in order (a diff of the two lists): equal ones, and in a run
+    of changed ones those sharing most of their labels."""
+    from difflib import SequenceMatcher
+    t_keys, c_keys = sorted(template), sorted(copy)
+    t_sig = [template[k] for k in t_keys]
+    c_sig = [copy[k] for k in c_keys]
+    sm = SequenceMatcher(None, t_sig, c_sig, autojunk=False)
+    pairs: Dict[int, int] = {}
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                pairs[t_keys[i]] = c_keys[j]
+        elif op == "replace":
+            j = j1
+            for i in range(i1, i2):
+                for jj in range(j, j2):
+                    a, b = t_sig[i], c_sig[jj]
+                    if len(a & b) * 2 >= max(len(a), len(b)):
+                        pairs[t_keys[i]] = c_keys[jj]
+                        j = jj + 1
+                        break
+    return pairs
+
+
+def place(cells: Dict[Tuple[int, int], Any], words: Dict[Tuple[int, int], str]
+          ) -> Placement:
+    """How the template sheet (its ``words``) lines up with a copy's sheet,
+    and the share of its labels found once rows and columns are moved."""
+    from council_core.ledger_examples import _norm
+    vocab = set(words.values())
+    seen = {rc: _norm(v) for rc, v in cells.items() if isinstance(v, str)}
+    seen = {rc: w for rc, w in seen.items() if w in vocab}
+
+    def by(axis: int, src) -> Dict[int, frozenset]:
+        out: Dict[int, set] = {}
+        for rc, w in src.items():
+            out.setdefault(rc[axis], set()).add(w)
+        return {k: frozenset(v) for k, v in out.items()}
+    p = Placement(_line_up(by(0, words), by(0, seen)), _line_up(by(1, words), by(1, seen)))
+    if words:
+        p.share = sum(1 for (r, c), w in words.items()
+                      if seen.get(p.cell(r, c)) == w) / len(words)
+    return p
 
 
 def _entered(schema: TemplateSchema, rows: List[Dict[str, str]]) -> int:
@@ -274,10 +525,27 @@ def _entered(schema: TemplateSchema, rows: List[Dict[str, str]]) -> int:
     return n
 
 
-def _rows_from(schema: TemplateSchema, ws_of: Dict[str, Any]) -> List[Dict[str, str]]:
+def _rows_from(schema: TemplateSchema, ws_of: Dict[str, Any],
+               placed: Optional[Dict[str, Placement]] = None,
+               audit: Optional[list] = None) -> List[Dict[str, str]]:
+    """The copy's rows, read at the template's cells (where they moved, on a
+    sheet in ``placed``); ``audit`` gets (field, item, template cell, cell
+    read, value, status) for every value."""
+    placed = placed or {}
+    audit = audit if audit is not None else []
+
     def get(f, item: str) -> str:
         ws = ws_of.get(f.sheet)
-        return _text(ws[f.cells[item]].value) if ws is not None else ""
+        tcell = f.cells[item]
+        if ws is None:
+            audit.append((f.name, item, tcell, "", "", NO_SHEET))
+            return ""
+        p = placed.get(f.sheet)
+        cell = p.a1(tcell) if p else tcell
+        v = _text(ws[cell].value)
+        audit.append((f.name, item, tcell, cell, xl_text(v),
+                      BLANK if not str(v).strip() else MOVED if cell != tcell else READ))
+        return v
     part = {f.name: get(f, "") for f in schema.fields if not f.per_item}
     if not schema.item_field:
         return [part]
@@ -298,18 +566,18 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
     what to say about it. A template of one sheet: every sheet laid out like
     it is a copy (a workbook with a sheet per part). Of several sheets: one
     copy, its sheets matched to the template's."""
-    import openpyxl
     name = _rel(path, folder)
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb, via_excel = _open_copy(path)
     except Exception as e:                                  # noqa: BLE001
         return [], [Problem(name, f"could not be opened: {e}")]
     try:
-        if ALL_DATA in wb.sheetnames and is_filled_template(path):
+        if not via_excel and ALL_DATA in wb.sheetnames and is_filled_template(path):
             return [], [Problem(name, "a merged workbook the Council made, not a copy")]
         tsheets = list(dict.fromkeys(f.sheet for f in schema.fields))
         cells = {ws.title: _cells(ws) for ws in wb.worksheets}
-        found = match_sheets(cells, layout, tsheets, min_share)
+        placed: Dict[str, Placement] = {}
+        found = match_sheets(cells, layout, tsheets, min_share, placed)
         id_sheet = schema.field(schema.id_field).sheet
         if id_sheet not in found:
             words = layout.get(id_sheet, {})
@@ -320,22 +588,27 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
                                       f"(needs {min_share:.0%}); read it with Extract "
                                       "instead. Template labels not in place: "
                                       + ", ".join(f"'{w}'" for w in gone) + more)]
-        sets = [found]
+        sets = [(found, placed)]
         if len(tsheets) == 1:                # more sheets laid out like the template
             rest = [t for t in cells if t != found[id_sheet]]
             while rest:
+                more_placed: Dict[str, Placement] = {}
                 more = match_sheets({t: cells[t] for t in rest}, layout, tsheets,
-                                    min_share)
+                                    min_share, more_placed)
                 if id_sheet not in more:
                     break
-                sets.append(more)
+                sets.append((more, more_placed))
                 rest.remove(more[id_sheet])
-        read = [(m, _rows_from(schema, {t: wb[s] for t, s in m.items()})) for m in sets]
+        read = []
+        for m, pl in sets:
+            audit: list = []
+            read.append((m, pl, _rows_from(schema, {t: wb[s] for t, s in m.items()}, pl,
+                                           audit), audit))
     finally:
         wb.close()
     copies, notes = [], []
     several = len(read) > 1
-    for m, rows in read:
+    for m, pl, rows, audit in read:
         label = f"{name} [{m[id_sheet]}]" if several else name
         pid = xl_text(rows[0].get(schema.id_field, "")).strip()
         if not pid and not _entered(schema, rows):
@@ -348,7 +621,15 @@ def read_copies(schema: TemplateSchema, layout, path: Path, folder: Path,
             pid, named = (path.stem if not several else f"{path.stem} {m[id_sheet]}"), True
             for r in rows:
                 r[schema.id_field] = pid
-        copies.append(Copy(path, pid, rows, m, named, label))
+        copies.append(Copy(path, pid, rows, m, named, label, moved=dict(pl), audit=audit))
+        if via_excel:
+            notes.append(Problem(label, "read through Excel (openpyxl cannot open it): "
+                                        "values as Excel shows them", part=pid))
+        for t, p in pl.items():
+            notes.append(Problem(label, f"read with its layout moved{' on ' + t if len(tsheets) > 1 else ''}"
+                                        f" ({p.describe()}): {p.share:.0%} of the template's "
+                                        "labels found where they moved. Check its values.",
+                                 part=pid))
         missing = [t for t in tsheets if t not in m]
         if missing:
             notes.append(Problem(label, f"sheet(s) {', '.join(missing)} not found laid out "
@@ -483,6 +764,7 @@ def merge(template, folder, out_dir=None, *, recursive: bool = True,
     try:
         write_workbook(schema, ParentCSV(tmp_csv), res, folder, book_path)
         _swap_in(tmp_csv, csv_path, schema)
+        _write_check(res, check_path(csv_path))
     finally:
         for stale in (tmp_csv, schema_path_for(tmp_csv)):
             if stale.exists():
@@ -517,7 +799,7 @@ def write_workbook(schema: TemplateSchema, ledger: ParentCSV, res: MergeResult,
     wb = openpyxl.load_workbook(schema.template_path)
     originals = list(wb.worksheets)
     several = len(originals) > 1
-    used = {ALL_DATA.lower(), NOT_MERGED.lower()}
+    used = {ALL_DATA.lower(), NOT_MERGED.lower(), CHECK.lower()}
     bold = Font(bold=True)
     head_fill = PatternFill("solid", fgColor="DDEBF7")
     try:
@@ -572,6 +854,22 @@ def write_workbook(schema: TemplateSchema, ledger: ParentCSV, res: MergeResult,
                 cell.font, cell.fill = bold, head_fill
             nm.freeze_panes = "A2"
             _autosize(nm, widest=70)
+
+        # Check: every value of every copy, the cell it was read from
+        ck = wb.create_sheet(CHECK, 2 if res.problems else 1)
+        ck.append(CHECK_COLS)
+        moved_fill = PatternFill("solid", fgColor="FFF2CC")
+        blank_fill = PatternFill("solid", fgColor="EDEDED")
+        for row in check_rows(res):
+            ck.append([_typed(v) if i == 6 else v for i, v in enumerate(row)])
+            if row[-1] in (MOVED, BLANK, NO_SHEET):
+                for cell in ck[ck.max_row]:
+                    cell.fill = moved_fill if row[-1] == MOVED else blank_fill
+        for cell in ck[1]:
+            cell.font, cell.fill = bold, head_fill
+        ck.freeze_panes = "A2"
+        ck.auto_filter.ref = ck.dimensions
+        _autosize(ck, widest=45)
         wb.active = 0
         mark_filled(wb)
         out.parent.mkdir(parents=True, exist_ok=True)
