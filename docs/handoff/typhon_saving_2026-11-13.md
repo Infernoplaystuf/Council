@@ -34,13 +34,12 @@ images") and said to start on the code items.
   Whether a CXP boost fills the block ID is not yet seen on the real camera.
 
 - **Raw recording** (`council_core/raw_frames.py`). `TYPHON_SAVE_FORMAT=raw`
-  or `frame_camera.set_save_format("raw")`: `capture.run_recorder` gives the
+  or `raw_frames.set_format("raw")`: `capture.run_recorder` gives the
   Recorder a `RawStack` writer, so every frame is appended to
   `<run>_frames.tyraw` (records: b"TYRF", header length, JSON header with the
   PNG name, dtype, shape, then the pixels) while the frames CSV names the PNG
   each frame becomes. The end record has `raw_frames` {file, frames, bytes,
-  converted: false}. `frame_camera.convert_raw_runs(folder)` or
-  `python council_core/raw_frames.py <folder|file> [--remove-raw]` writes the
+  converted: false}. `python council_core/raw_frames.py <folder|file> [--remove-raw]` writes the
   PNGs ("xb": one already there is left alone). A record cut short converts
   every whole frame before it. The .tyraw is removed only when asked and every
   frame became a new PNG in that call. Pixels are stored as Typhon has them

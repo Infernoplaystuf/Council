@@ -278,13 +278,12 @@ def test_a_raw_file_cut_short_converts_every_whole_frame(tmp_path):
 
 def test_the_save_format_is_chosen_and_png_stays_the_default(monkeypatch):
     from council_core import raw_frames
-    import frame_camera
     monkeypatch.setattr(raw_frames, "_format", None)
     monkeypatch.delenv(raw_frames.FORMAT_ENV, raising=False)
     assert raw_frames.save_format() == "png"
-    assert frame_camera.set_save_format("raw")["format"] == "raw"
+    assert raw_frames.set_format("raw") == "raw"
     assert capture.run_recorder(Path("."), "x").raw_stack is not None
-    frame_camera.set_save_format("png")
+    raw_frames.set_format("png")
     assert capture.run_recorder(Path("."), "x").raw_stack is None
     with pytest.raises(ValueError):
         raw_frames.set_format("tiff")

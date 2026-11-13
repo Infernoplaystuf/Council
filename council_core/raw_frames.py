@@ -24,8 +24,7 @@ too (capture.write_image): a PNG already there is reported and left alone.
 was written as a new PNG by that call.
 
 TURNED ON with TYPHON_SAVE_FORMAT=raw (before Typhon starts), or
-frame_camera.set_save_format("raw"). Converted with
-frame_camera.convert_raw_runs(folder), or by hand:
+raw_frames.set_format("raw"). Converted afterwards by hand:
     python _council/council_core/raw_frames.py <folder or .tyraw> [--remove-raw]
 """
 from __future__ import annotations
