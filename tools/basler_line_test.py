@@ -105,8 +105,11 @@ def check_lines(sdk: Any, serial: str, seconds: float, edge: str,
         return None
     infos = backend.discover()
     if not infos:
-        say("No Basler camera found. Check it is plugged in and that the "
-            "pylon Viewer sees it.")
+        from council_core import pylon_env
+        say("No Basler camera found. Check it is plugged in, that the "
+            "pylon Viewer sees it, and that pylon Viewer is closed.")
+        for line in pylon_env.words(pylon_env.report(sdk)):
+            say(f"  {line}")
         return None
     say(f"{len(infos)} Basler camera(s):")
     for info in infos:
