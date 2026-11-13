@@ -672,6 +672,11 @@ class BaslerBackend(Backend):
     def sdk(self) -> Any:
         if self._sdk is not None:
             return self._sdk
+        # Before pypylon's first import: the pylon Software Suite's CXP
+        # GenTL producer on this process's GENICAM_GENTL64_PATH (a CXP
+        # camera is invisible to the wheel without it; pylon_env says why).
+        from . import pylon_env
+        pylon_env.prepare()
         try:
             from pypylon import pylon
         except ImportError as exc:
@@ -2884,6 +2889,15 @@ def discover(known: Optional[Sequence[Backend]] = None) -> Discovery:
                 "pylon Software Suite with 'CXP Camera Support' ticked, and "
                 "make sure the interface card's applet matches the number of "
                 "CXP cables in use")
+            # What pypylon actually sees, so "nothing found" says where it
+            # looked (the transport layers, the GenTL path).
+            try:
+                from . import pylon_env
+                sdk = getattr(backend, "_sdk", None)
+                for line in pylon_env.words(pylon_env.report(sdk)):
+                    found.notes.append(f"basler: {line}")
+            except Exception:                               # noqa: BLE001
+                pass
         elif not cameras:
             found.notes.append(f"{backend.name}: no cameras found")
         found.cameras.extend(cameras)
