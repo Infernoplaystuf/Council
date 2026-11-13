@@ -83,6 +83,10 @@ class Node:
     url: str
     enabled: bool = False
     parallel: int = 1
+    #: The model this machine reads with when work is SHARED out rather than
+    #: sent for a role (the Connections build, the Ledger): an Ollama name
+    #: on that machine, US-origin only. "" = the machine takes no shared work.
+    model: str = ""
 
 
 @dataclass
@@ -99,11 +103,34 @@ class Routing:
 
     def to_json(self) -> dict:
         return {"version": VERSION, "routing_enabled": self.routing_enabled,
-                "nodes": {n.name: {"url": n.url, "enabled": n.enabled,
-                                   "parallel": n.parallel}
-                          for n in self.nodes.values()},
+                "nodes": {n.name: _node_json(n) for n in self.nodes.values()},
                 "roles": {r: {"node": b.node, "fallback": b.fallback}
                           for r, b in self.roles.items()}}
+
+
+def _node_json(n: Node) -> dict:
+    out = {"url": n.url, "enabled": n.enabled, "parallel": n.parallel}
+    if n.model:
+        out["model"] = n.model
+    return out
+
+
+_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
+
+def check_model(model: str) -> str:
+    """'' when ``model`` may be a machine's shared-work model, else why not:
+    an Ollama name, and US-origin (council_core.local_models, the rule
+    everywhere in the Council)."""
+    model = str(model or "").strip()
+    if not model:
+        return ""
+    if not _MODEL.match(model):
+        return f"{model!r} is not an Ollama model name"
+    from . import local_models
+    if local_models.maker_and_origin(model)[1] != "US":
+        return f"{model} is not a US-origin model"
+    return ""
 
 
 def normalise_url(url: str) -> str:
@@ -130,8 +157,12 @@ def parse(data: Any) -> Routing:
             raise RoutingError(f"machine {name!r} has a bad 'parallel'")
         if not 1 <= parallel <= 16:
             raise RoutingError(f"machine {name!r}: parallel must be 1-16")
+        model = str(spec.get("model", "") or "").strip()
+        why = check_model(model)
+        if why:
+            raise RoutingError(f"machine {name!r}: {why}")
         nodes[name] = Node(name, url, bool(spec.get("enabled", False)),
-                           parallel)
+                           parallel, model)
     roles: Dict[str, Binding] = {}
     for role, spec in (data.get("roles") or {}).items():
         if not isinstance(spec, dict):
@@ -272,6 +303,12 @@ def enabled_nodes(routing: Optional[Routing] = None) -> List[Node]:
     return [n for n in r.nodes.values() if n.enabled]
 
 
+def sharing_nodes(routing: Optional[Routing] = None) -> List[Node]:
+    """The enabled machines (routing on) that take shared work: those with a
+    model for it. The Connections build and the Ledger read with these."""
+    return [n for n in enabled_nodes(routing) if n.model]
+
+
 # ============================================================
 # Cooldown: a failing node rests
 # ============================================================
@@ -382,6 +419,6 @@ def run_parallel(calls: Sequence[Callable[[], Any]],
 __all__ = ["FILE_NAME", "SERVICE_ROLES", "Node", "Binding", "Routing", "RoutingError",
            "Target", "parse", "load", "save", "problem", "current",
            "invalidate", "set_current", "route", "is_allowed_host",
-           "enabled_nodes", "mark_failed", "mark_ok", "cooling",
+           "enabled_nodes", "sharing_nodes", "check_model", "mark_failed", "mark_ok", "cooling",
            "reset_cooldowns", "host_slot", "run_parallel", "Outcome",
            "normalise_url"]

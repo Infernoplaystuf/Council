@@ -3966,14 +3966,23 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
         if pool is not None:
             prog.update(f"reading {len(index)} files {len(pool.helpers)} at a time",
                         force=True)
+    # Council's model on several machines (council_core.ledger_spread): part
+    # questions run while the next workbooks are read; each workbook's values
+    # still go into the run in file order (_Pipeline)
+    pipe = (_Pipeline(run, prog, _wd, cancel, 2 * int(getattr(part_finder, "capacity", 1)))
+            if hasattr(part_finder, "submit") else None)
     try:
         for src in sources:
             if cancel is not None and cancel.is_set():
+                if pipe is not None:
+                    pipe.drop("before")
                 run.cancelled = True
                 run.problems.append("Cancelled by user before "
                                     f"{Path(src).name!r}.")
                 break
             label = label_of(src)
+            if pipe is not None and not pipe.make_room():
+                break                                 # cancelled while waiting
             if pool is not None and str(src) in index:
                 try:
                     part_json = pool.result(
@@ -3982,42 +3991,182 @@ def _extract_all(sources, run, prog, _wd, tick, here, cancel, image_dir, reader,
                                      else (lambda: False)),
                         say=prog.update)
                 except ledger_workers.Stopped:
+                    if pipe is not None:
+                        pipe.drop("while")
                     run.model_parts.pop(label, None)
                     run.cancelled = True
                     run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
                                         "the workbooks before it are in this review.")
                     break
                 if part_json is not None:
-                    ledger_workers.put(run, part_json)
-                    for what in pool.steps.pop(index[str(src)], []):
-                        prog.advance(what=what)
-                    _wd.beat()
+                    steps = pool.steps.pop(index[str(src)], [])
+
+                    def put(_found="", _where="", part_json=part_json, steps=steps):
+                        ledger_workers.put(run, part_json)
+                        for what in steps:
+                            prog.advance(what=what)
+                        _wd.beat()
+                    if pipe is not None and pipe.pending:
+                        pipe.add(src, _answered(("", "")), put)
+                    else:
+                        put()
                     continue
                 # Excel's, Council's model's, or its helper stopped: read here
             if not _extract_here(src, label, run, prog, _wd, tick, here, cancel, image_dir,
                                  reader, m, codes, mask_re, part, schema, _time,
-                                 part_finder, reader_cls, readers, mask_strict):
+                                 part_finder, reader_cls, readers, mask_strict,
+                                 pipe=pipe):
                 break
+        else:
+            if pipe is not None:
+                pipe.finish_all()
     finally:
+        if pipe is not None:
+            pipe.close()
         if pool is not None:
             pool.close()
 
 
+class _Pipeline:
+    """Workbooks whose part question is out to Council's model (several
+    machines answering at once: council_core.ledger_spread.PartAsker), each
+    finished - its values put into the run - in file order once its answer
+    is in. At most ``part_finder.capacity`` x 2 wait at a time, so their
+    sheets do not all sit in memory.
+
+    CANCEL: a workbook still waiting for its answer is dropped as a
+    workbook cut short always was - what its read added to the run's lists
+    (pictures, problem lines, filled copies...) is taken out again, latest
+    first, by the positions recorded when it was read (`mark`); the lists
+    only grow while the run reads, so those positions stay right."""
+
+    LISTS = ("images", "problems", "filled_copies", "unrelated", "open_failures",
+             "timings")
+    DICTS = ("other_words", "index_parts")
+
+    def __init__(self, run, prog, _wd, cancel, most: int = 0):
+        self.run, self.prog, self._wd, self.cancel = run, prog, _wd, cancel
+        self.most = max(2, int(most or 0))
+        self.pending: List[Tuple[Any, Any, Callable[..., None], Any]] = []
+
+    def mark(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for name in self.LISTS:
+            v = getattr(self.run, name, None)
+            out[name] = len(v) if isinstance(v, list) else None
+        for name in self.DICTS:
+            v = getattr(self.run, name, None)
+            out[name] = set(v) if isinstance(v, dict) else None
+        return out
+
+    def _ends(self) -> Dict[str, Any]:
+        return self.mark()
+
+    def add(self, src, fut, finish, marks=None) -> None:
+        self.pending.append((src, fut, finish,
+                             (marks, self._ends()) if marks is not None else None))
+
+    def _stopped(self) -> bool:
+        return self.cancel is not None and self.cancel.is_set()
+
+    def _wait(self, fut) -> bool:
+        """Wait for one answer, beating the watchdog; False on Cancel."""
+        while True:
+            try:
+                fut.result(timeout=0.5)
+                return True
+            except Exception as e:                          # noqa: BLE001
+                import concurrent.futures as cf
+                if isinstance(e, cf.TimeoutError):
+                    self._wd.beat()
+                    if self._stopped():
+                        return False
+                    continue
+                return True                                  # failed: finish without it
+
+    def _finish_first(self) -> bool:
+        src, fut, finish, _m = self.pending[0]
+        if not self._wait(fut):
+            return False
+        self.pending.pop(0)
+        try:
+            found, where = fut.result()
+        except Exception as e:                              # noqa: BLE001
+            found, where = "", ""
+            self.run.problems.append(f"{Path(src).name}: Council's model was not asked "
+                                     f"for its part: {e}")
+        finish(found or "", where or "")
+        return True
+
+    def make_room(self) -> bool:
+        """Finish answered workbooks at the front, then wait until fewer
+        than ``most`` are out. False: cancelled while waiting."""
+        while self.pending and (self.pending[0][1].done() or len(self.pending) >= self.most):
+            if not self._finish_first():
+                self.drop("while")
+                self.run.cancelled = True
+                return False
+        return True
+
+    def finish_all(self) -> None:
+        while self.pending:
+            if not self._finish_first():
+                self.drop("while")
+                self.run.cancelled = True
+                return
+
+    def drop(self, when: str) -> None:
+        """Cancel: every workbook still waiting is left out (latest first)."""
+        names = []
+        for src, fut, _finish, marks in reversed(self.pending):
+            fut.cancel()
+            names.append(Path(src).name)
+            if marks is None:
+                continue
+            start, end = marks
+            for name in self.LISTS:
+                lst = getattr(self.run, name, None)
+                if isinstance(lst, list) and start[name] is not None \
+                        and end[name] is not None:
+                    del lst[start[name]:end[name]]
+            for name in self.DICTS:
+                d = getattr(self.run, name, None)
+                if isinstance(d, dict) and start[name] is not None \
+                        and end[name] is not None:
+                    for k in end[name] - start[name]:
+                        d.pop(k, None)
+        self.pending.clear()
+        if names:
+            self.run.problems.append(
+                "Cancelled by user while Council's model was asked about "
+                + ", ".join(repr(n) for n in reversed(names))
+                + "; those workbooks are not in this review.")
+
+    def close(self) -> None:
+        for _src, fut, _f, _m in self.pending:
+            fut.cancel()
+
+
 def _extract_here(src, label, run, prog, _wd, tick, here, cancel, image_dir, reader,
                   m, codes, mask_re, part, schema, _time, part_finder, reader_cls,
-                  readers, mask_strict) -> bool:
+                  readers, mask_strict, pipe: "Optional[_Pipeline]" = None) -> bool:
     """One source read in this process. False: cancelled while reading it
     (what it gave is dropped)."""
     kept = (len(run.obs), len(run.unmatched), len(run.images), len(run.problems))
+    marks = pipe.mark() if pipe is not None else None
     try:
         _extract_one(Path(src), run, prog, _wd, tick, here, cancel, image_dir,
                      reader, m, codes, mask_re, part, schema, _time,
                      label, part_finder, reader_cls=reader_cls, readers=readers,
-                     mask_strict=mask_strict)
+                     mask_strict=mask_strict,
+                     defer=(None if pipe is None else
+                            lambda fut, finish: pipe.add(src, fut, finish, marks)))
     except _Cancelled:
         # half a workbook is not offered for review: what it gave goes
         del run.obs[kept[0]:], run.unmatched[kept[1]:], run.images[kept[2]:]
         del run.problems[kept[3]:]
+        if pipe is not None:              # then those still waiting (earlier ones)
+            pipe.drop("while")
         run.model_parts.pop(label, None)
         run.cancelled = True
         run.problems.append(f"Cancelled by user while reading {Path(src).name!r}; "
@@ -4042,7 +4191,14 @@ def _excel_down_line(problems: List[str], msg: str, name: str) -> None:
 def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                  m, codes, mask_re, part, schema, _time, label: str = "",
                  part_finder=None, reader_cls=None, readers=None,
-                 mask_strict: bool = True) -> None:
+                 mask_strict: bool = True, defer=None) -> None:
+    """One source into ``run``. ``defer(future, finish)``: Council's model
+    answers on several machines at once (council_core.ledger_spread): the
+    part question is SUBMITTED (part_finder.submit) and the rest of the
+    workbook - everything that puts its values into the run - is handed back
+    as ``finish(found_part, where)`` for _extract_all to call in file order
+    once the answer is in. A workbook that asks nothing hands back a finish
+    too (an answered future), so the run keeps the files' order."""
     _t0 = _time.monotonic()
     via_excel = src.suffix.lower() in (".xls", ".xlsb") or (
         src.exists() and __import__("excel_open").kind_of(src) == "rights")
@@ -4246,6 +4402,19 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
                 for o in ex.out + [u for u in ex.unmatched if not m.ignored(u.label)]
                 if not o.part and not o.part_how] \
         if part_finder is not None and not part and not book_part else []
+    def _rest(found_part: str = "", where: str = "") -> None:
+        _finish_one(src, run, prog, _wd, schema, label, exs, partless, m, part,
+                    mask_re, mask_strict, readers, _time, _t0, found_part, where)
+
+    if defer is not None:
+        if partless and hasattr(part_finder, "submit"):
+            here["what"] = f"{src.name}: asking Council's model which part it is"
+            prog.update(here["what"], force=True)
+            defer(part_finder.submit(label or src.name, grids), _rest)
+        else:
+            defer(_answered(("", "")), _rest)
+        return
+    found_part, where = "", ""
     if partless:
         here["what"] = f"{src.name}: asking Council's model which part it is"
         prog.update(here["what"], force=True)
@@ -4253,18 +4422,33 @@ def _extract_one(src, run, prog, _wd, tick, here, cancel, image_dir, reader,
         _wd.beat()
         if cancel is not None and cancel.is_set():
             raise _Cancelled()                # the model's answer was cut short
-        if found_part:
-            # the file name says the same part: two sources agree, and it
-            # may be pre-accepted (user, 2026-10-23: 3659 values to review
-            # with 'SBS2FFP268.xlsx -> SBS2FFP268')
-            how = (f"{AGREED_PART_HOW} {src.name!r}" if _in_name(found_part, src.stem)
-                   else f"{MODEL_PART_HOW} from {where} — check it")
-            run.model_parts[label or src.name] = (found_part, where)
-            for o in partless:
-                o.part, o.part_how = found_part, how
-            for ex in exs:
-                if not ex.part:
-                    ex.part, ex.part_how = found_part, how
+    _rest(found_part, where)
+
+
+def _answered(value):
+    from concurrent.futures import Future
+    fut: Future = Future()
+    fut.set_result(value)
+    return fut
+
+
+def _finish_one(src, run, prog, _wd, schema, label, exs, partless, m, part, mask_re,
+                mask_strict, readers, _time, _t0, found_part, where) -> None:
+    """The rest of _extract_one once the part question (if any) is answered:
+    the model's part given to the part-less values, then the workbook's
+    values put into the run."""
+    if found_part:
+        # the file name says the same part: two sources agree, and it
+        # may be pre-accepted (user, 2026-10-23: 3659 values to review
+        # with 'SBS2FFP268.xlsx -> SBS2FFP268')
+        how = (f"{AGREED_PART_HOW} {src.name!r}" if _in_name(found_part, src.stem)
+               else f"{MODEL_PART_HOW} from {where} — check it")
+        run.model_parts[label or src.name] = (found_part, where)
+        for o in partless:
+            o.part, o.part_how = found_part, how
+        for ex in exs:
+            if not ex.part:
+                ex.part, ex.part_how = found_part, how
     for ex in exs:
         for o in ex.out + ex.unmatched:
             o.part_how = o.part_how or ex.part_how

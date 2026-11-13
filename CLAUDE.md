@@ -195,6 +195,13 @@ same list.
   template merged into one workbook, a sheet per copy plus All data and Not
   merged, kept as a Ledger for Analyze; the same label on two pages kept as
   'Page 2: Date'): `docs/handoff/ledger_merge_2026-11-11.md`.
+- Several PCs as Council machines: Machines & roles' "Add a PC…" (a setup
+  .bat for the other PC: Ollama on the network, a firewall rule for this PC
+  only), Test selected, Models on selected… (list, download on press, remove
+  after a yes), the "Model for shared work" Connections and the Ledger
+  (`council_core/ledger_spread.py`: part and header questions on several
+  machines, the review unchanged) read with:
+  `docs/handoff/multi_pc_nodes_2026-11-13.md`.
 - Ideas from Andy's LMM Analysis Studio script in the Ledger: the merge
   following moved rows / columns, .xls and protected copies through Excel, the
   Check sheet and page, parts-based correlation, repeated tables as one field,
