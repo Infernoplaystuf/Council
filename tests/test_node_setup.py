@@ -157,7 +157,10 @@ def test_probe_of_nothing_says_what_to_do():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    found = ns.probe(f"http://127.0.0.1:{port}", timeout=2)
+    # Windows retries a refused connection for about 2 s before it says
+    # "refused" (CI, 2026-11-13: timeout=2 read as "no answer"); the probe's
+    # own default (4 s) leaves room for that, and so does this
+    found = ns.probe(f"http://127.0.0.1:{port}", timeout=8)
     assert not found.reachable
     assert "Ollama is not running there" in found.error
     assert ns.check(found)[0].startswith("✗")
