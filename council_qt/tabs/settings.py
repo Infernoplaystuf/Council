@@ -4,9 +4,12 @@ council_qt.tabs.settings — Council's Settings tab.
     Online    the switch for the internet (council_core.web): OFF by default,
               and while it is off nothing in Council searches or reads the
               web. Ticking it saves at once to <app dir>/online.json; the
-              search engine (DuckDuckGo, Brave with the user's key, or the
-              user's own SearXNG) is saved with "Save search settings".
-              COUNCIL_OFFLINE=1 greys it out, off.
+              search engine (SearXNG, the default; DuckDuckGo; Brave with
+              the user's key) is saved with "Save search settings". "Set up
+              SearXNG" starts a SearXNG server in Docker on this PC
+              (council_core.searxng) on a worker thread ("research-searxng")
+              and saves it as the engine. COUNCIL_OFFLINE=1 greys it out,
+              off.
 
     Plugins   one row per plugin folder: On, name, version, built in or
               added, and its status (ready, or why it cannot run). Ticking
@@ -17,10 +20,11 @@ council_qt.tabs.settings — Council's Settings tab.
               greyed out with the reason beside it.
 
 Listing reads manifests only (council_core.app_plugins.discover): no
-plugin code runs in this tab. Nothing here starts a thread.
+plugin code runs in this tab. Only "Set up SearXNG" starts a thread.
 """
 from __future__ import annotations
 
+import threading
 from typing import List, Optional
 
 from PySide6.QtCore import Qt, QUrl
@@ -31,6 +35,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QVBoxLayout, QWidget)
 
 from council_core import app_plugins
+from council_core import searxng
 from council_core import web
 
 from ..view import ViewHelpers, amp
@@ -58,6 +63,9 @@ class SettingsActions:
 
     def save_online(self, settings: web.Settings) -> web.Settings:
         return web.save(settings)
+
+    def setup_searxng(self, on_progress) -> web.Settings:
+        return searxng.setup(on_progress)
 
     def plugins_folder(self):
         return app_plugins.user_dir()
@@ -158,6 +166,18 @@ class SettingsTab(ViewHelpers, QWidget):
         self.save_search_btn = self._button(row, "Save search settings",
                                             self.on_save_search)
         layout.addLayout(row)
+
+        self.searxng_row = QWidget()
+        srow = QHBoxLayout(self.searxng_row)
+        srow.setContentsMargins(0, 0, 0, 0)
+        self.searxng_btn = self._button(srow, "Set up SearXNG on this PC",
+                                        self.on_setup_searxng)
+        self.searxng_note = QLabel(amp(
+            "Needs no account or key. Runs in Docker Desktop on this PC "
+            f"({web.DEFAULT_SEARXNG}); the first setup downloads it."))
+        self.searxng_note.setWordWrap(True)
+        srow.addWidget(self.searxng_note, 1)
+        layout.addWidget(self.searxng_row)
         self._load_online()
         return box
 
@@ -201,11 +221,12 @@ class SettingsTab(ViewHelpers, QWidget):
     def _engine_fields(self, *_args) -> None:
         key = self.engine_box.currentData()
         self.searxng_edit.setVisible(key == "searxng")
+        self.searxng_row.setVisible(key == "searxng")
         self.brave_edit.setVisible(key == "brave")
 
     def _form_settings(self) -> web.Settings:
         return web.Settings(online=self.online_check.isChecked(),
-                            search=self.engine_box.currentData() or "duckduckgo",
+                            search=self.engine_box.currentData() or web.DEFAULT_ENGINE,
                             searxng_url=self.searxng_edit.text().strip(),
                             brave_key=self.brave_edit.text().strip())
 
@@ -230,6 +251,26 @@ class SettingsTab(ViewHelpers, QWidget):
         self.online_note.setText(amp(
             f"Saved: search with "
             f"{web.ENGINE_NAMES[self.engine_box.currentData()]}."))
+
+    def on_setup_searxng(self) -> None:
+        if not self.online_check.isChecked():
+            self.searxng_note.setText(amp(
+                "Switch on Online first: setting up SearXNG downloads it."))
+            return
+        self.searxng_btn.setEnabled(False)
+        say = lambda text: self._to_ui(lambda: self.searxng_note.setText(amp(text)))
+
+        def work():
+            try:
+                self._online_call("setup_searxng", say)
+            except Exception as exc:                      # noqa: BLE001
+                msg = str(exc)
+                self._to_ui(lambda: self.searxng_note.setText(amp(msg)))
+            else:
+                self._to_ui(self._load_online)
+            finally:
+                self._to_ui(lambda: self.searxng_btn.setEnabled(True))
+        threading.Thread(target=work, name="research-searxng", daemon=True).start()
 
     # -- the list --------------------------------------------------------
     def on_refresh(self) -> None:
