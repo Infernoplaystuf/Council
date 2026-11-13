@@ -280,33 +280,51 @@ class ConnectionsActions:
 
     def pi_nodes(self) -> tuple:
         """``(usable, skipped)``: usable = (name, host url, model) of the
-        registered Pi nodes whose model is US-origin; skipped = (name, model)
-        of the rest. Only when remote nodes are enabled
-        (COUNCIL_REMOTE_NODES=1), the engine's own opt-in. A node's model
-        was used whatever it was — the real NodePrimus has only qwen2.5:3b,
-        so 'and my Pi nodes' ran extraction on it; local_models() already
-        offered only US-origin models for this PC. Origin is
+        other machines that may share the reading, with a US-origin model;
+        skipped = (name, model) of the rest. Two lists feed it:
+
+          * Machines & roles (council_core.node_routing): enabled machines
+            with a "Model for shared work", while routing is on — the
+            machine list "Add a PC" fills (2026-11-13);
+          * the Apothecary's registered nodes, only when remote nodes are
+            enabled (COUNCIL_REMOTE_NODES=1), the engine's older opt-in.
+
+        A machine in both is listed once (Machines & roles wins). A node's
+        model was used whatever it was — the real NodePrimus has only
+        qwen2.5:3b, so 'and my Pi nodes' ran extraction on it; local_models()
+        already offered only US-origin models for this PC. Origin is
         council_core.local_models', as everywhere else (_us_origin)."""
+        nodes: List[tuple] = []
+        try:
+            from council_core import node_routing as nr
+            routing = nr.load(self.vault_dir)
+            nodes += [(n.name, n.url, n.model) for n in nr.sharing_nodes(routing)]
+        except Exception:                                 # noqa: BLE001
+            pass
         try:
             import council_engine as ce
-            if not ce._remote_nodes_enabled():
-                return [], []
-            from council_core import apothecary as apoth
-            reg = apoth._ae.NodeRegistry(str(apoth.registry_path(self.vault_dir)))
-            nodes = [(n.name, f"http://{n.host}:{n.ollama_port}", n.model or n.active_model)
-                     for n in reg.list_nodes() if (n.model or n.active_model)]
-        except Exception:
-            return [], []
+            if ce._remote_nodes_enabled():
+                from council_core import apothecary as apoth
+                from council_core import node_routing as nr
+                reg = apoth._ae.NodeRegistry(str(apoth.registry_path(self.vault_dir)))
+                have = {nr.normalise_url(u) for _n, u, _m in nodes}
+                for n in reg.list_nodes():
+                    url = f"http://{n.host}:{n.ollama_port}"
+                    model = n.model or n.active_model
+                    if model and nr.normalise_url(url) not in have:
+                        nodes.append((n.name, url, model))
+        except Exception:                                 # noqa: BLE001
+            pass
         usable = [x for x in nodes if _us_origin(x[2])]
         skipped = [(n, m) for n, _u, m in nodes if not _us_origin(m)]
         return usable, skipped
 
     def pi_workers(self) -> List[tuple]:
-        """(name, host url, model) of the Pi nodes that may share the work."""
+        """(name, host url, model) of the other machines that may share the work."""
         return self.pi_nodes()[0]
 
     def pi_skipped(self) -> List[tuple]:
-        """(name, model) of the Pi nodes left out: not a US-origin model."""
+        """(name, model) of the machines left out: not a US-origin model."""
         return self.pi_nodes()[1]
 
     def read_text(self, model: str, use_pis: bool, on_progress, should_stop):
@@ -413,7 +431,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
                                   "names what is in it and how it connects. Without one, only "
                                   "labelled fields, tables, Ledgers and Collections are read.")
         grow.addWidget(self.model_box, 1)
-        self.pis_box = QCheckBox("and my Pi nodes")
+        self.pis_box = QCheckBox("and my other machines")
         grow.addWidget(self.pis_box)
         self.rebuild_btn = self._button(grow, "⟳ Build graph", self.on_build)
         self.stop_btn = self._button(grow, "Stop", self.on_stop_suggest)
@@ -1083,8 +1101,9 @@ class ConnectionsTab(ViewHelpers, QWidget):
                 "'ollama pull gemma3:12b') and reopen the tab.")
         self.pis_box.setEnabled(bool(pis))
         tip = (", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
-               "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
-               "and enable remote nodes (COUNCIL_REMOTE_NODES=1).")
+               "No other machine to share the work: add one in Machines & roles "
+               "(Council Map tab → Machines & roles… → Add a PC…), give it a "
+               "'Model for shared work', enable it and turn routing on.")
         if skipped:
             tip += "\n" + "\n".join(f"{n} skipped: {m} is not a US-origin model"
                                     for n, m in skipped)

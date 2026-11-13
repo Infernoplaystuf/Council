@@ -195,6 +195,11 @@ same list.
   template merged into one workbook, a sheet per copy plus All data and Not
   merged, kept as a Ledger for Analyze; the same label on two pages kept as
   'Page 2: Date'): `docs/handoff/ledger_merge_2026-11-11.md`.
+- Several PCs as Council machines: Machines & roles' "Add a PC…" (a setup
+  .bat for the other PC: Ollama on the network, a firewall rule for this PC
+  only), Test selected, Models on selected… (list, download on press, remove
+  after a yes), the "Model for shared work" Connections reads with:
+  `docs/handoff/multi_pc_nodes_2026-11-13.md`.
 - Council's own plugins (plugin.json shared with Typhon, kind "tab", all off
   until ticked in the Settings tab, guarded tab build, plugin data folder):
   `docs/handoff/app_plugins_2026-11-05.md`.
