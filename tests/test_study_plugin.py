@@ -87,7 +87,7 @@ def test_study_is_built_in_and_starts_off():
 
 
 def test_council_offers_the_services_the_plugin_names():
-    assert ap.SERVICES == ps.NAMES == {"sources", "models"}
+    assert ap.SERVICES == ps.NAMES == {"sources", "models", "mcp"}
 
 
 def test_a_context_gives_only_the_services_its_manifest_names():

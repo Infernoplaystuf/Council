@@ -83,6 +83,18 @@ class ServerSpec:
     fetch_tool: str = ""
     fetch_arg: str = ""
     bundled: bool = False
+    #: Extra HTTP headers. A credential is never written here as text: a
+    #: value may name an environment variable as ${NAME}, filled at connect
+    #: time (council_core.secret_source); a plain token is refused.
+    headers: Dict[str, str] = field(default_factory=dict)
+    #: Where the server's token is kept — "env:NAME" or "credential:NAME"
+    #: (Windows Credential Manager) — never the token itself. On HTTP it is
+    #: sent as `token_header: token_scheme <token>`; on stdio it is handed to
+    #: the server process as the environment variable `token_env`.
+    token_source: str = ""
+    token_header: str = "Authorization"
+    token_scheme: str = "Bearer"
+    token_env: str = ""
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -102,6 +114,8 @@ class ServerSpec:
         spec.args = [str(a) for a in (spec.args or [])]
         spec.env = {str(k): str(v) for k, v in (spec.env or {}).items()}
         spec.packages = [str(p) for p in (spec.packages or [])]
+        spec.headers = {str(k): str(v)
+                        for k, v in (spec.headers or {}).items()}
         spec.timeout = float(spec.timeout or 60.0)
         return spec
 
@@ -117,12 +131,17 @@ class ServerSpec:
         else:
             where = " ".join([self.command] + list(self.args))
         state = "" if self.enabled else "  [off]"
+        if self.token_source:
+            from . import secret_source
+            where += f"  (token: {secret_source.describe(self.token_source)})"
         return f"{self.name} — {where}{state}"
 
     def key(self) -> str:
         """Identity for the pool: anything that changes what runs."""
         return json.dumps([self.transport, self.command, self.args, self.env,
-                           self.cwd, self.url, self.allow_remote],
+                           self.cwd, self.url, self.allow_remote,
+                           self.headers, self.token_source, self.token_header,
+                           self.token_scheme, self.token_env],
                           sort_keys=True)
 
 
@@ -277,6 +296,23 @@ def save(servers: Sequence[ServerSpec], path: Optional[Path] = None) -> Path:
 
 def validate(spec: ServerSpec) -> str:
     """Why this spec cannot be used, or ""."""
+    from . import secret_source
+    for name, value in (spec.headers or {}).items():
+        if secret_source.looks_secret(name, value):
+            return (f"The {name} header holds a token as plain text. Keep the "
+                    f"token in an environment variable or the Windows "
+                    f"Credential Manager and set it as the server's token "
+                    f"source instead (or write ${{NAME}} in the header).")
+    problem = secret_source.valid_source(spec.token_source)
+    if problem:
+        return problem
+    if spec.token_source and spec.transport == "stdio" \
+            and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", spec.token_env or ""):
+        return ("A local (stdio) server gets its token as an environment "
+                "variable: name it (for example DYNDRITE_TOKEN).")
+    if spec.token_source and spec.transport == "http" \
+            and not re.match(r"^[A-Za-z0-9-]+$", spec.token_header or ""):
+        return "Name the header the token goes in (usually Authorization)."
     if not spec.name.strip():
         return "Give the server a name."
     if spec.transport not in TRANSPORTS:
@@ -472,15 +508,36 @@ def open_client(spec: ServerSpec, *, timeout: Optional[float] = None,
                 ) -> McpClient:
     """A connected client for `spec`. Raises McpError with a readable text."""
     limit = float(timeout or spec.timeout or 60.0)
+    from . import secret_source
+    try:
+        token = (secret_source.read(spec.token_source)
+                 if spec.token_source else "")
+        headers = {k: secret_source.fill(v)
+                   for k, v in (spec.headers or {}).items()}
+    except secret_source.SecretMissing as exc:
+        raise McpError(f"The server's token could not be read: {exc}") \
+            from None
     if spec.transport == "http":
+        if token:
+            scheme = (spec.token_scheme or "").strip()
+            headers[spec.token_header or "Authorization"] = \
+                f"{scheme} {token}" if scheme else token
         client = McpClient.http(spec.url.strip(),
                                 allow_remote=spec.allow_remote,
-                                timeout=limit)
+                                headers=headers or None, timeout=limit)
     else:
         command, args, env, cwd = expand(spec)
+        if token:
+            env = dict(env)
+            env[spec.token_env] = token
         client = McpClient.stdio(command, args, env=env, cwd=cwd or None,
                                  timeout=limit)
-    return client.connect(timeout=limit, should_stop=should_stop)
+    try:
+        return client.connect(timeout=limit, should_stop=should_stop)
+    except McpError as exc:
+        if token and token in str(exc):
+            raise McpError(secret_source.mask(str(exc), token)) from None
+        raise
 
 
 @dataclass

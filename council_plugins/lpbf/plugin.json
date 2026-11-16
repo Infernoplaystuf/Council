@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "council.lpbf",
+  "short": "lpbf",
+  "name": "LPBF / Dyndrite",
+  "version": "0.1.0",
+  "api": "0.1",
+  "kind": "tab",
+  "entry": "tab:build_tab",
+  "needs": ["models", "mcp"],
+  "network": "none",
+  "author": "The Council",
+  "description": "Plan laser powder bed fusion experiments: describe a study in plain English, get a checked design of experiments (factorial, fractional, Latin hypercube, central composite, Box-Behnken) with specimen IDs and a manifest, approve it with an audit trail, and bring measured results back in. Connects to Dyndrite's MCP server with Council holding the token; the model only proposes, never runs anything."
+}

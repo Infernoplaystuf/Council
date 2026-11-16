@@ -82,8 +82,9 @@ BUILTIN_PREFIX = "council."
 NETWORK = ("none",)
 #: Services a plugin may ask for in `needs` (council_core.plugin_services:
 #: "sources" = the user's documents as Connections reads them, "models" =
-#: the US-origin local models). Named here so listing imports nothing.
-SERVICES: frozenset = frozenset({"sources", "models"})
+#: the US-origin local models, "mcp" = MCP servers, Council as the client
+#: holding any token). Named here so listing imports nothing.
+SERVICES: frozenset = frozenset({"sources", "models", "mcp"})
 
 #: The fields a Council manifest may hold.
 REQUIRED = ("schema", "id", "short", "name", "version", "api", "kind",
@@ -95,7 +96,7 @@ FIELDS = frozenset(REQUIRED) | frozenset(OPTIONAL)
 
 #: The built-in plugins: folder names under council_plugins/. A plugin is
 #: built in because it is on this list, never because of where it sits.
-BUILTIN_PLUGINS: Sequence[str] = ("finance", "study")
+BUILTIN_PLUGINS: Sequence[str] = ("finance", "study", "lpbf")
 
 #: Where the built-in plugins ship (beside council_core in the source tree
 #: and in the bundle).
