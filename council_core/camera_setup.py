@@ -161,10 +161,18 @@ def guide(choice: str, python: Optional[str] = None,
                      "pip. Either the official Windows installer (it sets up "
                      "the camera's USB driver for you, but downloading it "
                      "needs an account requested from Prophesee), or the "
-                     "open-source OpenEB (no account, but you build it from "
-                     "source with Visual Studio 2022 — a few hours).",
+                     "open-source OpenEB (no account, but built from "
+                     "source — a few hours).",
                      url="https://docs.prophesee.ai/stable/installation/"
                          "index.html"),
+                Step("For OpenEB, the installer does every step for this "
+                     "Python: run install_openeb.bat beside an exported "
+                     "Typhon, or this command in the Council's folder. "
+                     "Install Git, CMake 3.26 and Visual Studio 2022 with "
+                     "\"Desktop development with C++\" first (it says which "
+                     "are missing); run it again after a stop and it "
+                     "carries on. Typhon then finds the build by itself.",
+                     command=f'"{python}" -m council_core.openeb_install'),
                 Step(f"This app runs Python {version}. The SDK's Python "
                      f"bindings are built for Python "
                      f"{', '.join(SDK_PYTHONS)} and will not import under "
@@ -175,8 +183,10 @@ def guide(choice: str, python: Optional[str] = None,
                         "Designer, or build it with --python.")),
                 Step("Install the Python packages the SDK's installation "
                      "guide lists, into this same Python."),
-                Step("Only if you built OpenEB — the installer does this for "
-                     "you: install the EVK4's USB driver. Windows has no "
+                Step("Only if you built OpenEB by hand — the official "
+                     "installer does this for you, and install_openeb.bat "
+                     "does it given wdi-simple.exe: install the EVK4's USB "
+                     "driver. Windows has no "
                      "built-in driver for it, and without one the camera is "
                      "simply not found, exactly as if it were unplugged. "
                      "Download wdi-simple.exe from the \"Camera Plugins\" "
@@ -297,9 +307,10 @@ def _evk_checks(sdk: Any) -> List[Check]:
         version = ".".join(str(v) for v in sys.version_info[:2])
         return [Check(
             "Metavision SDK installed", False, str(exc),
-            f"Install the Metavision SDK (step 1). If it IS installed, its "
+            f"Install the Metavision SDK (step 1, or step 2 for OpenEB). If it "
+            f"IS installed, its "
             f"Python bindings may be built for a different Python than "
-            f"{version} (step 2).")]
+            f"{version} (step 3).")]
     out.append(Check("Metavision SDK installed", True, "metavision_hal imports."))
     out.append(_cameras_check(backend, "prophesee"))
     return out
@@ -326,7 +337,7 @@ def _cameras_check(backend: Any, choice: str) -> Check:
            # empty list — so say which is likelier once it IS plugged in.
            "Plug the EVK4 into a USB 3 port and check again. If it is "
            "already plugged in, the USB driver is the likely cause: Windows "
-           "has no built-in driver for it (step 4).")
+           "has no built-in driver for it (step 5).")
     # None, not False: "no camera plugged in YET" is the normal state while
     # someone is working through the setup, and the software may be fine.
     return Check(CAMERAS_FOUND, None, "No camera found.", fix)
@@ -572,3 +583,46 @@ def families_label(chosen: Optional[Sequence[str]],
     if len(words) == 1:
         return words[0]
     return f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+# ======================================================================
+# Today's Typhon: the built-in families, ticked like a plugin project's
+# ======================================================================
+def builtin_families(held_keys: Optional[Callable[[], Sequence[str]]] = None
+                     ) -> List[Family]:
+    """Basler and Prophesee EVK4 as Families, for today's Typhon's set-up
+    wizard (Andy, 16 November 2026: a window runs a Basler beside an EVK4,
+    so the set-up must not make you choose one). The same guides and
+    checks the single-choice wizard showed; the Basler keeps its scan page
+    (council_core.basler_scan), told which cameras the app holds open."""
+    def scan(held: Mapping[str, str]) -> Any:
+        from . import basler_scan
+
+        keys = list(held or {}) or list(held_keys() if held_keys else [])
+        return basler_scan.scan(held_keys=keys)
+
+    out = []
+    for key in CHOICES:
+        words = guide(key)
+        out.append(Family(
+            key=key, plugin=f"builtin.{key}", label=label(key),
+            title=words.title, summary=words.summary,
+            guide=(lambda python, k=key: guide(k, python)),
+            check=(lambda k=key: check(k)),
+            scan=scan if key == "basler" else None,
+            scan_label="Scan Basler cameras" if key == "basler" else "",
+            scan_tip=("Every Basler camera this PC can see, and whether each "
+                      "one will run: interface, drivers, link, pixel format, "
+                      "trigger mode, and a short test grab."
+                      if key == "basler" else "")))
+    return out
+
+
+def builtin_choices(path: Any) -> Optional[List[str]]:
+    """The built-in camera kinds a set-up ticked (basler, prophesee), in
+    order; None when it was never set up, or ticked none of them."""
+    families = load_families(path)
+    if families is None:
+        return None
+    known = [f for f in families if f in CHOICES]
+    return known or None

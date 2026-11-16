@@ -431,11 +431,13 @@ def list_cameras() -> Dict[str, Any]:
 
     host = _plugin_host()
     if host is None:
-        choice = current_choice()
-        chosen = _backends_for(choice)
+        # Every kind the set-up ticked (a Basler beside an EVK4, Andy 16
+        # November); a set-up from before that ticked one.
+        kinds = _current_kinds()
+        chosen = _backends_for(kinds)
         found = cameras.discover(chosen)
         if chosen is not None and not any(
-                c.backend == choice for c in found.cameras):
+                c.backend in kinds for c in found.cameras):
             # Set up for a camera this PC has none of (its SDK missing, or
             # none plugged in): look for every kind rather than show only
             # the simulated ones. The Council PC's Prophesee set-up, copied
@@ -443,9 +445,10 @@ def list_cameras() -> Dict[str, Any]:
             every = cameras.discover(None)
             if any(not c.backend == "simulated" for c in every.cameras):
                 every.notes.insert(0, (
-                    f"This app is set up for {choice.title()}, but none was "
+                    f"This app is set up for "
+                    f"{_kinds_words(kinds)}, but none was "
                     f"found, so every kind of camera was searched. Click "
-                    f"Camera setup to choose the camera this PC has."))
+                    f"Camera setup to tick the cameras this PC has."))
                 found = every
     else:
         # A "Typhon (plugins)" project: the camera plugins it runs, less
@@ -486,12 +489,18 @@ def _scan_context(host: Any) -> List[str]:
             out.append("  plugin Typhon: the camera plugins it runs were "
                        "searched")
         else:
-            choice = current_choice()
-            out.append("  set up for: " + {
-                "basler": "Basler (Basler and simulated cameras searched)",
-                "prophesee": "Prophesee (Basler cameras are NOT searched; "
-                             "run Camera setup and pick Basler)",
-            }.get(choice or "", "no camera chosen (every backend searched)"))
+            kinds = _current_kinds() or []
+            if not kinds:
+                said = "no camera chosen (every backend searched)"
+            elif kinds == ["prophesee"]:
+                said = ("Prophesee (Basler cameras are NOT searched; "
+                        "run Camera setup and tick Basler)")
+            elif kinds == ["basler"]:
+                said = "Basler (Basler and simulated cameras searched)"
+            else:
+                said = (f"{_kinds_words(kinds)} (those and the simulated "
+                        f"cameras searched)")
+            out.append("  set up for: " + said)
         import os
         from council_core import pylon_env
         path = os.environ.get(pylon_env.ENV, "")
@@ -571,8 +580,11 @@ def _console(lines) -> None:
         pass
 
 
-def _backends_for(choice: Optional[str]):
+def _backends_for(choice: Any):
     """The backends to search for a set-up app, or None for all of them.
+
+    `choice` is one kind ("basler", "prophesee") or a list of the kinds the
+    set-up ticked (a Basler beside an EVK4, Andy 16 November 2026).
 
     An app set up for a Basler has no business reporting that the Metavision
     SDK is missing — that note is noise to someone who will never plug in an
@@ -581,11 +593,36 @@ def _backends_for(choice: Optional[str]):
     """
     from council_core import cameras
 
-    if choice == "basler":
-        return [cameras.BaslerBackend(), cameras.SyntheticBackend()]
-    if choice == "prophesee":
-        return [cameras.EvkBackend(), cameras.SyntheticBackend()]
-    return None
+    kinds = [choice] if isinstance(choice, str) else list(choice or [])
+    out = []
+    if "basler" in kinds:
+        out.append(cameras.BaslerBackend())
+    if "prophesee" in kinds:
+        out.append(cameras.EvkBackend())
+    if not out:
+        return None
+    return out + [cameras.SyntheticBackend()]
+
+
+def _current_kinds() -> Optional[List[str]]:
+    """The built-in camera kinds today's Typhon is set up for, in order
+    (camera_setup.json's ticked families, or its one camera), or None."""
+    from council_core import camera_setup
+
+    path = _LIVE.setup_path
+    kinds = camera_setup.builtin_choices(path) if path is not None else None
+    if not kinds:
+        choice = current_choice()
+        kinds = [choice] if choice else None
+    return kinds
+
+
+def _kinds_words(kinds: Any) -> str:
+    """"Prophesee", "Basler and Prophesee": the kinds, as the notes say them."""
+    words = [str(k).title() for k in kinds or []]
+    if len(words) <= 1:
+        return "".join(words)
+    return f"{', '.join(words[:-1])} and {words[-1]}"
 
 
 # ======================================================================
@@ -4246,30 +4283,23 @@ def setup(parent: Any = None) -> Dict[str, Any]:
         window = parent or QApplication.activeWindow()
         title = window.windowTitle() if window is not None else ""
         host = _plugin_host()
+        # Tick boxes, not one choice. Today's Typhon offers its built-in
+        # camera kinds (a window runs a Basler beside an EVK4, Andy 16
+        # November 2026); a "Typhon (plugins)" project one check box per
+        # camera plugin with a set-up, each bringing its guide, checks and
+        # scan (plugin design 2.4 item 15).
+        families = (camera_setup.builtin_families() if host is None
+                    else host.camera_families())
         try:
-            if host is None:
-                chosen = camera_wizard.run_wizard(window, path,
-                                                  app_name=title)
-            else:
-                # A "Typhon (plugins)" project ticks camera families: one
-                # check box per camera plugin with a set-up, each bringing
-                # its guide, checks and scan (plugin design 2.4 item 15).
-                families = host.camera_families()
-                ticked = camera_wizard.run_families_wizard(
-                    window, path, families, app_name=title,
-                    held=_held_names)
+            ticked = camera_wizard.run_families_wizard(
+                window, path, families, app_name=title, held=_held_names)
         except getattr(camera_wizard, "NoQtApplication", ()) as exc:
-            chosen = None
             said = f"Camera setup skipped — {exc}."
         else:
-            if host is None:
-                said = (f"Set up for {camera_setup.label(chosen)}." if chosen
-                        else "Camera setup cancelled — nothing changed.")
-            else:
-                said = (f"Set up for "
-                        f"{camera_setup.families_label(ticked, families)}."
-                        if ticked else
-                        "Camera setup cancelled — nothing changed.")
+            said = (f"Set up for "
+                    f"{camera_setup.families_label(ticked, families)}."
+                    if ticked else
+                    "Camera setup cancelled — nothing changed.")
     listed = list_cameras()
     listed["summary"] = f"{said} {listed['summary']}"
     return listed

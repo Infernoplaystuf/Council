@@ -1727,6 +1727,10 @@ class EvkBackend(Backend):
     def sdk(self) -> Any:
         if self._sdk is not None:
             return self._sdk
+        # An OpenEB build made by install_openeb.bat is found without the
+        # user editing PATH and PYTHONPATH (council_core.openeb_env).
+        from . import openeb_env
+        openeb_env.prepare()
         try:
             import metavision_hal
         except ImportError as exc:

@@ -307,7 +307,10 @@ def test_metavision_with_nothing_plugged_in():
     # "driver" passed with that sentence removed, because the next one still
     # mentions a driver in passing.
     assert "USB driver is the likely cause" in found.fix
-    assert "step 4" in found.fix
+    assert "step 5" in found.fix
+    # ... and step 5 of the guide IS the driver (the OpenEB installer step
+    # added before it moved the numbers once already).
+    assert "USB driver" in cs.guide("prophesee").steps[4].text
 
 
 def test_an_evk4_that_enumerates_is_found():
