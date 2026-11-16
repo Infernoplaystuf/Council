@@ -146,6 +146,7 @@ write one file over another.
 """
 from __future__ import annotations
 
+import contextlib
 import itertools
 import threading
 import time
@@ -341,6 +342,16 @@ class _Live:
         #: plugin design 3.6) while the run lasts, else None. Today's
         #: Typhon never has one.
         self.trigger_slot: Any = None
+        #: The latest run of SEVERAL cameras (one Start for every connected
+        #: camera, `_start_rig`): its top folder, name, each camera's folder
+        #: and whether it is still capturing — or None. About the window:
+        #: the slider follows the active camera's folder of it, and a Start
+        #: given that folder saves beside the run again, not inside it.
+        self.rig_run: Optional[Dict[str, Any]] = None
+        #: The small live pictures of the cameras that are not the active
+        #: one (council_qt.widgets.camera_tiles), when the app has a live
+        #: view. About the app, like the reviewer.
+        self.tiles: Any = None
 
     def clear(self) -> None:
         self.device = None
@@ -400,6 +411,9 @@ _RIG = _camera_rig.Rig(_Live)
 _LIVE = _camera_rig.LiveView(_RIG)
 _LOCK = threading.Lock()
 _STAMPS = itertools.count(1)
+#: How deep the UI thread is in work on a camera that is not the active one
+#: (_on_slot): what it announces is not the active camera's news.
+_ASIDE = {"depth": 0}
 
 
 # ======================================================================
@@ -727,6 +741,71 @@ def _chosen(which: Any) -> Any:
     raise RuntimeError(f"{raw!r} is not one of the cameras found")
 
 
+def _open_in_slot(host: Any, info: Any) -> Any:
+    """Open camera `info` for the active slot: through the camera layer
+    (today's Typhon), or a "Typhon (plugins)" project's camera plugin."""
+    from council_core import cameras
+
+    if host is None:
+        try:
+            return cameras.open_camera(info)
+        except Exception as exc:
+            _console([f"could not open {info.label}: {exc}"])
+            raise
+    # A "Typhon (plugins)" project opens through the camera plugin of the
+    # camera's family, which confirms onto the slot what the camera can do
+    # (plugin design 3.4). A camera another slot of this window holds is
+    # refused before anything opens (connect): a second open fails on real
+    # hardware (the emulator allows it).
+    slot = _RIG.active
+    other = _RIG.holding(info)
+    if other is not None and other is not slot:
+        raise RuntimeError(f"that camera is in use as {other.name} — "
+                           f"disconnect it there first")
+    try:
+        return host.open_camera(info, camera=slot.name)
+    except Exception as exc:
+        _console([f"could not open {info.label}: {exc}"])
+        raise
+
+
+def _another_slot() -> Any:
+    """Make an empty camera slot the active one, for a second (third, ...)
+    camera; returns the slot that was active, to go back to if the camera
+    does not open (_back_to). Refused while any camera is recording or
+    busy with a change, and past camera_rig.MAX_SLOTS cameras."""
+    for slot in _RIG.connected():
+        if slot.capturing:
+            raise RuntimeError(f"{slot.name} is capturing — Stop before "
+                               f"connecting another camera")
+        if slot.job is not None:
+            raise RuntimeError(f"{slot.name} is busy with a change — wait "
+                               f"for it, then connect")
+    before = _RIG.active
+    empty = next((s for s in _RIG.slots if s.device is None), None)
+    if empty is None:
+        if len(_RIG) >= _camera_rig.MAX_SLOTS:
+            raise RuntimeError(f"Typhon runs at most "
+                               f"{_camera_rig.MAX_SLOTS} cameras at once — "
+                               f"disconnect one first")
+        empty = _RIG.add_slot()
+    _RIG.select(empty.name)
+    return before
+
+
+def _back_to(before: Any) -> None:
+    """A second camera did not open: the camera that was active is again,
+    and the empty slot made for the new one goes."""
+    tried = _RIG.active
+    if before in _RIG.slots:
+        _RIG.select(before.name)
+    if tried is not _RIG.active and tried.device is None:
+        try:
+            _RIG.remove_slot(tried.name)
+        except ValueError:
+            pass
+
+
 def connect(which: Any) -> Dict[str, Any]:
     """Open the chosen camera and report what it is."""
     from council_core import cameras, capture
@@ -737,31 +816,22 @@ def connect(which: Any) -> Dict[str, Any]:
     host = _plugin_host()
     named = ""
     with _LOCK:
-        if _LIVE.device is not None:
-            raise RuntimeError("a camera is already open — disconnect first")
         info = _chosen(which)
-        if host is None:
-            try:
-                device = cameras.open_camera(info)
-            except Exception as exc:
-                _console([f"could not open {info.label}: {exc}"])
-                raise
-        else:
-            # A "Typhon (plugins)" project opens through the camera plugin
-            # of the camera's family, which confirms onto the slot what the
-            # camera can do (plugin design 3.4). A camera another slot of
-            # this window holds is refused before anything opens: a second
-            # open fails on real hardware (the emulator allows it).
-            slot = _RIG.active
-            other = _RIG.holding(info)
-            if other is not None and other is not slot:
-                raise RuntimeError(f"that camera is in use as {other.name} — "
-                                   f"disconnect it there first")
-            try:
-                device = host.open_camera(info, camera=slot.name)
-            except Exception as exc:
-                _console([f"could not open {info.label}: {exc}"])
-                raise
+        held = _RIG.holding(info)
+        if held is not None:
+            raise RuntimeError(f"that camera is already open — in use as "
+                               f"{held.name}; pick another one in the list, "
+                               f"or disconnect it first")
+        # ANOTHER CAMERA (Andy, 16 November 2026): with one already open,
+        # this one goes into a slot of its own and becomes the active one;
+        # the first keeps running. Refused while a run is recording.
+        before = _another_slot() if _LIVE.device is not None else None
+        try:
+            device = _open_in_slot(host, info)
+        except BaseException:
+            if before is not None:
+                _back_to(before)
+            raise
         # What the camera says it is once open (an event camera's sensor is
         # read then, never at discovery — cameras.identify): the identity
         # presets and the run's camera record use.
@@ -805,6 +875,14 @@ def connect(which: Any) -> Dict[str, Any]:
         # Its name in the rig could not be kept (camera_rig.json damaged,
         # or not writable): said, never in the way of the camera.
         said += f" Note: {named}."
+    others = [s.name for s in _RIG.connected() if s is not _RIG.active]
+    if others:
+        # Several cameras: which one this is, and what Start now does.
+        said += (f" Connected as {_RIG.active.name}, beside "
+                 f"{', '.join(others)}: Start records every connected "
+                 f"camera; the dropdown under the picture shows each "
+                 f"one, or all of them (Multicam).")
+    _point_slider()
     _console([said])
     return {
         "summary": said,
@@ -856,15 +934,54 @@ def disconnect() -> Dict[str, Any]:
                 pass
         session.close()
         _announce({"what": "disconnected", "summary": "Disconnected."})
+    shown = _show_another()
+    if shown:
+        said = f"Disconnected. {shown}"
+        return {"summary": said, "status": said}
     return {"summary": "Disconnected.", "status": ""}
+
+
+def _show_another() -> str:
+    """After the active camera was disconnected while others stay open:
+    the first of them becomes the active one, and the views are told as
+    for a Connect. The emptied slot stays, empty, for the next camera
+    (_another_slot takes it). With no camera left, the first slot is the
+    active one again, as in a new window. "" when no other camera is
+    open."""
+    others = _RIG.connected()
+    if not others:
+        if _RIG.slots and _RIG.active is not _RIG.slots[0]:
+            _RIG.select(_RIG.slots[0].name)
+        return ""
+    _RIG.select(others[0].name)
+    return _shown_now()
+
+
+def _shown_now() -> str:
+    """Tell every view the active camera changed — the settings tabs, the
+    preset box and a settings window read it again, as after Connect — and
+    point the slider at its folder; returns what to say."""
+    _LIVE.reported = False
+    reviewer = _LIVE.reviewer
+    prep = getattr(reviewer, "prep", None)
+    if prep is not None and callable(getattr(prep, "reset", None)):
+        prep.reset()                  # the next camera may use other bits
+    label = getattr(_LIVE.info, "label", "") or "the camera"
+    said = f"Showing {_RIG.active.name}: {label}."
+    _point_slider()
+    _announce({"what": "connected", "summary": said})
+    return said
 
 
 def shutdown() -> Dict[str, Any]:
     """What `on_close` should call.
 
     A grab thread that outlives its window crashes the application on exit, so
-    this joins it rather than merely dropping the reference.
+    this joins it rather than merely dropping the reference — every camera's,
+    when the window runs several.
     """
+    while len(_RIG.connected()) > 1:
+        disconnect()
     return disconnect()
 
 
@@ -951,6 +1068,20 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     saved and shown. The run's records and frames CSV say the factor and
     how it was made.
     """
+    folder = _rig_root(folder)
+    if len(_RIG.connected()) > 1:
+        # SEVERAL CAMERAS: one Start records every one (_start_rig).
+        return _start_rig(folder, exposure, gain, frame_rate)
+    return _start_one(folder, exposure, gain, frame_rate)
+
+
+def _start_one(folder: Any, exposure: Any = "", gain: Any = "",
+               frame_rate: Any = None, *, base: Optional[str] = None,
+               speed: bool = True, budget: int = 0) -> Dict[str, Any]:
+    """`start` for the active camera alone (see start). For a rig Start
+    (_start_rig): `base`, the run's name already reserved for the rig;
+    `speed` False, the folder timed for every camera at once; `budget`,
+    this camera's share of the save budget in bytes (0: all of it)."""
     from council_core import capture
 
     session = _require_session()
@@ -974,7 +1105,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         raise RuntimeError(problem)
     # Every run-hook plugin's check_start, before anything is changed,
     # stopped or reserved — a reason refuses this Start.
-    base = time.strftime("%Y%m%d_%H%M%S")
+    given = base
+    base = base or time.strftime("%Y%m%d_%H%M%S")
     if host is not None:
         host.register_run_files()
         if setup.triggered and host.trigger_plugin() is None:
@@ -1028,13 +1160,14 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     # Start fail after the live view had stopped (measured).
     # Before anything is written: how fast this folder saves, against the
     # frame size (once per folder per session; big frames only).
-    speed_warning = _speed_check(out, device, rate)
+    speed_warning = _speed_check(out, device, rate) if speed else ""
     try:
-        run, claim = (_claim_run(out) if host is None else
-                      _claim_run(out, base))
+        run, claim = (_claim_run(out, given) if host is None else
+                      _claim_run(out, given or base))
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
     recorder = capture.run_recorder(out, run, claim)
+    recorder.budget_bytes = int(budget or 0)
     armed = None
     trig = None
     active = None
@@ -1254,6 +1387,14 @@ def stop() -> Dict[str, Any]:
     carries on in the background and the status line counts it down, so a
     slow disk never freezes the window.
     """
+    if _rig_capturing():
+        # A run of several cameras ends for every one of them (_stop_rig).
+        return _stop_rig()
+    return _stop_one()
+
+
+def _stop_one() -> Dict[str, Any]:
+    """`stop` for the active camera alone (see stop)."""
     session = _LIVE.session
     if session is None:
         return {"summary": "Not capturing."}
@@ -1368,6 +1509,481 @@ def _close_books(device: Any, plug: Any, trig: Any, armed: Any) -> None:
 
 
 # ======================================================================
+# Several cameras in one window (Andy, 16 November 2026)
+# ======================================================================
+# Connect opens a second (third, fourth) camera into a slot of its own of
+# the rig and makes it the active one; the others keep streaming, shown as
+# small tiles (attach). Every one-camera function here acts on the ACTIVE
+# camera through _LIVE; work on another camera runs that same code with
+# that camera made active for the moment (_on_slot), on the UI thread, so
+# nothing else sees the switch — except a camera change on a worker
+# (_Job), and so nothing is switched while one runs.
+#
+# Each camera keeps its own capture set-up: a Basler triggered from its
+# line saves only what it is triggered for, while an EVK4 beside it records
+# all the time. One Start records every connected camera, each in its own
+# mode; one Stop ends them all. A run of several cameras goes in
+# <folder>/<run>/<camera>/ (multi-camera design 2.6), each camera folder
+# laid out exactly as a one-camera run, with <run>_rig.json at the top
+# (written at Start) and <run>_rig_end.json (at Stop). A one-camera run is
+# saved exactly as before.
+
+#: Between the event cameras' recordings opening and the frame cameras
+#: starting, and between the frame cameras stopping and the event cameras'
+#: recordings closing (multi-camera design 2.3: every exposure falls inside
+#: the event cameras' files, with a quiet stretch at each end).
+RIG_GAP_SECONDS = 0.1
+
+#: The least save budget one camera of several is given.
+RIG_MIN_BUDGET = 256 << 20
+
+RIG_RECORD_SUFFIX = "_rig.json"
+RIG_END_SUFFIX = "_rig_end.json"
+
+
+@contextlib.contextmanager
+def _on_slot(slot: Any):
+    """Run the one-camera code on `slot`: it is the active camera for the
+    moment, and what that code announces is not said to the views, which
+    show the active camera. The active camera comes back afterwards."""
+    before = _RIG.active
+    if slot is before:
+        yield slot
+        return
+    _RIG.active = slot
+    _ASIDE["depth"] += 1
+    try:
+        yield slot
+    finally:
+        _ASIDE["depth"] -= 1
+        _RIG.active = before if before in _RIG.slots else slot
+
+
+def _streams_once(slot: Any) -> bool:
+    """An event camera's (an EVK4's) stream: started once, never restarted;
+    its recording opens and closes inside it."""
+    return not getattr(slot.device, "restartable", True)
+
+
+def _folder_key(path: Any) -> str:
+    import os
+
+    text = str(path or "").strip().strip('"')
+    return os.path.normcase(os.path.abspath(text)) if text else ""
+
+
+def _rig_folders() -> Dict[str, str]:
+    """The latest rig run's folders by key: its top folder, each camera's,
+    and the folder Start was given — each mapped to that last."""
+    rr = _LIVE.rig_run
+    if not rr:
+        return {}
+    root = str(rr["root"])
+    keys = [root, str(rr["top"])] + [str(f) for f in rr["folders"].values()]
+    return {_folder_key(k): root for k in keys}
+
+
+def _rig_root(folder: Any) -> Any:
+    """The folder Start saves into. After a run of several cameras the
+    slider shows a camera's folder inside that run; a Start given that
+    folder (the same box) saves beside the run again, not inside it."""
+    return _rig_folders().get(_folder_key(folder), folder)
+
+
+def _point_slider() -> None:
+    """The slider shows the active camera's folder of the latest run of
+    several cameras (multi-camera design 2.7), or that run's capture folder
+    for a camera that was not in it — only while the box shows one of that
+    run's folders: a folder the user chose is left alone."""
+    rr = _LIVE.rig_run
+    port = getattr(_LIVE.reviewer, "folder", None)
+    if rr is None or port is None:
+        return
+    try:
+        now = port.get()
+    except Exception:                                     # noqa: BLE001
+        return
+    if _folder_key(now) not in _rig_folders():
+        return
+    want = str(rr["folders"].get(_RIG.active.name) or rr["root"])
+    if _folder_key(now) != _folder_key(want):
+        try:
+            port.set(want)
+        except Exception:                                 # noqa: BLE001
+            pass
+
+
+def _select_camera(name: str) -> Dict[str, Any]:
+    """Show camera `name` in the main view (a click on its tile): the
+    settings tabs, the boxes, the preset box, the slider and Capture now
+    follow it. Its recording, if any, carries on as it was."""
+    slot = _RIG.slot(str(name))
+    if slot is _RIG.active:
+        return {"summary": f"{slot.name} is already shown."}
+    if slot.device is None:
+        raise RuntimeError(f"{slot.name} has no camera open")
+    if _LIVE.job is not None:
+        raise RuntimeError(f"{_RIG.active.name} is busy with a change — "
+                           f"wait for it, then switch")
+    _RIG.select(slot.name)
+    said = _shown_now()
+    _capture_button_state()
+    return {"summary": said}
+
+
+def _rig_capturing() -> bool:
+    rr = _LIVE.rig_run
+    return bool(rr and rr.get("capturing"))
+
+
+def _claim_rig_run(root: Path, base: str) -> str:
+    """Reserve a run of several cameras: its folder <root>/<run>, made with
+    exclusive creation (a folder already there, whoever made it, is taken
+    and the next name tried), its name not that of any run already in
+    `root` (capture.taken_runs). Raises OSError when it cannot."""
+    from council_core import capture
+
+    root.mkdir(parents=True, exist_ok=True)
+    taken = capture.taken_runs(root)
+    run = base
+    for n in range(2, capture.RESERVE_TRIES + 2):
+        if run not in taken:
+            try:
+                (root / run).mkdir()
+                return run
+            except FileExistsError:
+                pass
+        run = f"{base}_{n}"
+    raise OSError(f"no free run name in {root} after "
+                  f"{capture.RESERVE_TRIES} tries")
+
+
+def _shared_budgets(slots: List[Any]) -> Dict[str, int]:
+    """Each camera's share of the one save budget (capture.
+    WRITE_BUDGET_BYTES), by the size of its frames — a 65 MB Basler frame
+    needs far more room to wait in than an EVK4's picture — and never
+    less than RIG_MIN_BUDGET (or an equal share, if that is less)."""
+    from council_core import capture
+
+    total = int(capture.WRITE_BUDGET_BYTES)
+    weights = {s.name: max(_frame_bytes(s.device), 1 << 20) for s in slots}
+    whole = sum(weights.values()) or 1
+    least = min(RIG_MIN_BUDGET, total // max(1, len(slots)))
+    return {name: max(least, total * w // whole)
+            for name, w in weights.items()}
+
+
+def _rig_speed_check(root: Path, slots: List[Any]) -> str:
+    """save_speed's check before a run of several cameras: the folder timed
+    once, against what every camera sends together (each one's frame size
+    times its live rate). Said in the Command Prompt; returns a warning
+    for the summary when they send more than the folder takes, else "".
+    Never raises."""
+    import os
+
+    try:
+        from council_core import capture, save_speed
+
+        if os.environ.get(save_speed.OFF_ENV, "").strip() not in ("", "0"):
+            return ""
+        biggest, together = 0, 0.0
+        for slot in slots:
+            size = _frame_bytes(slot.device)
+            session = slot.session
+            rate = (float(session.stats().rate or 0.0)
+                    if session is not None and session.running else 0.0)
+            biggest = max(biggest, size)
+            together += size * rate
+        if biggest < SPEED_CHECK_MIN_BYTES or _on_network_share(root):
+            return ""
+        result = (save_speed.measured(root)
+                  or save_speed.measure(root, SPEED_CHECK_MB))
+        lines = save_speed.words(result)
+        mb_s = float(result.get("mb_s") or 0.0)
+        warning = ""
+        if together > 0 and 0 < mb_s * 1e6 < together:
+            fills = capture.WRITE_BUDGET_BYTES / (together - mb_s * 1e6)
+            warning = (f"The cameras together send about "
+                       f"{together / 1e6:,.0f} MB/s and this folder takes "
+                       f"about {mb_s:,.0f} MB/s: the save queue fills in "
+                       f"about {fills:,.1f} s, then frames are NOT saved.")
+            lines.append(warning)
+        _console(lines)
+        return warning
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+def _start_rig(folder: Any, exposure: Any, gain: Any,
+               frame_rate: Any) -> Dict[str, Any]:
+    """One Start for every connected camera, each in its own capture
+    set-up, into <folder>/<run>/<camera>/. The event cameras' recordings
+    open first and the frame cameras start RIG_GAP_SECONDS later, so every
+    exposure falls inside them (multi-camera design 2.3). The boxes beside
+    Start are the active camera's: the others keep their own settings. A
+    camera that refuses stops the ones already started, and Start is
+    refused, saying which camera and why."""
+    where = str(folder or "").strip().strip('"')
+    if not where:
+        raise RuntimeError("choose a folder to save frames into first")
+    root = Path(where)
+    if root.exists() and not root.is_dir():
+        raise RuntimeError(f"{root} is a file, not a folder")
+    slots = _RIG.connected()
+    for slot in slots:
+        if slot.capturing:
+            raise RuntimeError(f"already capturing ({slot.name}) — stop "
+                               f"first")
+        if slot.job is not None:
+            raise RuntimeError(f"{slot.name} is busy with a change — wait "
+                               f"for it, then Start")
+    # Event cameras first: their files open before any exposure.
+    order = ([s for s in slots if _streams_once(s)]
+             + [s for s in slots if not _streams_once(s)])
+    active = _RIG.active
+    speed_warning = _rig_speed_check(root, order)
+    try:
+        run = _claim_rig_run(root, time.strftime("%Y%m%d_%H%M%S"))
+    except OSError as exc:
+        raise RuntimeError(f"cannot save frames into {root}: {exc}") from exc
+    top = root / run
+    budgets = _shared_budgets(order)
+    started: List[Any] = []
+    said: List[str] = []
+    for n, slot in enumerate(order):
+        if n and _streams_once(order[n - 1]) and not _streams_once(slot):
+            time.sleep(RIG_GAP_SECONDS)
+        mine = slot is active
+        try:
+            with _on_slot(slot):
+                out = _start_one(top / slot.name,
+                                 exposure if mine else "",
+                                 gain if mine else "",
+                                 frame_rate if mine else None,
+                                 base=run, speed=False,
+                                 budget=budgets[slot.name])
+        except Exception as exc:
+            undone = []
+            for done in reversed(started):
+                try:
+                    with _on_slot(done):
+                        _stop_one()
+                    undone.append(done.name)
+                except Exception:                         # noqa: BLE001
+                    pass
+            note = (f" {', '.join(undone)} started and "
+                    f"{'was' if len(undone) == 1 else 'were'} stopped "
+                    f"again; what {'it' if len(undone) == 1 else 'they'} "
+                    f"saved is in {top}." if undone else "")
+            raise RuntimeError(f"Start refused — {slot.name}: "
+                               f"{_said(exc)}.{note}") from exc
+        started.append(slot)
+        detail = str(out.get("summary") or "")
+        head = f"Capturing into {top / slot.name}."
+        detail = detail[len(head):].strip() if detail.startswith(head) \
+            else detail
+        said.append(f"{slot.name} ({_mode_of(slot)})"
+                    + (f": {detail}" if detail else ""))
+    _LIVE.rig_run = {"root": root, "run": run, "top": top,
+                     "folders": {s.name: top / s.name for s in order},
+                     "order": [s.name for s in order], "capturing": True}
+    record_note = _write_rig_record(top, run, order, budgets)
+    _point_slider()
+    summary = (f"Capturing {len(order)} cameras into {top}. "
+               + " ".join(x if x.endswith(".") else x + "." for x in said))
+    if record_note:
+        summary += f" {record_note}"
+    if speed_warning:
+        summary += f" {speed_warning}"
+    _capture_button_state()
+    _console([summary])
+    return {"summary": summary, "folder": str(top), "run": run, "raw": "",
+            "record": str(top / f"{run}{RIG_RECORD_SUFFIX}")}
+
+
+def _mode_of(slot: Any) -> str:
+    """A camera's capture set-up in a few words: "continuous",
+    "Triggered: snapshot · Line1", or "event camera, records everything"."""
+    setup = getattr(slot.device, "capture", None)
+    if setup is None:
+        return "event camera, records every event"
+    try:
+        return setup.short() if setup.triggered else "continuous"
+    except Exception:                                     # noqa: BLE001
+        return "continuous"
+
+
+def _write_rig_record(top: Path, run: str, order: List[Any],
+                      budgets: Dict[str, int]) -> str:
+    """<run>_rig.json at the run's top, written once: every camera, its
+    folder, its capture set-up and the order they started in. "" when
+    written, else why not (said; never a reason to stop the run)."""
+    from council_core import camera_record
+
+    cameras_ = []
+    for slot in order:
+        info = slot.info
+        setup = getattr(slot.device, "capture", None)
+        cameras_.append({
+            "name": slot.name,
+            "label": str(getattr(info, "label", "") or ""),
+            "kind": str(getattr(info, "kind", "") or ""),
+            "backend": str(getattr(info, "backend", "") or ""),
+            "model": str(getattr(info, "model", "") or ""),
+            "serial": str(getattr(info, "serial", "") or ""),
+            "folder": slot.name,
+            "run": str(slot.run or run),
+            "camera_record": f"{slot.name}/{slot.run or run}_camera.json",
+            "capture": (dict(setup.as_record()) if setup is not None
+                        else None),
+            "records_every_event": setup is None,
+            "save_budget_bytes": int(budgets.get(slot.name, 0))})
+    record = {"kind": "typhon_rig_run", "version": 1, "run": run,
+              "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+              "cameras": cameras_,
+              "start_order": [s.name for s in order],
+              "clock": ("the PC's clock only: without a trigger cable the "
+                        "cameras' recordings line up to milliseconds at "
+                        "best"),
+              "host": _host_name(), "app": _app_identity(),
+              "software": _software()}
+    try:
+        camera_record.write_once(top / f"{run}{RIG_RECORD_SUFFIX}", record)
+        return ""
+    except Exception as exc:                              # noqa: BLE001
+        return (f"The run's rig record was not written ({type(exc).__name__}"
+                f": {exc}); every camera's own record is in its folder.")
+
+
+def _stop_rig() -> Dict[str, Any]:
+    """One Stop for a run of several cameras: the frame cameras first, the
+    event cameras' recordings RIG_GAP_SECONDS later (their files hold the
+    last exposure), then <run>_rig_end.json."""
+    rr = _LIVE.rig_run
+    rr["capturing"] = False
+    capturing = [s for s in _RIG.connected() if s.capturing]
+    order = ([s for s in capturing if not _streams_once(s)]
+             + [s for s in capturing if _streams_once(s)])
+    lines: List[str] = []
+    status = ""
+    for n, slot in enumerate(order):
+        if n and not _streams_once(order[n - 1]) and _streams_once(slot):
+            time.sleep(RIG_GAP_SECONDS)
+        with _on_slot(slot):
+            out = _stop_one()
+        lines.append(f"{slot.name}: {out.get('summary', '')}")
+        if slot is _RIG.active:
+            status = str(out.get("status") or "")
+    note = _write_rig_end(rr)
+    if not order:
+        summary = "Not capturing — every camera of the run had ended."
+    else:
+        summary = (f"Stopped {len(order)} camera"
+                   f"{'' if len(order) == 1 else 's'}. " + " ".join(lines))
+    if note:
+        summary += f" {note}"
+    _capture_button_state()
+    return {"summary": summary, "status": status or summary}
+
+
+def _write_rig_end(rr: Dict[str, Any]) -> str:
+    """<run>_rig_end.json, written once at Stop: each camera's counts as
+    they were then (frames still landing are counted in each camera's own
+    <run>_run_end.json once on disk)."""
+    from council_core import camera_record
+
+    counts = {}
+    for name in rr.get("order", []):
+        try:
+            slot = _RIG.slot(name)
+        except KeyError:
+            counts[name] = {"note": "disconnected during the run"}
+            continue
+        session = slot.session
+        if session is None:
+            counts[name] = {"note": "disconnected during the run"}
+            continue
+        stats = session.run_stats()
+        counts[name] = {k: getattr(stats, k) for k in (
+            "grabbed", "recorded", "skipped", "waiting", "unsaved", "errors",
+            "camera_gaps") if hasattr(stats, k)}
+        counts[name]["line"] = _stats_line(stats)
+    record = {"kind": "typhon_rig_run_end", "version": 1,
+              "run": rr.get("run"),
+              "stopped": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+              "cameras": counts,
+              "note": ("counts at Stop; each camera's <run>_run_end.json has "
+                       "its final numbers once its last frame is on disk")}
+    try:
+        camera_record.write_once(
+            Path(rr["top"]) / f"{rr['run']}{RIG_END_SUFFIX}", record)
+        return ""
+    except Exception as exc:                              # noqa: BLE001
+        return (f"The run's rig end record was not written "
+                f"({type(exc).__name__}: {exc}).")
+
+
+def _tend_others() -> List[tuple]:
+    """Every tick, for each connected camera that is not the active one:
+    a capture whose camera stopped by itself ended (_watch_capture), its
+    live view kept running for its tile (_manage_preview), and its newest
+    frame taken. Returns (slot, frame or None) for each. Left as they are
+    for a tick while the active camera has a change on a worker, which
+    reads the active camera (_on_slot)."""
+    out = []
+    active = _RIG.active
+    for slot in _RIG.connected():
+        if slot is active:
+            continue
+        if active.job is None and slot.job is None:
+            with _on_slot(slot):
+                try:
+                    _watch_capture()
+                    _manage_preview(True)
+                except Exception as exc:                  # noqa: BLE001
+                    slot.idle = f"Live view: {exc}"
+        session = slot.session
+        frame = session.mailbox.take() if session is not None else None
+        out.append((slot, frame))
+    return out
+
+
+def _tile_text(slot: Any) -> str:
+    """A tile's caption: the camera's name, and what it is doing."""
+    session = slot.session
+    if session is None:
+        return slot.name
+    stats = session.stats()
+    if slot.capturing:
+        return (f"{slot.name} · REC · {stats.rate:.0f} fps · "
+                f"{getattr(stats, 'recorded', 0)} saved")
+    if slot.previewing and session.running:
+        return f"{slot.name} · live · {stats.rate:.0f} fps"
+    return f"{slot.name} · {slot.idle_reason or 'not streaming'}"
+
+
+def _feed_tiles(others: List[tuple], shown: Any = None) -> None:
+    """The camera dropdown and Multicam (council_qt.widgets.camera_tiles):
+    every connected camera with its label, whether it is the active one,
+    a caption and its newest frame — `shown`, the active camera's, which
+    the main view took this tick. Hidden for one camera."""
+    tiles = _LIVE.tiles
+    if tiles is None:
+        return
+    connected = _RIG.connected()
+    if len(connected) < 2:
+        tiles.show_cameras([])
+        return
+    frames = {slot.name: frame for slot, frame in others}
+    frames[_RIG.active.name] = shown
+    tiles.show_cameras([
+        {"name": slot.name, "active": slot is _RIG.active,
+         "label": str(getattr(slot.info, "label", "") or ""),
+         "text": _tile_text(slot), "frame": frames.get(slot.name)}
+        for slot in connected])
+
+
+# ======================================================================
 # Capture now, and the Basic tab's capture boxes
 # ======================================================================
 #: The key that does what Capture now does, anywhere in the app (attach).
@@ -1385,6 +2001,42 @@ def capture_now() -> Dict[str, Any]:
     press at any time.
 
     Keys: summary"""
+    firing = _rig_firing()
+    if len(firing) > 1:
+        # SEVERAL CAMERAS: every camera of the run waiting on a trigger
+        # Typhon fires takes this one (a software fan-out); a camera on
+        # its own input line, or one recording all the time, is not asked.
+        said = []
+        for slot in firing:
+            with _on_slot(slot):
+                out = _capture_now_one()
+            said.append(f"{slot.name}: {out['summary']}")
+        return {"summary": " ".join(x if x.endswith(".") else x + "."
+                                    for x in said)}
+    if len(firing) == 1 and firing[0] is not _RIG.active:
+        with _on_slot(firing[0]):
+            out = _capture_now_one()
+        return {"summary": f"{firing[0].name}: {out['summary']}"}
+    return _capture_now_one()
+
+
+def _rig_firing() -> List[Any]:
+    """The capturing cameras a Capture now fires: those whose triggered run
+    Typhon fires (Software or Timer), or, in a "Typhon (plugins)" project,
+    whose run has a triggering plugin's slot."""
+    out = []
+    for slot in _RIG.connected():
+        if not slot.capturing:
+            continue
+        trig = slot.trigger_run
+        if slot.trigger_slot is not None or (
+                trig is not None and getattr(trig, "typhon_fires", False)):
+            out.append(slot)
+    return out
+
+
+def _capture_now_one() -> Dict[str, Any]:
+    """`capture_now` for the active camera alone (see capture_now)."""
     session = _LIVE.session
     if session is None:
         return {"summary": "Connect a camera first — Capture now fires the "
@@ -2550,9 +3202,14 @@ def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
     """One timer tick: a finished camera change reported, the live view
     started or stopped, the newest frame to the reviewer (or straight to the
     canvas when the app has none), then the status line."""
+    if len(_RIG.connected()) > 1 and say is not None:
+        # Several cameras: the status line names the one it speaks of.
+        name, plain = _RIG.active.name, say
+        say = lambda text: plain(f"{name}: {text}")          # noqa: E731
     if reviewer is None:
         _poll_job()
         pump(show, say)
+        _feed_tiles(_tend_others())
         return
     if reviewer is not _LIVE.reviewer:
         # A window that is no longer the attached one (closed, or replaced by
@@ -2572,6 +3229,17 @@ def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
         _LIVE.shown_aoi = _aoi_of(frame)
         _LIVE.shown_reduce = _reduce_of(frame)
     _report(say, frame)
+    _feed_tiles(_tend_others(), frame)
+
+
+def _tile_picked(name: str) -> None:
+    """A click on a camera's tile: show it, and say so in the status
+    line (or why not)."""
+    try:
+        said = _select_camera(name)["summary"]
+    except Exception as exc:                              # noqa: BLE001
+        said = f"Cannot show {name}: {_said(exc)}"
+    _tell_status(said)
 
 
 def _aoi_of(frame: Any) -> Optional[tuple]:
@@ -2682,6 +3350,13 @@ def attach(app: Any, view: str = "live_view",
     _LIVE.reviewer = reviewer
     _LIVE.canvas = canvas
     app._capture_review = reviewer
+    # The other cameras' small pictures, over the main view's corner; hidden
+    # while one camera is connected (council_qt.widgets.camera_tiles).
+    from council_qt.widgets.camera_tiles import CameraTiles
+    if _LIVE.tiles is not None:
+        _LIVE.tiles.close()            # an earlier window's, now replaced
+    _LIVE.tiles = CameraTiles(canvas, _tile_picked)
+    app._camera_tiles = _LIVE.tiles
 
     timer = QTimer(app)
     timer.setInterval(int(interval_ms))
@@ -4104,6 +4779,10 @@ def _said(exc: BaseException) -> str:
 
 
 def _announce(out: Dict[str, Any]) -> None:
+    if _ASIDE["depth"]:
+        # Work done on a camera that is not the active one (_on_slot): the
+        # views show the active camera, and would take its news as theirs.
+        return
     for listener in list(_LIVE.listeners):
         try:
             listener(dict(out))

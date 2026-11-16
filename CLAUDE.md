@@ -241,6 +241,11 @@ same list.
   TYPHON_PYLON_BUFFER_GB / TYPHON_SAVE_THREADS, gaps in the camera's frame
   numbers, raw recording to one .tyraw file per run and converting it to
   PNGs; what is next): `docs/handoff/typhon_saving_2026-11-13.md`.
+- Several cameras in one Typhon window (a second Connect into its own slot,
+  each camera's own capture set-up, one Start / Stop into
+  `<folder>/<run>/<camera>/` with rig records, the Camera N / Multicam
+  dropdown above the slider, Capture now for every triggered camera):
+  `docs/handoff/typhon_multicamera_2026-11-16.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

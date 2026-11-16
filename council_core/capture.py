@@ -671,6 +671,9 @@ class Recorder:
         #: A raw run's stack (council_core.raw_frames.RawStack): its frames
         #: are in one .tyraw file until converted. None for a PNG run.
         self.raw_stack: Any = None
+        #: This run's save budget in bytes when it shares the program's with
+        #: other cameras (a rig Start); 0 for all of it (WRITE_BUDGET_BYTES).
+        self.budget_bytes = 0
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -1656,7 +1659,12 @@ class CaptureSession:
         writer = None
         if recorder is not None:
             recorder.open()
-            writer = FrameWriter(recorder)
+            # A camera of several (frame_camera's rig Start) is given its
+            # share of the one save budget (Recorder.budget_bytes); one
+            # camera alone has all of it, as before.
+            share = int(getattr(recorder, "budget_bytes", 0) or 0)
+            writer = FrameWriter(recorder, budget_bytes=share
+                                 or WRITE_BUDGET_BYTES)
             # A 0 from a camera that cannot report failed grabs would claim
             # a count nobody made: its CSV column and end record say nothing.
             writer.counts_grab_failures = bool(
