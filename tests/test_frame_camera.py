@@ -1113,7 +1113,12 @@ def test_the_preview_waits_for_a_stopped_run_to_finish_saving(tmp_path, monkeypa
     deadline = time.monotonic() + 30
     while session.saving and time.monotonic() < deadline:
         time.sleep(0.05)
-    ticks(ViewerStub(), seconds=0.2)
+    # The preview starts a tick or two after the saving ends (it waits for
+    # Pillow's plugins, warmed on a thread): 0.2 s of ticks was not always
+    # enough on a busy Windows runner.
+    deadline = time.monotonic() + 5
+    while not frame_camera._LIVE.previewing and time.monotonic() < deadline:
+        ticks(ViewerStub(), seconds=0.1)
     assert frame_camera._LIVE.previewing
 
 

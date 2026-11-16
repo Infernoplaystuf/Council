@@ -273,6 +273,19 @@ Continuous and Snapshot runs, and Downsample by averaging.
 Never confirm a capability your manifest doesn't declare. The check (section
 9) fails a plugin that does.
 
+**Several cameras in one window (16 November 2026).** A Typhon window can
+run up to four cameras at once, in any mix. Your plugin's `open_camera` is
+then called once for each of your cameras the user connects, each time
+with its own `camera` name (`cam1`, `cam2`, ...). Each open must return a
+`Device` of its own that shares nothing with the others. Each camera keeps
+its own capture set-up: one can be triggered from its input line while
+another records continuously. One Start records them all, into
+`<folder>/<run>/<camera name>/`. Typhon opens an event camera's recording
+(`records_raw`, not `restartable`) before the frame cameras start, and
+closes it after they stop. Nothing new is needed in the plugin API (still
+1.0). A camera that can only be opened once per PC should raise from its
+second open, with a reason; Typhon shows that reason.
+
 ---
 
 ## 8. The set-up wizard (optional)
