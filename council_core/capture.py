@@ -1184,7 +1184,7 @@ class FrameWriter:
             if len(self._marks) < 2:
                 return 0.0
             (t0, b0), (t1, b1) = self._marks[0], self._marks[-1]
-            if time.monotonic() - t1 > SAVE_RATE_WINDOW or t1 <= t0:
+            if time.perf_counter() - t1 > SAVE_RATE_WINDOW or t1 <= t0:
                 return 0.0
             return (b1 - b0) / (t1 - t0)
 
@@ -1349,7 +1349,10 @@ class FrameWriter:
                 if path is not None:
                     self.bytes_written += int(
                         getattr(frame.image, "nbytes", 0) or 0)
-                    self._marks.append((time.monotonic(),
+                    # perf_counter, not monotonic: Windows' monotonic clock
+                    # ticks every 15.6 ms, and saves landing within one
+                    # tick read as no time at all — a rate of 0 (CI).
+                    self._marks.append((time.perf_counter(),
                                         self.bytes_written))
                     while len(self._marks) > 2 and \
                             self._marks[-1][0] - self._marks[0][0] > \

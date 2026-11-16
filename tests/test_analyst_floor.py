@@ -97,8 +97,10 @@ def test_outside_the_allow_list_is_refused_with_a_plain_reason(box):
         why = fl.why_not(str(box["canary"]), write, "reading")
         assert why
         assert "not allowed" in why
-        # a plain reason, no jargon, no object repr
-        assert "<" not in why and "0x" not in why
+        # a plain reason, no jargon, no object repr — the path itself left
+        # out: a temporary folder's random name can hold "0x" (CI's did)
+        said = why.replace(str(box["canary"]), "PATH")
+        assert "<" not in said and "0x" not in said
 
 
 def test_the_vault_itself_is_not_readable_even_though_data_out_inside_is(box):
