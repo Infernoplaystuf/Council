@@ -291,6 +291,21 @@ def test_a_spoiled_run_is_run_again(tmp_path, monkeypatch):
     assert out["infra_retried"] == ["pytest wrote no report: "]
 
 
+def test_a_test_file_that_did_not_collect_is_a_spoiled_run(tmp_path):
+    """Its tests vanished from the outcomes instead: the empty module's run
+    lost a test that never touches the widget, so it counted, and a model
+    that delivered nothing scored on it (Windows CI, PRs #89 and #90)."""
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    test_file = suite / "test_never_collects.py"
+    test_file.write_text("import no_such_module_anywhere_xyz\n\n"
+                         "def test_a():\n    pass\n", encoding="utf-8")
+    out = tr.run_tests([test_file], tmp_path / "w", tag="round0")
+    assert out["infra"].startswith("a test file did not collect: ")
+    assert "no_such_module_anywhere_xyz" in out["infra"]
+    assert len(out.get("infra_retried", [])) == 0, "failed both tries"
+
+
 def test_a_timeout_is_not_run_again(tmp_path, monkeypatch):
     runs = []
 
