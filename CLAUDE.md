@@ -215,6 +215,12 @@ same list.
   ships; the projection of accounts over the years; what is not modeled;
   next steps):
   `docs/handoff/finance_plugin_2026-11-06.md`.
+- The LPBF / Dyndrite plugin (`council_plugins/lpbf`: limits profiles,
+  designs of experiments, deterministic checks, approval with an append-only
+  audit, manifests, results; the Dyndrite MCP page) and MCP server tokens
+  (`council_core/secret_source.py`: env var or Windows Credential Manager,
+  Council sends them, never saved or shown to a model):
+  `docs/handoff/lpbf_plugin_2026-11-16.md`.
 - The classifier as an optional pop-out plugin, the plugin toolbar strip
   and "Plugins…", and datasets of picked frames (references, sent to
   plugins; branch `typhon-plugins`):

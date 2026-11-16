@@ -22,6 +22,16 @@ imported to LIST plugins.
               function that sends messages to that model and returns its
               reply. Offline: localhost Ollama or a file loaded in process.
 
+    mcp       MCP servers the plugin keeps its own settings for (a dict per
+              server, the fields of council_core.docs_servers.ServerSpec):
+              check one, list its tools with their input schemas, call a
+              tool. Council is the MCP client, so a server's token is read
+              by Council from where the user keeps it (an environment
+              variable or the Windows Credential Manager, council_core.
+              secret_source) and sent by Council; neither the plugin's
+              settings file nor a model ever holds it. A server on another
+              computer is refused unless that server's "allow remote" is on.
+
 No Qt here. Each call opens what it reads and closes it, so a worker thread
 may call any of it.
 """
@@ -36,7 +46,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: The services a plugin may name in ``needs``.
-NAMES: frozenset = frozenset({"sources", "models"})
+NAMES: frozenset = frozenset({"sources", "models", "mcp"})
 
 #: Passage size for reading documents as text (lines per passage, overlap).
 PASSAGE_LINES = 30
@@ -402,6 +412,85 @@ class Models:
 
 
 # ======================================================================
+# mcp
+# ======================================================================
+class Mcp:
+    """The ``mcp`` service: one MCP server at a time, described by a dict
+    of ServerSpec fields. Connections are pooled per server and closed when
+    Council exits (council_core.docs_servers)."""
+
+    @staticmethod
+    def spec(data: Dict[str, Any]):
+        from council_core import docs_servers as ds
+        return ds.ServerSpec.from_json(dict(data or {}))
+
+    def problem(self, data: Dict[str, Any]) -> str:
+        """Why these settings cannot be used, or ""."""
+        from council_core import docs_servers as ds
+        try:
+            return ds.validate(self.spec(data))
+        except (TypeError, ValueError) as exc:
+            return str(exc)
+
+    def check(self, data: Dict[str, Any], *,
+              should_stop: Optional[Callable[[], bool]] = None
+              ) -> Dict[str, Any]:
+        """Connect fresh and list the tools: {ok, message, server,
+        protocol, tools: [{name, description, inputSchema, annotations}]}.
+        """
+        from council_core import docs_servers as ds
+        from council_core.mcp_client import McpError
+        problem = self.problem(data)
+        if problem:
+            return {"ok": False, "message": problem, "tools": []}
+        spec = self.spec(data)
+        try:
+            client = ds.open_client(spec, should_stop=should_stop)
+        except McpError as exc:
+            return {"ok": False, "message": f"Could not connect: {exc}",
+                    "tools": []}
+        try:
+            tools = client.list_tools(should_stop=should_stop) \
+                if client.has_tools else []
+            return {"ok": True,
+                    "message": f"Connected: {len(tools)} tool(s).",
+                    "server": client.describe(),
+                    "protocol": client.protocol_version or "",
+                    "tools": [dict(t) for t in tools if isinstance(t, dict)]}
+        except McpError as exc:
+            return {"ok": False, "message": f"Connected, but listing the "
+                    f"tools failed: {exc}", "tools": []}
+        finally:
+            client.close()
+
+    def tools(self, data: Dict[str, Any], *,
+              should_stop: Optional[Callable[[], bool]] = None
+              ) -> List[Dict[str, Any]]:
+        from council_core import docs_servers as ds
+        client, _roles = ds.pooled(self.spec(data), should_stop=should_stop)
+        return [dict(t) for t in client.list_tools(should_stop=should_stop)]
+
+    def call(self, data: Dict[str, Any], tool: str,
+             arguments: Optional[Dict[str, Any]] = None, *,
+             timeout: Optional[float] = None,
+             should_stop: Optional[Callable[[], bool]] = None
+             ) -> Dict[str, Any]:
+        """Run one tool: {text, structured, is_error}."""
+        from council_core import docs_servers as ds
+        from council_core import mcp_client as mc
+        client, _roles = ds.pooled(self.spec(data), should_stop=should_stop)
+        result = client.call_tool(tool, arguments or {}, timeout=timeout,
+                                  should_stop=should_stop)
+        return {"text": mc.content_text(result.content),
+                "structured": result.structured,
+                "is_error": result.is_error}
+
+    def release(self, data: Dict[str, Any]) -> None:
+        from council_core import docs_servers as ds
+        ds.release(self.spec(data).name)
+
+
+# ======================================================================
 # Making a service
 # ======================================================================
 def make(name: str) -> Any:
@@ -410,4 +499,6 @@ def make(name: str) -> Any:
         return Sources()
     if name == "models":
         return Models()
+    if name == "mcp":
+        return Mcp()
     raise KeyError(f"Council offers no service called {name!r}")
