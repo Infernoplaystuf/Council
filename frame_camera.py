@@ -1287,6 +1287,11 @@ def _start_one(folder: Any, exposure: Any = "", gain: Any = "",
                                       _listed_values(listing), rate, session)
             recorder.capture_info = trig.summary
         recorder.downsample_info = _downsample_record(device)
+        # An event camera's .raw alone, unless "Save pictures while
+        # recording" is ticked: the CSV rows, no PNGs (Andy, 17 November
+        # 2026). A frame camera always saves its pictures.
+        recorder.pictures = (not getattr(device, "records_raw", False)
+                             or bool(getattr(device, "save_pictures", True)))
         # reset: this run's numbers only — frames the preview showed were
         # never meant to be saved, and counting them would read as frames the
         # capture lost. In the same step as the switch (see record_to).
@@ -2223,6 +2228,9 @@ def _run_note(session: Any) -> str:
     — and the note said nothing of it while Stop's line did."""
     stats = session.run_stats()
     bits = [f"{stats.recorded} saved"]
+    if stats.raw_only and not stats.recorded:
+        bits = ["no pictures saved (the .raw has every event; "
+                "\"Make pictures from .raw…\" draws them)"]
     if _LIVE.run_waited:
         bits[0] += f" — {_LIVE.run_waited}"
     trig = _LIVE.last_trigger_run

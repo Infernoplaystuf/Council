@@ -250,6 +250,10 @@ same list.
   setup, and the EVK4's OpenEB installer (`install_openeb.bat`,
   `council_core/openeb_install.py`, `openeb_env.py` finding the build):
   `docs/handoff/typhon_camera_kinds_openeb_2026-11-16.md`.
+- The EVK4 recording its .raw alone (no PNGs while recording, "Save
+  pictures while recording", the slider's raw view, "Make pictures from
+  .raw…" by right-click, `council_core/raw_pictures.py`):
+  `docs/handoff/typhon_evk_raw_only_2026-11-17.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

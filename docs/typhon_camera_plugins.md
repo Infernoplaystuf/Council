@@ -286,6 +286,19 @@ closes it after they stop. Nothing new is needed in the plugin API (still
 1.0). A camera that can only be opened once per PC should raise from its
 second open, with a reason; Typhon shows that reason.
 
+**An event camera's .raw alone (17 November 2026).** A device with
+`records_raw` may also set `save_pictures`. When it is False, a run
+records the raw file only: Typhon draws and saves no picture while it
+records, and the run's frames CSV still gets one row per picture window
+(its camera time, `raw_t_us`, its events) with an empty `file` column. The
+slider opens such a run in its raw view, and right-clicking the picture
+offers "Make pictures from .raw…" (`council_core/raw_pictures.py`), which
+writes the PNGs afterwards and fills in the CSV. `api.Device.save_pictures`
+is True. The built-in EVK4 sets it False, and its settings window has a
+"Save pictures while recording" box (`record.pictures`) to turn the PNGs
+back on. A frame camera, such as the webcam example, leaves it True: its
+pictures are its data. Nothing new is needed in the plugin API (still 1.0).
+
 ---
 
 ## 8. The set-up wizard (optional)

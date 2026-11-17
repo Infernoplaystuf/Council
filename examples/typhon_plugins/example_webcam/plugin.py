@@ -142,6 +142,9 @@ class WebcamDevice(api.Device):
     restartable = True
     #: The area (crop) changes only with the stream stopped.
     area_live = False
+    # save_pictures stays True (api.Device's): a frame camera's pictures
+    # are its data. Only an event camera with records_raw may record its
+    # raw file alone (guide section 7).
 
     def __init__(self, info: Any, cv2: Any, number: int) -> None:
         self.info = info
