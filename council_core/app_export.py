@@ -489,6 +489,30 @@ def _check_bat() -> str:
         "exit /b %CODE%", ""])
 
 
+#: The EVK4's OpenEB installer, copied into an export that runs cameras
+#: (Andy, 16 November 2026) and started by install_openeb.bat.
+OPENEB_INSTALLER = "council_core/openeb_install.py"
+
+
+def _openeb_bat() -> str:
+    return "\r\n".join([
+        "@echo off",
+        "REM Builds and installs OpenEB, the Prophesee EVK4's open-source",
+        "REM SDK, for the Python run.bat uses: Git, CMake and Visual Studio",
+        "REM 2022 (C++) first, then a few hours. Run it again after a stop:",
+        "REM it carries on. Options: --dir C:\\openeb  --driver",
+        "REM wdi-simple.exe  --dry-run  (README.txt, EVK4 CAMERAS).",
+        "setlocal",
+        "set \"HERE=%~dp0\"",
+        *_FIND_PYTHON,
+        "cd /d \"%HERE%\"",
+        f"\"%PYTHON%\" \"%HERE%{LIB_DIR}\\"
+        f"{OPENEB_INSTALLER.replace('/', chr(92))}\" %*",
+        "set \"CODE=%ERRORLEVEL%\"",
+        "pause",
+        "exit /b %CODE%", ""])
+
+
 def _sh(name: str) -> str:
     return "\n".join([
         "#!/bin/sh",
@@ -688,7 +712,21 @@ SET UP A NEW MACHINE
      runtime (pylon Software Suite) and pip install pypylon; a CoaXPress
      camera also needs the suite's CXP support and the frame grabber's
      driver, and the grabber set (in its own software) to pass triggers.
+     A Prophesee EVK4 needs the Metavision SDK: see EVK4 CAMERAS below.
   4. Run check.bat. It changes nothing.
+
+EVK4 CAMERAS (PROPHESEE)
+  install_openeb.bat builds OpenEB, Prophesee's open-source SDK for the
+  EVK4 (no account needed), for the Python run.bat uses, and Typhon then
+  finds it by itself: no PATH to edit. Before it, install Git, CMake 3.26
+  (tick "Add CMake to the PATH") and Visual Studio 2022 with "Desktop
+  development with C++"; it says which are missing. It needs internet
+  and a few hours the first time; run it again after a stop and it
+  carries on. It builds in C:\\openeb (--dir to choose another short
+  folder). The EVK4's USB driver: save wdi-simple.exe from the link it
+  prints in C:\\openeb or Downloads and run it again, or give --driver.
+  install_openeb.bat --dry-run lists every step without doing any.
+  Prophesee's own SDK installer (an account from Prophesee) works too.
 
 NO INTERNET ON THAT MACHINE
   On a PC with internet and the same Windows and Python version (3.11 ->
@@ -757,6 +795,7 @@ WHAT IS IN THIS FOLDER
                             of the Council: no models, no Ledger)
   run.bat, run.sh           start the app
   check.bat, check.sh       check this machine can run it
+  install_openeb.bat        (camera apps) build the EVK4's OpenEB SDK
   requirements.txt          the Python packages it uses
   data/                     made on first run: this copy's own vault,
                             settings, plugin home and classifiers
@@ -850,6 +889,14 @@ def export_app(project_dir: Path, dest_parent: Path, *,
         _write(staging / "run.sh", _sh(name))
         _write(staging / "check.bat", _check_bat())
         _write(staging / "check.sh", _check_sh())
+        if "council_core.cameras" in modules:
+            installer = COUNCIL_ROOT / OPENEB_INSTALLER
+            target = lib / OPENEB_INSTALLER
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(installer, target)
+            if OPENEB_INSTALLER not in lib_files:
+                lib_files.append(OPENEB_INSTALLER)
+            _write(staging / "install_openeb.bat", _openeb_bat())
         _write(staging / CHECK_SCRIPT, SETUP_CHECK.lstrip("\n"))
         _write(staging / "README.txt",
                _readme(name, required, optional, commit))

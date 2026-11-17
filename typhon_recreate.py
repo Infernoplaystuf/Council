@@ -1283,6 +1283,18 @@ def _run_tests_once(tests: Sequence[Path], work: Path, *,
             elif child.tag == "skipped":
                 state = "skipped"
         out["outcomes"][tid] = state
+    # A test file that did not collect is a spoiled run, not a result: every
+    # name a test file imports exists in each swapped module (a placeholder
+    # at worst), so the code under test cannot cause it. Read as results, it
+    # dropped the file's tests from the run: the empty module's run lost a
+    # test that never touches the widget, which then counted, and a model
+    # that delivered nothing scored on it (Windows CI, PRs #89 and #90).
+    # Said as infra, the run is tried again (INFRA_RETRIES).
+    broken = [tid for tid, msg in out["failures"].items()
+              if msg.startswith("collection failure")]
+    if broken and not out["infra"]:
+        out["infra"] = ("a test file did not collect: "
+                        + out["failures"][broken[0]][-300:])
     return out
 
 

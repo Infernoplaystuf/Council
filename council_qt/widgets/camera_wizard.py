@@ -33,7 +33,10 @@ per camera family — each a camera plugin with a set-up, handed in as
 council_core.camera_setup.Family — then the install steps of every family
 ticked, then each one's checks and, for a family with one (a Basler), its
 scan page. With one family ticked the pages read exactly as this wizard's.
-Today's Typhon keeps `CameraSetupWizard`, unchanged.
+Today's Typhon uses it too since 16 November 2026, offered its built-in
+Basler and Prophesee EVK4 (camera_setup.builtin_families): one window runs
+a Basler beside an EVK4, so the set-up no longer makes you pick one.
+`CameraSetupWizard` (one choice) stays for whoever calls run_wizard.
 """
 from __future__ import annotations
 

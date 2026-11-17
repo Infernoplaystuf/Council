@@ -144,7 +144,10 @@ def test_the_evk4_driver_commands_copy_one_per_line(qapp):
     w.next()
     w.install.copy_commands()
     lines = QGuiApplication.clipboard().text().splitlines()
-    assert lines == list(cs.WDI_COMMANDS)
+    # The OpenEB installer's command first (16 November 2026), then the
+    # driver's three.
+    assert lines[0].endswith("-m council_core.openeb_install")
+    assert lines[1:] == list(cs.WDI_COMMANDS)
 
 
 def test_a_multi_line_command_is_shown_on_separate_lines():
@@ -357,9 +360,11 @@ def test_setup_saves_and_reports_the_choice(clean_camera, tmp_path,
     monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
     path = cs.setup_path(tmp_path)
     frame_camera._LIVE.setup_path = path
-    monkeypatch.setattr(cw, "run_wizard",
-                        lambda parent, p, **kw: (cs.save_choice(p, "basler")
-                                                 or "basler"))
+    # Today's Typhon ticks camera kinds (16 November 2026): the families
+    # wizard, offered the built-in Basler and Prophesee EVK4.
+    monkeypatch.setattr(cw, "run_families_wizard",
+                        lambda parent, p, families, **kw:
+                        cs.save_families(p, ["basler"]))
     out = frame_camera.setup()
     assert "Set up for Basler" in out["summary"]
     assert frame_camera.current_choice() == "basler"
@@ -369,7 +374,7 @@ def test_a_cancelled_setup_says_nothing_changed(clean_camera, tmp_path,
                                                 monkeypatch):
     monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
     frame_camera._LIVE.setup_path = cs.setup_path(tmp_path)
-    monkeypatch.setattr(cw, "run_wizard", lambda parent, p, **kw: None)
+    monkeypatch.setattr(cw, "run_families_wizard", lambda *a, **kw: None)
     assert "nothing changed" in frame_camera.setup()["summary"]
 
 

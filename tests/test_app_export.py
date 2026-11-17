@@ -195,6 +195,21 @@ def test_the_readme_covers_setting_up_a_new_machine(exported):
         assert (exported.folder / name).is_file(), name
 
 
+def test_a_camera_app_brings_the_openeb_installer(exported):
+    """Andy, 16 November 2026: the EVK4's OpenEB install in the export, so
+    the needed packages are easy to add on the other PC."""
+    folder = exported.folder
+    bat = (folder / "install_openeb.bat").read_text(encoding="utf-8")
+    assert '"%PYTHON%" "%HERE%_council\\council_core\\openeb_install.py" %*' \
+        in bat
+    assert (folder / ae.LIB_DIR / "council_core" / "openeb_install.py"
+            ).is_file()
+    assert (folder / ae.LIB_DIR / "council_core" / "openeb_env.py"
+            ).is_file(), "Typhon finds the build by itself"
+    readme = (folder / "README.txt").read_text(encoding="utf-8")
+    assert "EVK4 CAMERAS" in readme and "install_openeb.bat" in readme
+
+
 def test_run_bat_finds_python_or_says_how_to_get_it(exported):
     for name in ("run.bat", "check.bat"):
         bat = (exported.folder / name).read_text(encoding="utf-8")

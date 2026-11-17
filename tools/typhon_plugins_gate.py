@@ -87,6 +87,7 @@ TYPHON_FILES = (
     "tests/test_pylon_env.py",
     "tests/test_typhon_saving.py",
     "tests/test_typhon_multicamera.py",
+    "tests/test_openeb_install.py",
     "tests/test_basler_real.py",       # collects nothing outside `pylon`
     # the libraries the feature plugins will wrap (Barbie v1-v3 use them too)
     "tests/test_frame_classes.py",

@@ -246,6 +246,10 @@ same list.
   `<folder>/<run>/<camera>/` with rig records, the Camera N / Multicam
   dropdown above the slider, Capture now for every triggered camera):
   `docs/handoff/typhon_multicamera_2026-11-16.md`.
+- Today's Typhon ticking several camera kinds (Basler and EVK4) in Camera
+  setup, and the EVK4's OpenEB installer (`install_openeb.bat`,
+  `council_core/openeb_install.py`, `openeb_env.py` finding the build):
+  `docs/handoff/typhon_camera_kinds_openeb_2026-11-16.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

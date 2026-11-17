@@ -472,6 +472,7 @@ def test_several_families_each_get_their_steps_and_a_copy_button(qapp):
     assert sorted(w.install.copy_buttons) == ["basler", "prophesee"]
     w.install.copy_buttons["prophesee"].click()
     assert QGuiApplication.clipboard().text().splitlines() == \
+        [f'"{PYTHON}" -m council_core.openeb_install'] + \
         list(cs.WDI_COMMANDS), "an EVK4's commands, one per line, alone"
     w.install.copy_buttons["basler"].click()
     assert QGuiApplication.clipboard().text() == \
@@ -974,15 +975,29 @@ def test_a_cancelled_families_setup_says_nothing_changed(plugin_project,
     assert not cs.setup_path(plugin_project).exists()
 
 
-def test_todays_typhon_still_gets_todays_wizard(classic_project, monkeypatch):
+def test_todays_typhon_ticks_its_camera_kinds(classic_project, monkeypatch):
+    """Today's Typhon ticks camera kinds too (Andy, 16 November 2026: one
+    window runs a Basler beside an EVK4, so the set-up must not make you
+    pick one): the built-in Basler and Prophesee EVK4, both scanned."""
     monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
     frame_camera._LIVE.setup_path = cs.setup_path(classic_project)
-    monkeypatch.setattr(cw, "run_families_wizard", lambda *a, **k:
-                        pytest.fail("the families wizard in today's Typhon"))
-    monkeypatch.setattr(cw, "run_wizard", lambda parent, p, **kw: (
-        cs.save_choice(p, "basler") or "basler"))
+    seen = {}
+
+    def fake(parent, path, families, **kw):
+        seen["families"] = [(f.key, f.plugin) for f in families]
+        return cs.save_families(path, ["basler", "prophesee"])
+
+    monkeypatch.setattr(cw, "run_families_wizard", fake)
     try:
-        assert "Set up for Basler." in frame_camera.setup()["summary"]
+        out = frame_camera.setup()
+        assert seen["families"] == [("basler", "builtin.basler"),
+                                    ("prophesee", "builtin.prophesee")]
+        assert "Set up for Basler and Prophesee EVK4." in out["summary"]
+        assert frame_camera._current_kinds() == ["basler", "prophesee"]
+        assert frame_camera.current_choice() == "basler"
+        backends = frame_camera._backends_for(frame_camera._current_kinds())
+        assert [type(b).__name__ for b in backends] == [
+            "BaslerBackend", "EvkBackend", "SyntheticBackend"]
     finally:
         frame_camera._LIVE.setup_path = None
 

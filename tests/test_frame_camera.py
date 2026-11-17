@@ -1083,8 +1083,18 @@ def test_a_one_stream_capture_whose_camera_dies_says_reconnect(tmp_path, monkeyp
     settle()
     _dies(monkeypatch, device)
     said = []
-    ticks(ViewerStub(), seconds=0.5, said=said)
-    assert any("Capture ended" in s and "Connect again" in s for s in said), said
+
+    def ended():
+        return any("Capture ended" in s and "Connect again" in s
+                   for s in said)
+
+    # The grab thread has to notice the camera died before the tick can
+    # say so: 0.5 s of ticks was not always enough on a busy Windows
+    # runner (PR #90's CI). Up to 5 s, stopping as soon as it is said.
+    deadline = time.monotonic() + 5
+    while not ended() and time.monotonic() < deadline:
+        ticks(ViewerStub(), seconds=0.1, said=said)
+    assert ended(), said
     assert device.calls.count("start") == 1
 
 

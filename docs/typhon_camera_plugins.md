@@ -299,6 +299,16 @@ scanned, which is simpler and what the example does. To add one, implement
 `api.Check`s), as the Basler plugin does. Once a project's set-up has been
 run, a plugin with `"setup"` is scanned only if its box is ticked.
 
+Today's Typhon (no plugins) uses the same check-box wizard since 16
+November 2026, for its built-in Basler and Prophesee EVK4
+(`camera_setup.builtin_families`): tick both for a rig with one of each.
+A step can carry a whole installer as its command, as the EVK4's does
+(`python -m council_core.openeb_install`, also `install_openeb.bat` in
+an exported Typhon: it builds OpenEB for the app's own Python, and
+`council_core.openeb_env` finds the build before `metavision_hal` is
+imported). A plugin whose SDK must be built can do the same; the plugin
+API is unchanged.
+
 ---
 
 ## 9. Testing your plugin
