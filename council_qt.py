@@ -34,6 +34,10 @@ def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--ledger-worker":
         from council_core.ledger_workers import main as ledger_worker
         return ledger_worker()
+    # The Speech tab's file transcriber (council_core.transcribe), likewise.
+    if len(sys.argv) > 1 and sys.argv[1] == "--transcribe-worker":
+        from council_core.transcribe import main as transcribe_worker
+        return transcribe_worker()
 
     # The main model, before anything can import council_engine. The run-*
     # launchers export the FIRST *.gguf they find when COUNCIL_GGUF_PATH is
