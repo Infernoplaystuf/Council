@@ -429,7 +429,7 @@ class TranscribeJob:
     # -- control --------------------------------------------------------
     def start(self) -> "TranscribeJob":
         self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="transcribe-file")
+                                        name="speech-transcribe")
         self._thread.start()
         return self
 

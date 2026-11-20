@@ -256,8 +256,10 @@ def test_the_built_app_can_start_the_child():
 def tab():
     from PySide6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
-    from council_qt.tabs.speech import SpeechTab
-    widget = SpeechTab()
+    from council_qt.tabs.speech import SpeechActions, SpeechTab
+    from council_core import speech as speech_core
+    # A player of its own and no vault: this tab touches no user data.
+    widget = SpeechTab(actions=SpeechActions(player=speech_core.TtsPlayer()))
     yield widget, app
     widget.deleteLater()
 

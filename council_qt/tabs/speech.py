@@ -241,7 +241,7 @@ class SpeechTab(ViewHelpers, QWidget):
                     "model\" fetches it once (internet); after that it "
                     "runs offline.")
             self._to_ui(show)
-        threading.Thread(target=work, name="whisper-cache", daemon=True).start()
+        threading.Thread(target=work, name="speech-whisper-cache", daemon=True).start()
 
     def on_download_model(self) -> None:
         name = self._choice(self.model_box)
@@ -262,7 +262,7 @@ class SpeechTab(ViewHelpers, QWidget):
                 self.status.setText(msg)
                 self._refresh_model_note()
             self._to_ui(done)
-        threading.Thread(target=work, name="whisper-download",
+        threading.Thread(target=work, name="speech-whisper-download",
                          daemon=True).start()
 
     def on_transcribe_file(self) -> None:
@@ -403,7 +403,7 @@ class SpeechTab(ViewHelpers, QWidget):
             except Exception as exc:                      # noqa: BLE001
                 msg = f"Recording failed: {exc}"
             self._to_ui(lambda: self.status.setText(msg))
-        threading.Thread(target=work, name="mic-record", daemon=True).start()
+        threading.Thread(target=work, name="speech-mic-record", daemon=True).start()
 
     def on_transcribe(self) -> None:
         rec = getattr(self, "_recording", None)
