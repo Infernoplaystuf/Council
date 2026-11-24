@@ -7,7 +7,8 @@ makes sure the camera takes the picture when the bottle is in the middle of
 the view, allowing for the belt speed and the delays along the way.
 
 It is a built-in plugin that is **off** in a new project. To turn it on, open
-**Plugins…** in Typhon (plugins), tick **PLC trigger (Do-More)**, and press
+**Plugins…** in Typhon (plugins) (the Council makes that project in its
+Designer by itself, `typhon_plugins`), tick **PLC trigger (Do-More)**, and press
 its button on the toolbar strip to open its window.
 
 For a **fan** with no sensor, where you want one blade in the same spot in

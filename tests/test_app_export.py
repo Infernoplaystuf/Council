@@ -121,8 +121,26 @@ def test_typhon_plugins_exports_and_starts(tmp_path, monkeypatch):
     monkeypatch.setenv("TYPHON_PLUGIN_HOME", str(home))
     project = Path(rex.build("typhon_plugins", project="tp_x",
                              vault_dir=tmp_path / "vault", target="qt"))
-    result = ae.export_app(project, tmp_path / "out")
+    # A tick box per plugin (Andy, 24 November 2026), all of them listed,
+    # ticked as the project runs them; the ticks go into the COPY.
+    from council_core import plugin_host as ph
+    from council_core import plugin_lists as pl
+    choices = ae.plugin_choices(project)
+    assert [p for p, _n, _o in choices] == [p for p, _f in ph.BUILTIN_PLUGINS]
+    ticked = {p: on for p, _n, on in choices}
+    assert ticked["typhon.plc"] is False and ticked["typhon.trigger"] is True
+    before = (project / pl.PROJECT_FILE).read_text(encoding="utf-8")
+    result = ae.export_app(project, tmp_path / "out",
+                           plugins={"typhon.plc": True,
+                                    "typhon.classify": False})
+    copy = pl.read_project(result.folder)
+    assert "typhon.plc" in copy.runs() and "typhon.classify" not in \
+        copy.runs()
+    assert (project / pl.PROJECT_FILE).read_text(encoding="utf-8") == \
+        before, "the project itself is unchanged"
+    assert ae.plugin_choices(tmp_path) == [], "no plugin list, no boxes"
     lib = result.folder / ae.LIB_DIR
+    assert (lib / "typhon_plugins/plc/fan.py").is_file()
     assert (lib / "council_core/plugin_host.py").is_file()
     assert (lib / "typhon_plugins/trigger/plugin.json").is_file()
     assert (lib / "typhon_plugins/send_trigger/panel.py").is_file()
@@ -306,3 +324,20 @@ def test_an_activated_environment_s_python_is_used(exported, tmp_path):
     out = done.stdout + done.stderr
     assert f"at {want}" in out, out[-2000:]
     assert done.returncode == 0 and "All set" in out, out[-2000:]
+
+
+def test_the_export_plugin_tick_boxes_offscreen():
+    from PySide6.QtWidgets import QApplication
+    from council_qt.widgets import plugin_choice as pc
+    qapp = QApplication.instance() or QApplication([])
+    choices = [("typhon.plc", "PLC trigger (Do-More)", False),
+               ("typhon.trigger", "Triggering", True)]
+    dlg = pc.PluginChoiceDialog(choices)
+    assert dlg.chosen() == {"typhon.plc": False, "typhon.trigger": True}
+    dlg.boxes["typhon.plc"].setChecked(True)
+    assert dlg.chosen()["typhon.plc"] is True
+    # unattended: as the project runs them, no dialog
+    assert pc.ask_plugins(choices) == {"typhon.plc": False,
+                                       "typhon.trigger": True}
+    dlg.deleteLater()
+    qapp.processEvents()

@@ -185,7 +185,10 @@ def resolve_home(recorded: Optional[str] = None) -> Home:
 #: refuses it too (designer_examples.plugin_home_problem). This matters for
 #: a double-clicked app whose recorded plugin home is gone: the home falls
 #: back to ~/.council/typhon (design 4.1). False at the switch-over.
-BESIDE_TODAYS_TYPHON = True
+#: FALSE SINCE 24 NOVEMBER 2026 (Andy: Typhon (plugins) in the Council's own
+#: Designer, no side Council): both Typhons are qt-migration's code now, and
+#: the plugin home ~/.council/typhon is a folder today's Typhon never reads.
+BESIDE_TODAYS_TYPHON = False
 
 
 def inside_council(path: Any) -> bool:

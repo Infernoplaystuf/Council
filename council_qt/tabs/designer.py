@@ -188,13 +188,16 @@ class DesignerActions:
     def export_gspec(self, name: str, shapes: Sequence[Any], dest):
         return dx.export_gspec(name, shapes, self.vault_dir, dest)
 
-    def export_app(self, name: str, dest, *, with_classifiers=False):
+    def export_app(self, name: str, dest, *, with_classifiers=False,
+                   plugins=None):
         """The generated app, into a new folder of its own under `dest`,
         then checked to start with no Council (council_core.app_export).
-        Blocking; a worker calls it. (ExportResult, CheckResult or None)."""
+        `plugins`: {id: on} for the copy's plugin list. Blocking; a worker
+        calls it. (ExportResult, CheckResult or None)."""
         from council_core import app_export as ae
         result = ae.export_app(self.project_dir(name), Path(dest),
-                               with_classifiers=with_classifiers)
+                               with_classifiers=with_classifiers,
+                               plugins=plugins)
         return result, ae.check(result.folder)
 
     def stop(self, name: str) -> bool:
@@ -283,6 +286,9 @@ class DesignerTab(ViewHelpers, QWidget):
         self.ask_save_path = ask_save_path or (lambda *a, **k: "")
         #: (title, start folder) -> a folder, or "" for cancelled.
         self.ask_folder = lambda *a, **k: ""
+        #: [(plugin id, name, on)] -> {id: on}, or None for cancelled. The
+        #: Export app… plugin tick boxes; the default keeps them as they are.
+        self.ask_plugins = lambda choices: {p: on for p, _n, on in choices}
         #: designer_codebehind.Review -> True to write it. The default is
         #: "not accepted": model-written code nobody looked at is never
         #: written, by a test or by a host that forgot to supply a dialog.
@@ -1066,12 +1072,23 @@ class DesignerTab(ViewHelpers, QWidget):
             "Export app",
             "Copy this PC's classifiers into the exported app too?\n\n"
             "No: it starts with none of its own."))
+        # A Typhon (plugins) app: a tick box per plugin (Andy, 24 November
+        # 2026), on or off in the exported copy.
+        from council_core import app_export as ae
+        choices = ae.plugin_choices(Path(project))
+        plugins = None
+        if choices:
+            plugins = self.ask_plugins(choices)
+            if plugins is None:
+                self.log("Export cancelled.")
+                return
         name = self.project
 
         def work() -> None:
             try:
                 result, checked = self.actions.export_app(
-                    name, dest, with_classifiers=with_classifiers)
+                    name, dest, with_classifiers=with_classifiers,
+                    plugins=plugins)
                 words = [result.message, checked.message]
             except Exception as exc:                      # noqa: BLE001
                 words = [f"Not exported: {exc}"]
@@ -1459,6 +1476,8 @@ def build_designer(window) -> QWidget:
                                           vault_dir=tab.actions.vault_dir)
     tab.ask_save_path = lambda title, folder, filename: ask_export_path(
         tab, title, folder, filename)
+    from ..widgets.plugin_choice import ask_plugins
+    tab.ask_plugins = lambda choices: ask_plugins(choices, parent=tab)
     tab.ask_folder = lambda title, folder: (
         "" if dialogs.disabled() else
         dialogs.askdirectory(title=title, initialdir=folder, parent=tab)
@@ -1467,4 +1486,18 @@ def build_designer(window) -> QWidget:
     # above: unattended, nothing a model wrote is ever accepted.
     from ..widgets.wiring import ask_accept
     tab.review_code = lambda review: ask_accept(review, parent=tab)
+    # Typhon (plugins) is made once per vault, on its own (Andy, 24
+    # November 2026): a worker, the Designer's log says so. Not in an
+    # unattended run (COUNCIL_NO_DIALOGS: the tests), which makes nothing in
+    # a vault it did not ask for.
+    if dialogs.disabled():
+        return tab
+    vault = tab.actions.vault_dir
+
+    def make_typhon_plugins() -> None:
+        words = dx.ensure_auto_project(vault)
+        if words:
+            tab._to_ui(lambda: tab.log(words))
+    threading.Thread(target=make_typhon_plugins, daemon=True,
+                     name="designer-typhon-plugins").start()
     return tab

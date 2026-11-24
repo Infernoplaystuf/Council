@@ -1915,7 +1915,9 @@ def test_the_host_never_writes_under_council_beside_todays_typhon(
         builtins_pkg, tmp_path, monkeypatch):
     """A double-clicked app whose recorded plugin home is gone falls back to
     ~/.council/typhon (design 4.1). While the plugin Typhon runs beside
-    today's, the host refuses to write there, as the build does."""
+    today's, the host refuses to write there, as the build does. (Off since
+    24 November 2026, the rule is kept for a side Council: switched on here.)"""
+    monkeypatch.setattr(pl, "BESIDE_TODAYS_TYPHON", True)
     user = tmp_path / "user"
     user.mkdir()
     monkeypatch.setenv("USERPROFILE", str(user))
@@ -1947,6 +1949,30 @@ def test_the_host_never_writes_under_council_beside_todays_typhon(
     assert not (other / pl.PROJECT_FILE).exists()
     assert any(".council" in n for n in notes), notes
     assert not (user / ".council").exists()
+
+
+def test_the_plugin_home_in_the_councils_own_folder_is_used(
+        builtins_pkg, tmp_path, monkeypatch):
+    """Andy, 24 November 2026: Typhon (plugins) in the Council's own
+    Designer, no side Council. With no TYPHON_PLUGIN_HOME the plugin home is
+    ~/.council/typhon, and the host writes its base set there and the
+    project's list beside the project."""
+    assert pl.BESIDE_TODAYS_TYPHON is False
+    user = tmp_path / "user"
+    user.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(user))
+    monkeypatch.setenv("HOME", str(user))
+    monkeypatch.delenv(pl.HOME_ENV, raising=False)
+    _name, _pkg, add = builtins_pkg
+    add("a", manifest_doc("typhon.a", "aa"))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    host = make_host(builtins_pkg, [("typhon.a", "a")])
+    host.open_project(proj, create=True)
+    assert host.home.path == user / ".council" / "typhon"
+    assert (proj / pl.PROJECT_FILE).exists()
+    host.set_base_plugins(["typhon.a"])
+    assert (user / ".council" / "typhon").is_dir()
 
 
 def test_a_live_feed_is_capped_by_default(builtins_pkg, plugin_home):
