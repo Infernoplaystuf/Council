@@ -1498,6 +1498,9 @@ def build_designer(window) -> QWidget:
         words = dx.ensure_auto_project(vault)
         if words:
             tab._to_ui(lambda: tab.log(words))
-    threading.Thread(target=make_typhon_plugins, daemon=True,
+    # Not a daemon: closing the Council in the first seconds waits for the
+    # build to finish rather than ending the process under it (a daemon
+    # thread still writing at exit is what failed Windows CI once).
+    threading.Thread(target=make_typhon_plugins, daemon=False,
                      name="designer-typhon-plugins").start()
     return tab
