@@ -8,7 +8,7 @@ Bottles pass the photo-eye every `pitch_mm / speed_mm_s` seconds. At each
 one the "ladder" adds 1 to the bottle count (MHR1 by default, wrapping at
 65535, as INC on an MHR does) after `scan_ms` (the PLC's scan), and keeps
 the belt speed in MHR2 (mm/s). `detections` lists when each bottle really
-crossed the photo-eye (time.monotonic()), so a test can check when the
+crossed the photo-eye (time.perf_counter()), so a test can check when the
 camera fired against when the bottle reached the camera.
 
 Only on 127.0.0.1, only while it runs; nothing is written to disk.
@@ -102,7 +102,7 @@ class SimulatedPlc:
 
     def bottle(self) -> None:
         """One bottle crosses the photo-eye now."""
-        crossed = time.monotonic()
+        crossed = time.perf_counter()
         with self._lock:
             self.detections.append(crossed)
             self.pulses.append(crossed)
@@ -117,10 +117,11 @@ class SimulatedPlc:
         """The ladder's fire rung, once a scan: a request in the fire
         register pulses the output, is cleared and counted."""
         period = max(self.scan_ms, 0.2) / 1000.0
-        while not self._stop.wait(period):
+        while not self._stop.is_set():
+            time.sleep(period)
             with self._lock:
                 if self.holding[self.fire_offset]:
-                    now = time.monotonic()
+                    now = time.perf_counter()
                     self.holding[self.fire_offset] = 0
                     at = self.presses_offset
                     self.holding[at] = (self.holding[at] + 1) & 0xFFFF
@@ -128,18 +129,21 @@ class SimulatedPlc:
                     self.press_pulses.append(now)
 
     def _conveyor(self) -> None:
-        next_at = time.monotonic() + 0.05
+        next_at = time.perf_counter() + 0.05
         while not self._stop.is_set():
             with self._lock:
                 speed, pitch = self.speed_mm_s, self.pitch_mm
                 running = self.belt_running
             if not running or speed <= 0 or pitch <= 0:
-                next_at = time.monotonic() + 0.05
+                next_at = time.perf_counter() + 0.05
                 self._stop.wait(0.02)
                 continue
-            wait = next_at - time.monotonic()
+            wait = next_at - time.perf_counter()
+            if wait > 0.02:
+                self._stop.wait(min(wait - 0.02, 0.05))
+                continue
             if wait > 0:
-                self._stop.wait(min(wait, 0.05))
+                time.sleep(min(wait, 0.001))
                 continue
             self.bottle()
             next_at += pitch / speed

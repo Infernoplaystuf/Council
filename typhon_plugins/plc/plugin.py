@@ -93,10 +93,10 @@ class PlcLink:
             self.client.close()
 
     def read_count(self) -> Tuple[int, float]:
-        """(count, when it was read: time.monotonic() at the reply)."""
-        sent = time.monotonic()
+        """(count, when it was read: time.perf_counter() at the reply)."""
+        sent = time.perf_counter()
         value = self.client.read_one(self.count_at)
-        got = time.monotonic()
+        got = time.perf_counter()
         rtt = got - sent
         self.rtt_s = rtt if self.rtt_s == 0 else 0.9 * self.rtt_s + 0.1 * rtt
         return value, got
@@ -109,6 +109,19 @@ class PlcLink:
         return timing.speed_from_register(raw, self.settings.speed_scale)
 
 
+def _pause(stop: threading.Event, seconds: float) -> None:
+    """Wait up to `seconds` (or until `stop`), to the millisecond on
+    Windows too: there an Event's wait and time.monotonic tick every
+    ~15.6 ms (measured on the CI runner: bottles fired 13-29 ms late),
+    while time.sleep and time.perf_counter are fine-grained (Python 3.11+).
+    Long waits use the Event, so stop is still seen at once; the last
+    20 ms are slept in 1 ms steps."""
+    if seconds > 0.02:
+        stop.wait(min(seconds - 0.02, 0.05))
+    elif not stop.is_set():
+        time.sleep(min(seconds, 0.001))
+
+
 class PlcSource:
     """The network mode's trigger source for one run: reads the bottle
     count every poll and fires each bottle at its time (a heap of times;
@@ -119,7 +132,7 @@ class PlcSource:
 
     def __init__(self, name: str, make_link: Callable[[], PlcLink],
                  settings: timing.PlcSettings,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.perf_counter) -> None:
         self.name = name
         self._make_link = make_link
         self.settings = settings
@@ -202,7 +215,7 @@ class PlcSource:
                                                          pending[0])
                 wait = wake - self._clock()
                 if wait > 0:
-                    self._stop.wait(min(wait, 0.05))
+                    _pause(self._stop, wait)
         finally:
             link.close()
 
