@@ -378,6 +378,19 @@ Typhon through `run-typhon-plugins.bat`, it's
 `~\Typhon-plugins-app\typhon\plugins\`. Each plugin is its own folder, and
 the folder can have any name.
 
+**Typhon (plugins) in the Council's own Designer (24 November 2026).** The
+second Council of `run-typhon-plugins.bat` is no longer needed. The Council's
+Designer makes the project `typhon_plugins` by itself the first time it opens
+on a vault (once: delete it and it stays deleted), and New from example
+builds more. Its classifiers live in `<vault>/classifiers_typhon_plugins`,
+never in `<vault>/classifiers`, the library the other apps share.
+
+**On and off.** **Plugins…** lists every plugin, built in or from someone
+else, of every kind (feature, trigger source, camera), each with a tick box.
+The Designer's **Export app…** asks the same: a tick box per plugin, written
+into the exported copy's plugin list. Every plugin's code goes with the
+export either way, so one left off can be ticked later.
+
 **What Typhon reads, and when.** When Typhon starts (or opens a project, or
 you press **Rescan**), it reads every file of every plugin folder and
 records each file's sha256. **Those exact bytes are what run.** Editing a

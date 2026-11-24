@@ -56,7 +56,8 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (Dict, Iterable, List, Mapping, Optional, Sequence, Set,
+                    Tuple)
 
 #: The Council's own folder (the repository root, or a bundle's).
 COUNCIL_ROOT = Path(__file__).resolve().parent.parent
@@ -818,13 +819,62 @@ Exported from Council commit {commit or '(unknown)'}.
 """
 
 
+def plugin_choices(project_dir: Path) -> List[Tuple[str, str, bool]]:
+    """(id, name, on) for every Typhon plugin an exported copy of this
+    project could run: each built-in plugin, then any other its plugin
+    list names, ticked as the project runs them now. [] for a project with
+    no plugin list (not a Typhon (plugins) app). Reads only."""
+    from council_core import plugin_host as ph
+    from council_core import plugin_lists as pl
+    from council_core import plugin_manifest as pm
+
+    try:
+        project = pl.read_project(project_dir)
+    except pl.PluginListError:
+        return []
+    if project is None:
+        return []
+    runs = set(project.runs())
+    out: List[Tuple[str, str, bool]] = []
+    for pid, folder in ph.BUILTIN_PLUGINS:
+        try:
+            name = pm.read(ph.BUILTIN_DIR / folder, builtin=True).name
+        except Exception:                                 # noqa: BLE001
+            name = pid
+        out.append((pid, name, pid in runs))
+    known = {pid for pid, _n, _o in out}
+    for pid in project.base_set + project.added:
+        if pid not in known:
+            known.add(pid)
+            out.append((pid, pid, pid in runs))
+    return out
+
+
+def _set_plugins(project_dir: Path, plugins: Mapping[str, bool]) -> None:
+    """The exported COPY's plugin list: each plugin on or off as ticked
+    (the project itself is never changed)."""
+    from council_core import plugin_lists as pl
+
+    if pl.read_project(project_dir) is None:
+        return
+    for pid, on in plugins.items():
+        if on:
+            pl.switch_on(project_dir, pid)
+        else:
+            pl.switch_off(project_dir, pid)
+
+
 def export_app(project_dir: Path, dest_parent: Path, *,
                name: Optional[str] = None,
-               with_classifiers: bool = False) -> ExportResult:
+               with_classifiers: bool = False,
+               plugins: Optional[Mapping[str, bool]] = None) -> ExportResult:
     """Export the project at `project_dir` into a new folder
     `dest_parent/<name>` (default: the project's name). Refused, with
     nothing written, when that folder exists or the project is not a
-    generated app."""
+    generated app. `plugins` ({id: on}, from the Designer's tick boxes)
+    switches each plugin on or off in the exported copy's plugin list;
+    every built-in plugin's code goes with it either way, so a plugin left
+    off can be ticked in the exported Typhon's Plugins… later."""
     src = Path(project_dir).resolve()
     if not (src / "main.py").is_file() or not (src / "app.py").is_file():
         raise ExportError(f"{src} is not a generated app (no main.py and "
@@ -859,6 +909,8 @@ def export_app(project_dir: Path, dest_parent: Path, *,
                                     dir=str(dest_parent)))
     try:
         copied = _copy_project(src, staging)
+        if plugins:
+            _set_plugins(staging, plugins)
         _write(staging / "main.py", main_text)
         lib = staging / LIB_DIR
         lib.mkdir()
@@ -927,7 +979,8 @@ def export_app(project_dir: Path, dest_parent: Path, *,
             "from_project": str(src), "council_commit": commit,
             "council_modules": list(modules),
             "requires": required, "optional": optional,
-            "with_classifiers": bool(with_classifiers)}
+            "with_classifiers": bool(with_classifiers),
+            "plugins": {k: bool(v) for k, v in (plugins or {}).items()}}
         _write(staging / EXPORT_FILE, json.dumps(record, indent=2) + "\n")
         os.replace(staging, dest)
     except BaseException:

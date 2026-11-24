@@ -23,11 +23,12 @@ WINDOWS_FILE beside the plugin list, written atomically; a remembered place
 that is no longer on any screen is not used.
 
 THE PLUGINS WINDOW
-Each feature plugin with a tick box (ticked = this project runs it) and its
-state and reason (host.states()). Unticking switches it off in this project
+Every plugin with a tick box (ticked = this project runs it) and its
+state and reason (host.states()): built-in feature, trigger-source and
+camera plugins alike (24 November 2026; before, built-in camera and source
+plugins were not listed). Unticking switches it off in this project
 now (host.switch_off: its instance is deactivated, its window closed, its
-button gone); ticking switches it on. Built-in camera plugins are not
-listed: the set-up wizard chooses the camera families. Every plugin from
+button gone); ticking switches it on. Every plugin from
 someone else is listed, any kind, with "Review and approve…" while it waits
 for approval and "Withdraw approval" once approved; "Open plugins folder"
 and "Rescan" find one dragged in (stage P5, 9 November 2026).
@@ -296,7 +297,7 @@ class PluginStrip:
         return dlg
 
     def switch(self, pid: str, on: bool) -> str:
-        """Switch feature plugin `pid` on or off in this project; what
+        """Switch plugin `pid` (any kind) on or off in this project; what
         happened."""
         try:
             if on:
@@ -317,8 +318,9 @@ class PluginStrip:
 
 class PluginsDialog(QDialog):
     """Which plugins this project runs, with each one's state: every
-    feature plugin, and every plugin from someone else (any kind — a camera
-    plugin's cameras are listed at the next camera scan). A plugin from
+    plugin, built in or from someone else, of any kind (a camera plugin's
+    cameras are listed at the next camera scan; one switched off offers
+    none). A plugin from
     someone else waits for approval: "Review and approve…" shows what it
     is before it may run (stage P5; design 4.6). "Open plugins folder" is
     where such a plugin's folder is dragged; "Rescan" finds one dragged in
@@ -368,16 +370,16 @@ class PluginsDialog(QDialog):
 
     # -- the rows ----------------------------------------------------------
     def listed_plugins(self) -> List[str]:
-        """Every feature plugin, then every plugin from someone else."""
+        """EVERY plugin, each with its tick box (Andy, 24 November 2026:
+        "All plugins should be a tick box to turn them on or off"): the
+        feature, trigger-source and camera plugins built in, then every
+        plugin from someone else. Until then only feature plugins were
+        listed, and a built-in source plugin (the PLC trigger) could not be
+        switched on at all."""
         host = self.strip.host
         out = []
         for pid, _state, _why in host.states():
-            m = host.manifest(pid)
-            rec = host.record(pid)
-            if m is None:
-                continue
-            if m.kind == "feature" or (rec is not None and not rec.builtin
-                                       and rec.factory is None):
+            if host.manifest(pid) is not None:
                 out.append(pid)
         return out
 

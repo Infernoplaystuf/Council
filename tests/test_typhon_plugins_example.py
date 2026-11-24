@@ -39,6 +39,7 @@ import run_example_gui as rex
 from council_core import camera_setup as cs
 from council_core import capture
 from council_core import designer_examples as dx
+from council_core import plugin_lists as pl
 from tests.sim_cameras import simulated_index
 from PySide6.QtWidgets import QApplication
 
@@ -159,7 +160,8 @@ def test_its_classifier_store_is_pinned_to_the_vault_it_was_built_in(
     pin = json.loads((pdir / dx.CLASSIFIER_STORE_FILE).read_text(
         encoding="utf-8"))
     store = Path(pin["store"]).expanduser().resolve()
-    assert store == Path(vault).resolve() / "classifiers"
+    assert store == Path(vault).resolve() / dx.OWN_STORE_NAME
+    assert dx.OWN_STORE_NAME != "classifiers", "never the shared library"
     assert dx.CLASSIFIER_STORE_FILE == frame_classes.STORE_CONFIG
 
 
@@ -175,7 +177,7 @@ def test_a_double_clicked_app_still_finds_its_own_store(
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(sys, "argv", [str(pdir / "main.py")])
     assert frame_classes.classifier_store().resolve() == \
-        Path(vault).resolve() / "classifiers"
+        Path(vault).resolve() / dx.OWN_STORE_NAME
     # Today's Typhon, double-clicked, shares the default store — as before.
     typhon = rex.build("typhon", project="typhon_today", vault_dir=vault,
                        target="qt")
@@ -185,28 +187,30 @@ def test_a_double_clicked_app_still_finds_its_own_store(
         Path.home() / ".council" / "vault" / "classifiers"
 
 
-def test_it_is_never_built_into_the_councils_own_vault(tmp_path, monkeypatch):
-    """Built into ~/.council/vault, its "own" store would be the user's real
-    library. Refused before anything is written, by the CLI's pipeline and
-    by the Designer's checks alike."""
+def test_it_builds_in_the_councils_own_vault_beside_the_library(
+        tmp_path, monkeypatch):
+    """Andy, 24 November 2026: Typhon (plugins) in the Council's own
+    Designer, no side Council. Built into ~/.council/vault it keeps its
+    classifiers in a folder of its own there, never the user's library
+    (<vault>/classifiers), which it does not create or touch."""
     home = tmp_path / "home"
     real_vault = home / ".council" / "vault"
-    real_vault.mkdir(parents=True)
+    library = real_vault / "classifiers"
+    library.mkdir(parents=True)
+    (library / "mine.json").write_text("{}", encoding="utf-8")
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(pl.HOME_ENV, raising=False)
     assert Path.home() == home
-    with pytest.raises(dx.ExampleError, match="own vault"):
-        dx.build_project(NAME, "tp", real_vault, toolkit="qt")
-    assert not (real_vault / gpj.PROJECTS_DIRNAME).exists() or not any(
-        (real_vault / gpj.PROJECTS_DIRNAME).iterdir())
     answers = dx.ExampleAnswers(example=NAME, project="tp", toolkit="qt",
                                 python="")
-    assert "own vault" in dx.problem(answers, real_vault)
-    assert dx.problem(answers, tmp_path / "side_vault") == ""
-    # Today's Typhon builds there as it always has.
-    assert dx.problem(dx.ExampleAnswers(example="typhon", project="t",
-                                        toolkit="qt", python=""),
-                      real_vault) == ""
+    assert dx.problem(answers, real_vault) == ""
+    pdir = dx.build_project(NAME, "tp", real_vault,
+                            toolkit="qt").project_dir
+    pin = json.loads((Path(pdir) / dx.CLASSIFIER_STORE_FILE).read_text(
+        encoding="utf-8"))
+    assert pin["store"] == f"~/.council/vault/{dx.OWN_STORE_NAME}"
+    assert sorted(p.name for p in library.iterdir()) == ["mine.json"]
 
 
 def test_the_pin_is_written_once_and_never_over_a_file(tmp_path):
@@ -227,11 +231,11 @@ def test_a_vault_outside_the_home_folder_is_pinned_absolute(
     (tmp_path / "a").mkdir()
     inside = dx.pin_classifier_store(tmp_path / "a", home / "tp-vault")
     assert json.loads(inside.read_text(encoding="utf-8"))["store"] == \
-        "~/tp-vault/classifiers"
+        f"~/tp-vault/{dx.OWN_STORE_NAME}"
     (tmp_path / "b").mkdir()
     outside = dx.pin_classifier_store(tmp_path / "b", tmp_path / "elsewhere")
     stored = json.loads(outside.read_text(encoding="utf-8"))["store"]
-    assert Path(stored) == (tmp_path / "elsewhere" / "classifiers").resolve()
+    assert Path(stored) == (tmp_path / "elsewhere" / dx.OWN_STORE_NAME).resolve()
 
 
 # ======================================================================
@@ -324,3 +328,40 @@ def test_it_captures_a_run_through_the_rig(ui, tmp_path):
         encoding="utf-8"))
     assert record["format_version"] == 1
     assert (tmp_path / f"{run}_run_end.json").is_file()
+
+
+# ======================================================================
+# Made once per vault, on its own (Andy, 24 November 2026)
+# ======================================================================
+def test_the_council_makes_typhon_plugins_once(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(pl.HOME_ENV, raising=False)
+    vault = tmp_path / "vault"
+    words = dx.ensure_auto_project(vault)
+    assert "Made the Typhon (plugins) project" in words, words
+    pdir = gpj.project_path(dx.AUTO_PROJECT, vault)
+    assert (pdir / "main.py").is_file()
+    assert (pdir / pl.PROJECT_FILE).is_file()
+    assert gpj.load_manifest(pdir).example == NAME
+    assert dx.ensure_auto_project(vault) == "", "once"
+    moved = gpj.delete(dx.AUTO_PROJECT, vault)
+    assert dx.ensure_auto_project(vault) == "", "a deleted one stays gone"
+    assert not pdir.exists() and moved
+
+
+def test_an_existing_project_of_that_name_is_left_alone(tmp_path,
+                                                       monkeypatch):
+    monkeypatch.delenv(pl.HOME_ENV, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    vault = tmp_path / "vault"
+    gpj.create(dx.AUTO_PROJECT, vault_dir=vault, toolkit="qt")
+    before = sorted(p.name for p in gpj.project_path(dx.AUTO_PROJECT,
+                                                     vault).iterdir())
+    assert dx.ensure_auto_project(vault) == ""
+    after = sorted(p.name for p in gpj.project_path(dx.AUTO_PROJECT,
+                                                    vault).iterdir())
+    assert before == after

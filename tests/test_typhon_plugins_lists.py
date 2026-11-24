@@ -402,8 +402,12 @@ def test_typhon_plugins_is_never_made_with_a_plugin_home_under_council(
         tmp_path, fake_user, monkeypatch):
     """Built with TYPHON_PLUGIN_HOME unset, its project would record
     ~/.council/typhon, where the plugin Typhon never writes while it runs
-    beside today's Typhon. Refused before anything is written."""
+    beside today's Typhon. Refused before anything is written. (The rule
+    is off since 24 November 2026, Typhon (plugins) being built in the
+    Council's own Designer; kept for a side Council: switched on here.)"""
     from council_core import designer_examples as dx
+
+    monkeypatch.setattr(pl, "BESIDE_TODAYS_TYPHON", True)
 
     monkeypatch.delenv(pl.HOME_ENV, raising=False)
     vault = tmp_path / "side_vault"

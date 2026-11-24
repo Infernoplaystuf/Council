@@ -10,7 +10,11 @@ export it to other machines."
 - GUI Designer: open the project, **Export app…**, choose a folder. The app
   gets a new folder there (never an existing one), and is then checked to
   start with no Council. A Yes to "Copy this PC's classifiers…" copies the
-  classifier store into it.
+  classifier store into it. A Typhon (plugins) app then gets a tick box
+  per plugin (every built-in one, ticked as the project runs it): the
+  ticks go into the exported copy's `typhon_plugins.json`, the project is
+  not changed, and every plugin's code is exported either way (24 November
+  2026).
 - Command line: `python tools/export_app.py <project name or folder> <dest>
   [--name N] [--with-classifiers] [--no-check]`.
 

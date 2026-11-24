@@ -133,6 +133,10 @@ same list.
   progress; it was written for the desktop's `knowledge-graph` branch).
 - The graph's Excel / Ledger sources, inspector initials and outside folders:
   `docs/handoff/kg_excel_2026-10-16.md`.
+- Typhon (plugins) in the Council's own Designer since 2026-11-24 (made by itself
+  once per vault, `designer_examples.ensure_auto_project`; classifiers in
+  `<vault>/classifiers_typhon_plugins`; every plugin a tick box in Plugins… and in
+  Export app…): `docs/typhon_camera_plugins.md` section 10.
 - The plugin Typhon on branch `typhon-plugins` (design: `docs/typhon_plugins_design.md`):
   `docs/typhon_plugins_branch.md` says how "Typhon (plugins)" runs beside today's Typhon
   (`run-typhon-plugins.bat`, its side vault), its traps, and the branch gate every commit

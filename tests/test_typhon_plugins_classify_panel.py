@@ -254,9 +254,11 @@ def test_the_plugins_window_switches_the_classifier_off_and_on(ui, built):
     dlg = strip.open_plugins_window()
     box = dlg.boxes[CLASSIFY]
     assert box.isChecked() and set(dlg.boxes) >= {CLASSIFY, "typhon.trigger"}
-    assert not any(p in dlg.boxes for p in ("typhon.basler",
-                                            "typhon.simulated")), \
-        "camera families are the set-up wizard's"
+    # Every plugin has a tick box, camera and source plugins too (Andy,
+    # 24 November 2026)
+    assert {"typhon.basler", "typhon.simulated", "typhon.plc"} <= \
+        set(dlg.boxes)
+    assert not dlg.boxes["typhon.plc"].isChecked(), "optional: off at first"
     box.setChecked(False)
     host = frame_camera._RIG.plugins
     assert host.state(CLASSIFY)[0] == "off"

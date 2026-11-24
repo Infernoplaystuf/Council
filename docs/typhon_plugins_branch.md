@@ -1,5 +1,13 @@
 # The typhon-plugins branch: running "Typhon (plugins)" beside today's Typhon
 
+> **Since 24 November 2026 (Andy) this side set-up is optional.** Typhon
+> (plugins) is on `qt-migration`, and the Council's own Designer makes the
+> `typhon_plugins` project by itself, its classifiers in
+> `<vault>/classifiers_typhon_plugins` (never the shared `classifiers`), its
+> plugin home `~/.council/typhon` (`plugin_lists.BESIDE_TODAYS_TYPHON` is
+> False). What follows is how the side Council worked, kept for a side
+> checkout.
+
 Branch `typhon-plugins` builds the plugin Typhon of
 `docs/typhon_plugins_design.md` together with multi-camera stage M1. Today's
 Typhon stays on `qt-migration`, takes bug fixes only, and keeps working

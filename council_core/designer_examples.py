@@ -253,12 +253,19 @@ def problem(answers: ExampleAnswers, vault_dir: Any) -> str:
 CLASSIFIER_STORE_FILE = "classifier_store.json"
 
 
+#: The folder in the vault where a project with a store of its own keeps its
+#: classifiers. NOT <vault>/classifiers: that is the store every other app
+#: of the vault shares (frame_classes' default), the user's library.
+OWN_STORE_NAME = "classifiers_typhon_plugins"
+
+
 def own_store_folder(vault_dir: Any) -> Path:
-    """<vault>/classifiers of the vault a project is built into."""
+    """<vault>/classifiers_typhon_plugins of the vault a project is built
+    into: a store of its own, beside the user's library, never it."""
     import gui_projects as gpj
 
     return gpj.resolve_vault_root(vault_dir).expanduser().resolve() \
-        / "classifiers"
+        / OWN_STORE_NAME
 
 
 def own_store_problem(vault_dir: Any) -> str:
@@ -266,28 +273,18 @@ def own_store_problem(vault_dir: Any) -> str:
     (gui_examples.OWN_CLASSIFIER_STORE) cannot be built into this vault, or
     "" when it can.
 
-    Its store is <vault>/classifiers, so built into the Council's own
-    vault (under ~/.council) the "own" store would be the user's real
-    library — which "Typhon (plugins)" must never share or touch (design
-    7.1, question 10). It is built from the Council that
-    run-typhon-plugins.bat starts, on its side vault."""
-    import gui_projects as gpj
-
-    vault = gpj.resolve_vault_root(vault_dir).expanduser().resolve()
-    real = (Path.home() / ".council").resolve()
-    if vault == real or real in vault.parents:
-        return (f"this example keeps its classifiers in a store of its own "
-                f"in the vault it is built in, and {vault} is the Council's "
-                f"own vault, whose classifiers are your library — build it "
-                f"from the Council run-typhon-plugins.bat starts, on its "
-                f"side vault (docs/typhon_plugins_branch.md). Nothing was "
-                f"built.")
+    Until 24 November 2026 its store was <vault>/classifiers, so it was
+    refused in the Council's own vault (that is the user's library, which
+    "Typhon (plugins)" must never share or touch: design 7.1, question 10)
+    and built from a side Council. Andy asked for it in the Council's own
+    Designer: its store is now a folder of its own in any vault
+    (OWN_STORE_NAME), so every vault takes it."""
     return ""
 
 
 def pin_classifier_store(project_dir: Any, vault_dir: Any) -> Path:
-    """Write classifier_store.json beside the app, naming <vault>/classifiers
-    of the vault it was built in — so the app finds that one store whether
+    """Write classifier_store.json beside the app, naming
+    <vault>/classifiers_typhon_plugins of the vault it was built in — so the app finds that one store whether
     the Council started it or it was double-clicked (frame_classes reads
     the file before falling back to ~/.council/vault).
 
@@ -464,6 +461,54 @@ def build_project(example: str, project: str, vault_dir: Any, *,
                         files_written=list(res.files_written),
                         files_skipped=list(res.files_skipped),
                         warnings=list(res.warnings))
+
+
+# ============================================================
+# Typhon (plugins) made once, on its own (Andy, 24 November 2026)
+# ============================================================
+
+#: The project the Council makes for Typhon (plugins) the first time its
+#: Designer opens on a vault, and the file that says it did (so a project
+#: the user deleted or renamed is not made again).
+AUTO_EXAMPLE = "typhon_plugins"
+AUTO_PROJECT = "typhon_plugins"
+AUTO_MARKER = ".typhon_plugins_made"
+
+
+def ensure_auto_project(vault_dir: Any, toolkit: str = "qt") -> str:
+    """Make the Typhon (plugins) project in this vault if it was never
+    made here: "It should just be automatically imported into the Council's
+    designer when the qt-migration branch is pulled. I don't want extra
+    steps to add it" (Andy). Never replaces a project: a project of that
+    name already there is left as it is. Writes the marker either way, so
+    it is tried once per vault. What happened, in words ("" when nothing
+    was to do). Never raises. Blocking (a whole generate): off the UI
+    thread."""
+    import gui_projects as gpj
+
+    try:
+        root = gpj.resolve_vault_root(vault_dir).expanduser()
+        marker = root / AUTO_MARKER
+        if marker.exists():
+            return ""
+        if gpj.project_path(AUTO_PROJECT, vault_dir).exists():
+            words = ""
+        else:
+            built = build_project(AUTO_EXAMPLE, AUTO_PROJECT, vault_dir,
+                                  toolkit=toolkit)
+            words = (f"Made the Typhon (plugins) project "
+                     f"{AUTO_PROJECT!r} ({built.project_dir}): open it "
+                     f"with Open.")
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(marker, "x", encoding="utf-8") as handle:
+                handle.write("made once by the Council's Designer "
+                             "(designer_examples.ensure_auto_project)\n")
+        except FileExistsError:
+            pass
+        return words
+    except Exception as exc:                              # noqa: BLE001
+        return f"Typhon (plugins) was not made: {exc}"
 
 
 def build(answers: ExampleAnswers, vault_dir: Any) -> ExampleBuild:
