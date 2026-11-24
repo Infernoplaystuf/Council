@@ -29,6 +29,12 @@ MODE_WIRE = "Wire (PLC output to camera)"
 MODE_NETWORK = "Network (Typhon fires)"
 MODES = (MODE_WIRE, MODE_NETWORK)
 
+LINK_TCP = "Ethernet (Modbus TCP)"
+LINK_SERIAL = "Serial (Modbus RTU)"
+LINKS = (LINK_TCP, LINK_SERIAL)
+PARITIES = ("None", "Even", "Odd")
+BAUDS = (9600, 19200, 38400, 57600, 115200)
+
 SPEED_FIXED = "Fixed"
 SPEED_PLC = "From PLC register"
 SPEEDS = (SPEED_FIXED, SPEED_PLC)
@@ -46,9 +52,16 @@ MAX_WAIT_S = 60.0
 
 @dataclass
 class PlcSettings:
+    link: str = LINK_TCP
     host: str = ""
     port: int = 502
+    #: the PLC's Modbus station (unit) number: over Ethernet Do-More
+    #: answers any; over serial it must match the port's station number
     unit: int = 1
+    serial_port: str = ""
+    baud: int = 115200
+    parity: str = "None"
+    stop_bits: int = 1
     mode: str = MODE_WIRE
     count_register: str = "MHR1"
     speed_source: str = SPEED_FIXED
@@ -88,6 +101,12 @@ class PlcSettings:
             except (TypeError, ValueError):
                 continue
             setattr(out, f.name, value)
+        if out.link not in LINKS:
+            out.link = LINK_TCP
+        if out.parity not in PARITIES:
+            out.parity = "None"
+        out.stop_bits = 2 if out.stop_bits == 2 else 1
+        out.unit = min(max(out.unit, 0), 247)
         if out.mode not in MODES:
             out.mode = MODE_WIRE
         if out.speed_source not in SPEEDS:
@@ -104,7 +123,8 @@ class PlcSettings:
         return asdict(self)
 
 
-def travel_s(distance_mm: float, speed_mm_s: Optional[float]) -> Optional[float]:
+def travel_s(distance_mm: float, speed_mm_s: Optional[float]
+             ) -> Optional[float]:
     """Seconds from the photo-eye to the middle of the view, or None when
     the belt is stopped or the speed unknown."""
     if speed_mm_s is None or speed_mm_s <= 0:

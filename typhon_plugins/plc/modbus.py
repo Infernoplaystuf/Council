@@ -1,6 +1,7 @@
 """
-A small Modbus TCP client (standard library only) for the PLC plugin, and
-how a Do-More address names a Modbus register.
+A small Modbus client (standard library only) for the PLC plugin — Modbus
+TCP over Ethernet, or Modbus RTU over a serial port — and how a Do-More
+address names a Modbus register.
 
 WHY OUR OWN
 Modbus TCP is a 7-byte header and a few function codes; the plugin needs
@@ -27,7 +28,7 @@ import socket
 import struct
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 HOLDING = "holding"
 INPUT = "input"
@@ -212,3 +213,105 @@ class ModbusClient:
                                      2 * len(values))
                      + struct.pack(f">{len(values)}H", *values))
 
+
+
+# ======================================================================
+# Modbus RTU over a serial port (Andy, 24 November 2026: "a serial
+# connection between the GUI and the PLC")
+# ======================================================================
+def crc16(data: bytes) -> int:
+    """Modbus RTU's CRC-16 (polynomial 0xA001, start 0xFFFF)."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def rtu_frame(unit: int, pdu: bytes) -> bytes:
+    """A request or reply as it goes down the wire: unit, PDU, CRC (low
+    byte first)."""
+    body = bytes([unit & 0xFF]) + pdu
+    return body + struct.pack("<H", crc16(body))
+
+
+class ModbusRtuClient(ModbusClient):
+    """The same requests as ModbusClient, framed for Modbus RTU on a serial
+    port (RS-232 or RS-485). `open_port()` makes the port: an object with
+    write(bytes), read(n) -> bytes (fewer on timeout), reset_input_buffer()
+    and close() — pyserial's Serial, or the simulator's stand-in. Opened on
+    first use and again after a failure; one request at a time."""
+
+    def __init__(self, open_port: Any, unit: int = 1, name: str = "",
+                 timeout_s: float = DEFAULT_TIMEOUT_S) -> None:
+        super().__init__("", unit=unit, timeout_s=timeout_s)
+        self._open_port = open_port
+        self.name = str(name or "the serial port")
+        self._port: Any = None
+
+    def _drop(self) -> None:
+        port, self._port = self._port, None
+        if port is not None:
+            try:
+                port.close()
+            except Exception:                             # noqa: BLE001
+                pass
+
+    def _read(self, n: int) -> bytes:
+        data = self._port.read(n)
+        if len(data) < n:
+            raise ModbusError(f"no answer from the PLC on {self.name} (check "
+                              f"the cable, baud rate, parity and station "
+                              f"number)")
+        return bytes(data)
+
+    def request(self, function: int, body: bytes) -> bytes:
+        with self._lock:
+            if self._port is None:
+                try:
+                    self._port = self._open_port()
+                except ModbusError:
+                    raise
+                except Exception as exc:                  # noqa: BLE001
+                    raise ModbusError(f"cannot open {self.name} ({exc})") \
+                        from exc
+            pdu = bytes([function]) + body
+            try:
+                try:
+                    self._port.reset_input_buffer()
+                except Exception:                         # noqa: BLE001
+                    pass
+                self._port.write(rtu_frame(self.unit, pdu))
+                head = self._read(2)
+                code = head[1]
+                if code & 0x80:
+                    rest = self._read(3)
+                elif code in (3, 4):
+                    count = self._read(1)
+                    rest = count + self._read(count[0] + 2)
+                elif code in (6, 16):
+                    rest = self._read(6)
+                else:
+                    raise ModbusError("the PLC sent a reply Typhon cannot "
+                                      "read")
+            except ModbusError:
+                self._drop()
+                raise
+            except Exception as exc:                      # noqa: BLE001
+                self._drop()
+                raise ModbusError(f"lost {self.name} ({exc})") from exc
+            frame = head + rest
+            if crc16(frame[:-2]) != struct.unpack("<H", frame[-2:])[0]:
+                self._drop()
+                raise ModbusError(f"a garbled reply on {self.name} (check "
+                                  f"the baud rate and parity)")
+            if head[0] != self.unit:
+                raise ModbusError(f"station {head[0]} answered, not "
+                                  f"{self.unit}")
+            if code == function | 0x80:
+                why = _EXCEPTIONS.get(rest[0], "unknown exception")
+                raise ModbusError(f"the PLC refused: {why}")
+            if code != function:
+                raise ModbusError("the PLC answered a different request")
+            return bytes(rest[:-2])

@@ -47,6 +47,18 @@ def _spin(parent: QWidget, lo: float, hi: float, value: float,
     return box
 
 
+def _show_row(form: QFormLayout, field: QWidget, shown: bool) -> None:
+    """Show or hide a form row (setRowVisible from Qt 6.4; before it, the
+    field and its label)."""
+    if hasattr(form, "setRowVisible"):
+        form.setRowVisible(field, shown)
+        return
+    field.setVisible(shown)
+    label = form.labelForField(field)
+    if label is not None:
+        label.setVisible(shown)
+
+
 class PlcPanel(QWidget):
     def __init__(self, plugin: Any, parent: Any = None) -> None:
         super().__init__(parent)
@@ -62,6 +74,11 @@ class PlcPanel(QWidget):
         # -- the PLC --------------------------------------------------------
         plc = QGroupBox("PLC", self)
         form = QFormLayout(plc)
+        self.plc_form = form
+        self.link = QComboBox(plc)
+        self.link.addItems(list(timing.LINKS))
+        self.link.setCurrentText(s.link)
+        form.addRow("Connection", self.link)
         self.host = QLineEdit(s.host, plc)
         self.host.setPlaceholderText("192.168.1.10")
         self.port = QSpinBox(plc)
@@ -71,7 +88,51 @@ class PlcPanel(QWidget):
         row.addWidget(self.host, 1)
         row.addWidget(QLabel("port", plc))
         row.addWidget(self.port)
-        form.addRow("Address", row)
+        self.address_row = QWidget(plc)
+        self.address_row.setLayout(row)
+        row.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Address", self.address_row)
+        # the serial port (Modbus RTU)
+        self.serial_port = QComboBox(plc)
+        self.serial_port.setEditable(True)
+        self.serial_port.addItems(plugin.serial_ports())
+        self.serial_port.setCurrentText(s.serial_port)
+        self.serial_port.setToolTip("The PC's serial port wired to the "
+                                    "PLC's (COM1, COM3 …; a USB adapter "
+                                    "shows up as one).")
+        self.baud = QComboBox(plc)
+        self.baud.addItems([str(b) for b in timing.BAUDS])
+        self.baud.setEditable(True)
+        self.baud.setCurrentText(str(s.baud))
+        self.parity = QComboBox(plc)
+        self.parity.addItems(list(timing.PARITIES))
+        self.parity.setCurrentText(s.parity)
+        self.stop_bits = QComboBox(plc)
+        self.stop_bits.addItems(["1", "2"])
+        self.stop_bits.setCurrentText(str(s.stop_bits))
+        srow = QHBoxLayout()
+        srow.setContentsMargins(0, 0, 0, 0)
+        srow.addWidget(self.serial_port, 1)
+        srow.addWidget(QLabel("baud", plc))
+        srow.addWidget(self.baud)
+        self.serial_row = QWidget(plc)
+        self.serial_row.setLayout(srow)
+        form.addRow("Serial port", self.serial_row)
+        prow = QHBoxLayout()
+        prow.setContentsMargins(0, 0, 0, 0)
+        prow.addWidget(QLabel("parity", plc))
+        prow.addWidget(self.parity)
+        prow.addWidget(QLabel("stop bits", plc))
+        prow.addWidget(self.stop_bits)
+        prow.addWidget(QLabel("station", plc))
+        self.unit = QSpinBox(plc)
+        self.unit.setRange(0, 247)
+        self.unit.setValue(s.unit)
+        prow.addWidget(self.unit)
+        prow.addStretch(1)
+        self.framing_row = QWidget(plc)
+        self.framing_row.setLayout(prow)
+        form.addRow("", self.framing_row)
         self.simulated = QCheckBox("Use a simulated PLC (no hardware)", plc)
         self.simulated.setChecked(s.simulated)
         form.addRow("", self.simulated)
@@ -166,7 +227,13 @@ class PlcPanel(QWidget):
 
         for w in (self.host, self.count_register, self.speed_register):
             w.editingFinished.connect(self.save)
-        for w in (self.port, self.frames):
+        self.serial_port.lineEdit().editingFinished.connect(self.save)
+        self.serial_port.activated.connect(self.save)
+        self.baud.lineEdit().editingFinished.connect(self.save)
+        self.baud.activated.connect(self.save)
+        for w in (self.link, self.parity, self.stop_bits):
+            w.currentTextChanged.connect(self.save)
+        for w in (self.port, self.frames, self.unit):
             w.valueChanged.connect(self.save)
         for w in (self.speed, self.speed_scale, self.distance, self.latency,
                   self.offset, self.poll, self.view_mm):
@@ -189,7 +256,16 @@ class PlcPanel(QWidget):
 
     # -- keeping the settings ---------------------------------------------
     def values(self) -> Dict[str, Any]:
-        return {"host": self.host.text().strip(), "port": self.port.value(),
+        try:
+            baud = int(self.baud.currentText())
+        except ValueError:
+            baud = self.plugin.settings.baud
+        return {"link": self.link.currentText(),
+                "serial_port": self.serial_port.currentText().strip(),
+                "baud": baud, "parity": self.parity.currentText(),
+                "stop_bits": int(self.stop_bits.currentText()),
+                "unit": self.unit.value(),
+                "host": self.host.text().strip(), "port": self.port.value(),
                 "simulated": self.simulated.isChecked(),
                 "mode": self.mode.currentText(),
                 "count_register": self.count_register.text().strip(),
@@ -223,15 +299,22 @@ class PlcPanel(QWidget):
         self.speed.setEnabled(not from_plc or self.simulated.isChecked())
         self.speed_register.setEnabled(from_plc)
         self.speed_scale.setEnabled(from_plc)
-        self.host.setEnabled(not self.simulated.isChecked())
-        self.port.setEnabled(not self.simulated.isChecked())
+        sim = self.simulated.isChecked()
+        serial = self.link.currentText() == timing.LINK_SERIAL
+        self.host.setEnabled(not sim)
+        self.port.setEnabled(not sim)
+        self.serial_port.setEnabled(not sim)
+        for row, shown in ((self.address_row, not serial),
+                           (self.serial_row, serial),
+                           (self.framing_row, serial)):
+            _show_row(self.plc_form, row, shown)
 
     # -- the readout --------------------------------------------------------
     def refresh(self) -> None:
         r = self.plugin.reading
-        if not (self.plugin.settings.host or self.plugin.settings.simulated):
-            self.readout.setText("Set the PLC's address (or tick the "
-                                 "simulated PLC).")
+        if not self.plugin._set_up():
+            self.readout.setText("Set the PLC's address or serial port (or "
+                                 "tick the simulated PLC).")
             return
         parts = []
         if r.get("connected"):
@@ -298,4 +381,5 @@ class PlcPanel(QWidget):
             self._calibrated = text
             self._calibrating = False
 
-        threading.Thread(target=work, daemon=True, name="plc-calibrate").start()
+        threading.Thread(target=work, daemon=True,
+                         name="plc-calibrate").start()

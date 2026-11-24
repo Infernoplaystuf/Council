@@ -8,10 +8,10 @@ API: the plugin reaches it through typhon_plugin_api.builtin.
 The bottle is told from the belt by its edges: each picture's gradient
 energy is summed across the belt, giving a profile along it; the busiest
 stretch of that profile (above its median by a few spreads) is the
-bottle, and the middle of that stretch is the bottle's place. The offset from the
-picture's middle, in pixels along the belt's direction, says how early
-(negative) or late (positive) the picture was taken; timing.correction_ms
-turns the median offset into milliseconds.
+bottle, and the middle of that stretch is the bottle's place. The offset
+from the picture's middle, in pixels along the belt's direction, says how
+early (negative) or late (positive) the picture was taken; the plugin's
+timing.correction_ms turns the median offset into milliseconds.
 
 Works best on a plain belt; a busy belt or a bottle filling the view gives
 no clear stretch, and that picture is skipped (said in the result).

@@ -87,6 +87,9 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     # import
     "bottle_calibrate": ("council_core.bottle_position", "calibrate"),
     "latest_pictures": ("council_core.bottle_position", "latest_pictures"),
+    # its serial link (council_core/serial_port.py: pyserial, optional)
+    "open_serial_port": ("council_core.serial_port", "open_port"),
+    "serial_ports": ("council_core.serial_port", "list_ports"),
 }
 
 __all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])

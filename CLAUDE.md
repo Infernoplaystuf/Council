@@ -251,7 +251,8 @@ same list.
   `council_core/openeb_install.py`, `openeb_env.py` finding the build):
   `docs/handoff/typhon_camera_kinds_openeb_2026-11-16.md`.
 - The PLC trigger plugin (`typhon_plugins/plc/`: a Do-More PLC over Modbus
-  TCP, wire mode setting the camera's TriggerDelay from the belt speed,
+  TCP or Modbus RTU on a serial port (`council_core/serial_port.py`,
+  pyserial optional), wire mode setting the camera's TriggerDelay from the belt speed,
   network mode firing from the PLC's bottle count, auto-calibration, the
   missed-bottle check, the simulated PLC; the Do-More Designer set-up):
   `docs/typhon_plc_trigger.md`.

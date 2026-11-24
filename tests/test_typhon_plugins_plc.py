@@ -45,7 +45,8 @@ from tests.test_typhon_plugins_trigger import (  # noqa: E402,F401
 from council_core import bottle_position as cal  # noqa: E402
 from typhon_plugins.plc import timing  # noqa: E402
 from typhon_plugins.plc.modbus import (  # noqa: E402
-    HOLDING, INPUT, ModbusClient, ModbusError, parse_address)
+    HOLDING, INPUT, ModbusClient, ModbusError, ModbusRtuClient, crc16,
+    parse_address, rtu_frame)
 from typhon_plugins.plc.plugin import (  # noqa: E402
     SOURCE_NAME, PlcLink, PlcSource)
 from typhon_plugins.plc.simulator import SimulatedPlc  # noqa: E402
@@ -105,6 +106,71 @@ def test_an_unreachable_plc_is_said_in_words():
 
 
 # ======================================================================
+# Modbus RTU over a serial port
+# ======================================================================
+def test_the_rtu_frame_and_crc():
+    # the textbook request: station 1, read 1 holding register at 0
+    assert rtu_frame(1, bytes.fromhex("0300000001")).hex() == \
+        "010300000001840a"
+    assert crc16(b"") == 0xFFFF
+
+
+def test_the_rtu_client_reads_and_writes_the_plc(sim):
+    client = ModbusRtuClient(sim.rtu_port, unit=1, name="COM9")
+    client.write(parse_address("MHR10"), [7])
+    client.write(parse_address("MHR11"), [1, 65535])
+    assert client.read(parse_address("MHR10"), 3) == [7, 1, 65535]
+    sim.inputs[0] = 42
+    assert client.read_one(parse_address("MIR1")) == 42
+    with pytest.raises(ModbusError, match="not mapped"):
+        client.read_one(parse_address("MHR5000"))
+
+
+def test_rtu_faults_are_said_in_words(sim):
+    wrong = ModbusRtuClient(sim.rtu_port, unit=9, name="COM9", timeout_s=0.1)
+    with pytest.raises(ModbusError, match="no answer from the PLC on COM9"):
+        wrong.read_one(parse_address("MHR1"))
+    ports = []
+
+    def opener():
+        ports.append(sim.rtu_port())
+        return ports[-1]
+
+    client = ModbusRtuClient(opener, unit=1, name="COM9")
+    client.read_one(parse_address("MHR1"))
+    ports[-1].garble = True
+    with pytest.raises(ModbusError, match="garbled"):
+        client.read_one(parse_address("MHR1"))
+    assert ports[0].closed, "a bad reply drops the port"
+    assert client.read_one(parse_address("MHR2")) == 500 and len(ports) == 2
+
+    def missing():
+        raise RuntimeError("the serial link needs pyserial")
+
+    with pytest.raises(ModbusError, match="cannot open COM9.*pyserial"):
+        ModbusRtuClient(missing, name="COM9").read_one(parse_address("MHR1"))
+
+
+def test_the_network_source_works_over_serial():
+    with SimulatedPlc(speed_mm_s=1000.0, pitch_mm=100.0) as plc:
+        s = timing.PlcSettings(link=timing.LINK_SERIAL,
+                               mode=timing.MODE_NETWORK, distance_mm=50.0,
+                               speed_mm_s=1000.0, poll_ms=5.0)
+        client = ModbusRtuClient(plc.rtu_port)
+        source = PlcSource(SOURCE_NAME,
+                           lambda: PlcLink(s, client, owns=False), s)
+        events = []
+        source.start(events.append)
+        assert wait_for(lambda: len(events) >= 4, 5.0)
+        source.stop()
+        assert client._port is not None, "a shared port stays open"
+        client.close()
+    errors = [fired - max(d for d in plc.detections if d <= fired) - 0.05
+              for fired in source.fire_times]
+    assert abs(float(np.median(errors))) < 0.01, errors
+
+
+# ======================================================================
 # The sums
 # ======================================================================
 def test_the_camera_delay_is_travel_less_latency_plus_offset():
@@ -157,6 +223,10 @@ def test_settings_survive_a_round_trip_and_bad_values():
                                           "port": "503", "speed_scale": 0})
     assert odd.mode == timing.MODE_WIRE and odd.poll_ms == 2.0
     assert odd.port == 503 and odd.speed_scale == 1.0
+    assert odd.link == timing.LINK_TCP and odd.parity == "None"
+    serial = timing.PlcSettings.from_values({"link": timing.LINK_SERIAL,
+                                             "stop_bits": 3, "unit": 999})
+    assert serial.stop_bits == 1 and serial.unit == 247
 
 
 # ======================================================================
@@ -208,7 +278,8 @@ def test_the_network_source_fires_each_bottle_when_it_reaches_the_view():
                                speed_mm_s=1000.0,
                                fixed_latency_ms=1.0, poll_ms=2.0)
         source = PlcSource(SOURCE_NAME,
-                           lambda: PlcLink(s, "127.0.0.1", plc.port), s)
+                           lambda: PlcLink(s, ModbusClient("127.0.0.1",
+                                                           plc.port)), s)
         assert source.needs(api.MODE_EXACT) >= {"software_trigger"}
         events = []
         source.start(events.append)
@@ -235,7 +306,8 @@ def test_the_network_source_fires_each_bottle_when_it_reaches_the_view():
 def test_the_network_source_keeps_going_when_the_plc_drops():
     s = timing.PlcSettings(mode=timing.MODE_NETWORK)
     source = PlcSource(SOURCE_NAME,
-                       lambda: PlcLink(s, "127.0.0.1", 1), s)
+                       lambda: PlcLink(s, ModbusClient("127.0.0.1", 1)),
+                       s)
     source.start(lambda e: None)
     assert wait_for(lambda: source.error, 3.0)
     assert "cannot reach the PLC" in source.error
@@ -352,6 +424,46 @@ def test_the_wire_mode_follows_the_speed_between_runs(plugin_project,
         plugin.deactivate()
 
 
+def test_the_simulated_plc_over_serial(plugin_project, monkeypatch):
+    plugin = plc_on(plugin_project, {"simulated": True,
+                                     "link": timing.LINK_SERIAL,
+                                     "mode": timing.MODE_WIRE,
+                                     "speed_mm_s": 500.0,
+                                     "distance_mm": 100.0,
+                                     "follow_speed": False})
+    try:
+        with_a_trigger_delay(monkeypatch)
+        assert wait_for(lambda: plugin.reading.get("connected"), 5.0), \
+            plugin.reading
+        assert isinstance(plugin._link.client, ModbusRtuClient)
+        assert "200.000 ms" in plugin.apply_delay()
+    finally:
+        plugin.deactivate()
+
+
+def test_a_real_serial_port_without_pyserial_says_what_to_install(
+        plugin_project, monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_serial(name, *a, **kw):
+        if name == "serial" or name.startswith("serial."):
+            raise ImportError("no pyserial")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_serial)
+    plugin = plc_on(plugin_project, {"link": timing.LINK_SERIAL,
+                                     "serial_port": "COM7"})
+    try:
+        assert plugin.serial_ports() == []
+        out = plugin.read_now()
+        assert not out["connected"] and "pip install pyserial" in \
+            out["error"], out
+    finally:
+        plugin.deactivate()
+
+
 def test_its_window_is_built_offscreen(plugin_project):
     from PySide6.QtWidgets import QApplication
 
@@ -365,6 +477,12 @@ def test_its_window_is_built_offscreen(plugin_project):
         assert not panel.apply_button.isEnabled()
         panel.distance.setValue(250.0)
         assert plugin.settings.distance_mm == 250.0
+        panel.test()
+        assert "The PLC answered" in panel.said.text(), panel.said.text()
+        panel.link.setCurrentText(timing.LINK_SERIAL)
+        assert plugin.settings.link == timing.LINK_SERIAL
+        assert panel.serial_row.isVisibleTo(panel)
+        assert not panel.address_row.isVisibleTo(panel)
         panel.test()
         assert "The PLC answered" in panel.said.text(), panel.said.text()
         panel.refresh()

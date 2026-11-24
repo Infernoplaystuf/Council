@@ -18,12 +18,25 @@ its button on the toolbar strip to open its window.
 |---|---|---|
 | What fires the camera | A PLC output wired to the camera's trigger input (a Basler `Line1`, or `CxpTrigger0` through the frame grabber) | Typhon, by software trigger, when the PLC's bottle count goes up |
 | Timing | Microseconds: the camera waits its own **TriggerDelay** | A few milliseconds of spread (one poll plus Windows scheduling) |
-| Wiring | One output to the camera or grabber | None; just Ethernet |
+| Wiring | One output to the camera or grabber | None; just Ethernet or a serial cable |
 | Good for | Production, fast belts | Slow belts, bench tests, trying things out |
 | Typhon's Triggering window | Mode **Triggered: exact**, Trigger from **Line1** / **CxpTrigger0** | Trigger from **PLC (network)**, mode exact, snapshot or record |
 
-Both modes use Modbus TCP to read the bottle count and the belt speed. The
-window's **Mode** box picks one. The **PLC (network)** source appears under
+Both modes read the bottle count and the belt speed over one of two
+connections. The window's **Connection** box picks it:
+
+- **Ethernet (Modbus TCP)**: the default. It is fast, with a reply in about
+  1 ms, and needs nothing installed.
+- **Serial (Modbus RTU)**: a serial cable (RS-232, or RS-485 through a USB
+  adapter) from the PC to the PLC's serial port. Each read takes the time
+  its bytes need on the wire, plus up to one PLC scan: about 2 to 5 ms at
+  115200 baud, and 20 ms or more at 9600. That is fine for **wire mode**,
+  where serial only reads the speed and the count. In network mode it adds
+  that much spread, so use Ethernet there if you can. Serial needs
+  **pyserial** in the Python that Typhon runs under (`pip install pyserial`).
+  Typhon never installs it; without it the window says what to install.
+
+The window's **Mode** box picks wire or network mode. The **PLC (network)** source appears under
 Trigger from only in network mode.
 
 A third wiring also works in wire mode: wire the photo-eye **straight to the
@@ -83,6 +96,28 @@ Do-More's Modbus server shows its **MHR** block as holding registers:
 `MHR1` is Modbus `40001`, `MHR2` is `40002`, and so on. Its **MIR** block
 shows as input registers: `MIR1` is `30001`. Typhon accepts either spelling.
 
+### 3.1b Or: turn on Modbus RTU on the serial port
+
+For **Connection: Serial (Modbus RTU)**:
+
+1. In **System Configuration**, open the internal serial port's settings
+   (`@IntSerial`), and set its protocol to **Modbus RTU** as a
+   **server** (slave).
+2. Note its **station number** (node address), **baud rate**, **parity** and
+   **stop bits**. Typhon's window must match all four (**station**, **baud**,
+   **parity**, **stop bits**). Use 8 data bits and the fastest baud rate the
+   cable allows (115200 if you can).
+3. Wire the PC to that port. For RS-232, use a straight serial cable or a USB
+   to RS-232 adapter. For RS-485, use a USB to RS-485 adapter, A to A and B to
+   B, with termination at the ends of a long line.
+4. In Typhon, pick the PC's port under **Serial port** (`COM3` and so on).
+   A USB adapter appears as a COM port once its driver is installed.
+
+The serial port serves the same MHR/MIR blocks as Ethernet, so 3.2 to 3.5
+are the same either way. Menus and names can differ a little between
+Do-More models and Designer versions. Check against your PLC's serial port
+settings.
+
 ### 3.2 The registers Typhon reads
 
 | Register (default) | What the ladder keeps there | Typhon setting |
@@ -128,7 +163,9 @@ count. Without an encoder, use **Belt speed: Fixed**.
 
 ## 4. Set up Typhon
 
-1. In the plugin's window, type the PLC's **Address**, pick the **Mode**,
+1. In the plugin's window, pick the **Connection**. For Ethernet, type the
+   PLC's **Address**. For serial, pick the **Serial port** and match its
+   baud, parity, stop bits and station to the PLC's. Then pick the **Mode**,
    and fill in **Photo-eye to view**, **Belt speed** and the registers.
 2. Press **Test connection**. It should say *The PLC answered* with the
    count and speed.
@@ -137,7 +174,8 @@ count. Without an encoder, use **Belt speed: Fixed**.
    **Network mode:** choose Trigger from **PLC (network)**.
 4. Start a run, let a few bottles through, and press Stop.
 
-To try it without hardware, tick **Use a simulated PLC**. A pretend PLC and
+To try it without hardware, tick **Use a simulated PLC**. It answers on
+either connection; on serial it stands in for the port at 115200 baud. A pretend PLC and
 belt run on this PC at the fixed speed you typed, one bottle per 200 mm.
 
 ---
@@ -199,6 +237,10 @@ speeds up or slows down a lot during runs, you can:
 | What you see | What to do |
 |---|---|
 | *cannot reach the PLC at …* | Check the IP address and the cable, and that the PC is on the PLC's subnet. Try `ping`. |
+| *cannot open COM… (… pip install pyserial …)* | Install pyserial into Typhon's Python, or use Ethernet. |
+| *cannot open COM… (… access denied / could not open port …)* | Another program holds the port (Do-More Designer's serial link, a terminal). Close it. Check the port name in Device Manager. |
+| *no answer from the PLC on COM…* | The cable, or the baud, parity, stop bits or station number don't match the PLC's (3.1b). On RS-485, try swapping A and B. |
+| *a garbled reply on COM…* | Baud or parity mismatch, or noise on a long RS-485 line (terminate it). |
 | *the PLC refused: illegal function* | Modbus/TCP Server is not enabled (3.1). |
 | *the PLC refused: illegal data address* | That MHR/MIR isn't in the Modbus map. Check the register name. |
 | Bottle count never changes | The photo-eye input or the `INC` rung. Watch `MHR1` in Designer's Data View. |

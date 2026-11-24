@@ -43,6 +43,9 @@ class SimulatedPlc:
         self._server: Optional[socket.socket] = None
         self._threads: List[threading.Thread] = []
         self.port = 0
+        #: the serial port's station number and speed (Modbus RTU)
+        self.station = 1
+        self.baud = 115200
 
     # -- life -------------------------------------------------------------
     def start(self) -> "SimulatedPlc":
@@ -123,7 +126,7 @@ class SimulatedPlc:
     def _accept(self) -> None:
         while not self._stop.is_set():
             try:
-                conn, _ = self._server.accept()          # type: ignore[union-attr]
+                conn, _ = self._server.accept()  # type: ignore[union-attr]
             except socket.timeout:
                 continue
             except OSError:
@@ -158,6 +161,13 @@ class SimulatedPlc:
                     except OSError:
                         return
 
+    # -- the serial port (Modbus RTU) ---------------------------------------
+    def rtu_port(self) -> "SimulatedSerialPort":
+        """A stand-in for a serial port wired to this PLC (what pyserial's
+        Serial gives the RTU client): each request written is answered as
+        the PLC's serial port would, at `baud`."""
+        return SimulatedSerialPort(self)
+
     def _answer(self, pdu: bytes) -> bytes:
         self.requests += 1
         fn = pdu[0] if pdu else 0
@@ -190,3 +200,48 @@ class SimulatedPlc:
         return error(1)
 
 
+
+
+class SimulatedSerialPort:
+    """A serial port to a SimulatedPlc: write() a Modbus RTU request, read()
+    its reply after the time the bytes take at the PLC's baud rate. A
+    request for another station, or with a bad CRC, gets no reply (as on
+    the wire: the read times out)."""
+
+    def __init__(self, plc: SimulatedPlc, timeout_s: float = 0.5) -> None:
+        self.plc = plc
+        self.timeout_s = timeout_s
+        self._reply = b""
+        self.closed = False
+        self.garble = False         # tests: the next reply's CRC is wrong
+
+    def reset_input_buffer(self) -> None:
+        self._reply = b""
+
+    def write(self, frame: bytes) -> int:
+        from .modbus import crc16, rtu_frame
+
+        if self.closed:
+            raise OSError("the port is closed")
+        frame = bytes(frame)
+        self._reply = b""
+        if len(frame) < 4 or crc16(frame[:-2]) != struct.unpack(
+                "<H", frame[-2:])[0] or frame[0] != self.plc.station:
+            return len(frame)
+        reply = rtu_frame(frame[0], self.plc._answer(frame[1:-2]))
+        if self.garble:
+            self.garble = False
+            reply = reply[:-1] + bytes([reply[-1] ^ 0xFF])
+        # 10 bits a byte (start, 8 data, stop) both ways
+        time.sleep((len(frame) + len(reply)) * 10.0 / self.plc.baud)
+        self._reply = reply
+        return len(frame)
+
+    def read(self, n: int) -> bytes:
+        if not self._reply:
+            time.sleep(self.timeout_s)
+        out, self._reply = self._reply[:n], self._reply[n:]
+        return out
+
+    def close(self) -> None:
+        self.closed = True

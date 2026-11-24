@@ -26,7 +26,11 @@ TWO MODES (timing.py has the sums)
 
 THE PLC SIDE (docs/typhon_plc_trigger.md, the Do-More Designer sheet)
 Modbus TCP, which Do-More's internal Ethernet port serves when "Enable
-Modbus/TCP Server" is ticked. The ladder adds 1 to a holding register
+Modbus/TCP Server" is ticked — or Modbus RTU on its serial port (Andy, 24
+November 2026), through pyserial (council_core/serial_port.py, reached by
+typhon_plugin_api.builtin; optional). A COM port opens once, so the
+window, the source and the run hooks share one serial client.
+The ladder adds 1 to a holding register
 (MHR1) per bottle and may keep the belt speed in another (MHR2, mm/s).
 modbus.py is the client (standard library only); simulator.py a pretend
 PLC and conveyor on 127.0.0.1 for trying it without hardware.
@@ -51,7 +55,7 @@ import typhon_plugin_api as api
 from typhon_plugin_api import builtin
 
 from . import timing
-from .modbus import ModbusClient, ModbusError, parse_address
+from .modbus import ModbusClient, ModbusError, ModbusRtuClient, parse_address
 
 PLUGIN_ID = "typhon.plc"
 SOURCE_NAME = "PLC (network)"
@@ -66,10 +70,13 @@ FOLLOW_FRACTION = 0.01
 class PlcLink:
     """One connection to the PLC (real or simulated) and what it reads."""
 
-    def __init__(self, settings: timing.PlcSettings, host: str, port: int
-                 ) -> None:
+    def __init__(self, settings: timing.PlcSettings, client: ModbusClient,
+                 owns: bool = True) -> None:
         self.settings = settings
-        self.client = ModbusClient(host, port, settings.unit)
+        self.client = client
+        #: False for the serial port, which one link holds for everyone (a
+        #: COM port opens once): closing this link leaves it open.
+        self.owns = owns
         self.count_at = parse_address(settings.count_register)
         self.speed_at = (parse_address(settings.speed_register)
                          if settings.speed_source == timing.SPEED_PLC
@@ -77,7 +84,8 @@ class PlcLink:
         self.rtt_s = 0.0
 
     def close(self) -> None:
-        self.client.close()
+        if self.owns:
+            self.client.close()
 
     def read_count(self) -> Tuple[int, float]:
         """(count, when it was read: time.monotonic() at the reply)."""
@@ -211,6 +219,7 @@ class PlcPlugin:
         self._monitor: Optional[threading.Thread] = None
         self._monitor_stop = threading.Event()
         self._link: Optional[PlcLink] = None
+        self._serial: Optional[ModbusRtuClient] = None
         self.reading: Dict[str, Any] = {"connected": False, "error": "",
                                         "count": None, "speed": None,
                                         "delay_us": None}
@@ -225,7 +234,7 @@ class PlcPlugin:
             self.settings = timing.PlcSettings.from_values(ctx.settings())
         except Exception:                                 # noqa: BLE001
             self.settings = timing.PlcSettings()
-        if self.settings.simulated or self.settings.host:
+        if self._set_up():
             self.start_monitor()
 
     def deactivate(self) -> None:
@@ -241,7 +250,9 @@ class PlcPlugin:
         merged.update(values)
         new = timing.PlcSettings.from_values(merged)
         reconnect = any(getattr(new, k) != getattr(self.settings, k)
-                        for k in ("host", "port", "unit", "count_register",
+                        for k in ("link", "host", "port", "unit",
+                                  "serial_port", "baud", "parity",
+                                  "stop_bits", "count_register",
                                   "speed_register", "speed_source",
                                   "simulated"))
         self.settings = new
@@ -257,16 +268,14 @@ class PlcPlugin:
             self.stop_monitor()
             if not new.simulated:
                 self._stop_sim()
-            if new.simulated or new.host:
+            if self._set_up():
                 self.start_monitor()
         return why
 
-    def _address(self) -> Tuple[str, int]:
+    def _set_up(self) -> bool:
         s = self.settings
-        if s.simulated:
-            sim = self._ensure_sim()
-            return "127.0.0.1", sim.port
-        return s.host, s.port
+        serial = s.link == timing.LINK_SERIAL
+        return bool(s.simulated or (s.serial_port if serial else s.host))
 
     def _ensure_sim(self) -> Any:
         with self._lock:
@@ -291,13 +300,49 @@ class PlcPlugin:
             sim.stop()
 
     def make_link(self) -> PlcLink:
-        host, port = self._address()
-        return PlcLink(self.settings, host, port)
+        """A link to the PLC: over Ethernet a connection of its own (the
+        network source's reads never wait behind the window's); over a
+        serial port the one port everyone shares."""
+        s = self.settings
+        if s.link == timing.LINK_SERIAL:
+            return PlcLink(s, self._serial_client(), owns=False)
+        if s.simulated:
+            port = self._ensure_sim().port
+            return PlcLink(s, ModbusClient("127.0.0.1", port, s.unit))
+        return PlcLink(s, ModbusClient(s.host, s.port, s.unit))
+
+    def _serial_client(self) -> ModbusRtuClient:
+        sim = self._ensure_sim() if self.settings.simulated else None
+        with self._lock:
+            if self._serial is None:
+                s = self.settings
+                if sim is not None:
+                    opener = sim.rtu_port
+                    name = "the simulated serial port"
+                else:
+                    def opener() -> Any:
+                        return builtin.open_serial_port(
+                            s.serial_port, s.baud, s.parity, s.stop_bits)
+                    name = s.serial_port or "the serial port"
+                self._serial = ModbusRtuClient(opener, s.unit, name)
+            return self._serial
+
+    def serial_ports(self) -> List[str]:
+        """This PC's serial ports now (none listed without pyserial)."""
+        try:
+            return list(builtin.serial_ports())
+        except Exception:                                 # noqa: BLE001
+            return []
+
+    def _close_serial(self) -> None:
+        with self._lock:
+            client, self._serial = self._serial, None
+        if client is not None:
+            client.close()
 
     # -- the trigger source (network mode) ------------------------------------
     def sources(self) -> List[str]:
-        if self.settings.mode == timing.MODE_NETWORK and (
-                self.settings.host or self.settings.simulated):
+        if self.settings.mode == timing.MODE_NETWORK and self._set_up():
             return [SOURCE_NAME]
         return []
 
@@ -326,6 +371,7 @@ class PlcPlugin:
         link, self._link = self._link, None
         if link is not None:
             link.close()
+        self._close_serial()
 
     def read_now(self) -> Dict[str, Any]:
         """Read the PLC once (count, speed, the delay they make)."""
@@ -442,7 +488,7 @@ class PlcPlugin:
                 + f"; offset now {self.settings.offset_ms:+.3f} ms. "
                   f"Apply the delay, then run again to check.")
 
-    # -- run hooks: the missed-bottle check ------------------------------------
+    # -- run hooks: the missed-bottle check ----------------------------------
     def _count_now(self) -> Optional[int]:
         if not self._set_up():
             return None
@@ -452,9 +498,6 @@ class PlcPlugin:
             return self._link.read_count()[0]
         except (ModbusError, ValueError, OSError):
             return None
-
-    def _set_up(self) -> bool:
-        return bool(self.settings.host or self.settings.simulated)
 
     def on_run_started(self, run: api.RunInfo) -> None:
         if not self._set_up():
