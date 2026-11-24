@@ -10,6 +10,10 @@ It is a built-in plugin that is **off** in a new project. To turn it on, open
 **Plugins…** in Typhon (plugins), tick **PLC trigger (Do-More)**, and press
 its button on the toolbar strip to open its window.
 
+For a **fan** with no sensor, where you want one blade in the same spot in
+every picture, see section 9 (the strobe lock). The PLC's timer stays as
+the backup, switched by hand.
+
 ---
 
 ## 1. Pick a mode
@@ -126,6 +130,7 @@ settings.
 | `MHR2` | Belt speed in mm/s (or tenths: set **units per mm/s** to 10) | **Speed register** (when **Belt speed** is *From PLC register*) |
 | `MHR3` | Fire request: Typhon writes 1, the ladder pulses the camera and writes 0 back (3.4b) | **Fire request** |
 | `MHR4` | Presses the ladder took (optional, for your own records) | none |
+| `MHR5` | Timer switch: 0 = the PLC's timer triggers the camera, 1 = the timer is off and the computer triggers it (section 9.4) | **Timer switch** |
 
 If the belt always runs at one speed, choose **Belt speed: Fixed**, type in
 the speed, and leave `MHR2` out of the ladder.
@@ -282,3 +287,160 @@ client, `timing.py` the sums and `simulator.py` the pretend PLC). The
 picture check is `council_core/bottle_position.py`, which the plugin reaches
 through `typhon_plugin_api.builtin` because it needs numpy and Pillow. Its tests are in
 `tests/test_typhon_plugins_plc.py`.
+
+---
+
+## 9. A fan blade in the same spot every picture (strobe lock)
+
+The bottles above were only an example. The real set-up (Andy, 24
+November 2026) is a fan. The PLC's timer triggers the camera every second,
+and the goal is a picture of **one blade in the same spot every time**.
+The fan's speed is set for each run and is steady once it is up to speed.
+**There is no sensor on the fan** (no once-per-turn pulse), and none will be
+added.
+
+### 9.1 How it works
+
+Without a sensor, nothing outside the camera knows where the blade is. So
+the plugin uses the clock with the least latency, which is **the camera's
+own frame clock**. The camera free-runs (**TriggerMode Off**) at a frame
+rate that makes each picture a whole number of turns after the last:
+
+    frame rate = (rpm / 60) / K        K = whole turns per picture
+
+The window picks K so the rate stays at or under **pictures at most**
+(1 per second by default). At 1200 rpm that is K = 20 and 1 picture per
+second. The camera's clock is steady to the microsecond, with no wire, PLC
+scan or network between the decision and the exposure.
+
+The rpm you type is never exact, so the blade would creep a little each
+picture. The **pictures themselves** say how far:
+
+- **Face-on** (looking down the axle): the plugin reads the brightness on
+  a ring around the hub, all the way round, and compares it with the
+  reference picture's ring. This gives the angle the fan has turned, to
+  about 0.1 to 0.3 degrees on a sharp picture.
+- **Side-on** (the blades pass across the view): the plugin reads the
+  brightness along a box across the blades' path and compares it with the
+  reference's. This gives how many pixels the blades moved. The plugin
+  measures how many pixels a degree is by itself at the start of each run:
+  it speeds the frame rate up very slightly once and watches the drift
+  change.
+
+From the last few pictures (5 by default), the lock works out the creep
+per picture and the distance from the spot. It then nudges the camera's
+**AcquisitionFrameRate** to stop the creep and bring the blade back.
+Pictures reach the disk a picture or two late, so after each nudge the lock
+waits for pictures taken after it.
+
+On a drawn fan, the lock holds the blade to within about ±0.5 degree after
+30 to 40 pictures. It does this from a start 0.25 % off in rpm, which is
+18 degrees of creep per picture at K = 20. A real fan's small speed wobble
+adds to that. Expect about ±1 to 3 degrees on a steady fan, and less with
+more blades in the ring and a short exposure.
+
+**Blur:** the blade turns `rpm × 6 × exposure` degrees while the shutter is
+open. At 1200 rpm that is 0.72 degree per 100 µs, and the window shows it.
+Keep the exposure short and add light.
+
+### 9.2 Any blade, or this blade
+
+- **Any blade** (the default): with N alike blades, the picture repeats
+  every 360/N degrees, so whichever blade is nearest the spot counts. The
+  lock can then settle at a rate a whole blade off, and that picture still
+  looks the same. The rpm it reports is the one nearest what you typed.
+- **This blade (mark it)**: the same blade every time. Alike blades look
+  the same to the camera, so **mark that blade** with a strip of tape near
+  its tip.
+
+### 9.3 Set it up
+
+1. In **Fan blade**, type the fan's speed (rpm), how many pictures a second
+   you want at most, the number of blades, any or this blade, and which
+   way you are looking (face-on or side-on).
+2. With no run going, press **Set camera for the fan**. It sets the active
+   camera to TriggerMode Off, turns the frame rate limit on, and sets the
+   frame rate. A trigger setting can't change in the middle of a run.
+3. Record a few seconds of the spinning fan.
+   - **Face-on:** press **Find hub from newest pictures**. The pixels that
+     change between pictures are the blades, which form a ring around the
+     hub. Check the hub and the ring numbers, and correct them if needed
+     (the ring is best across the blades' outer half).
+   - **Side-on:** type the box (x, y, width, height in pixels) across the
+     blades' path, and which way they move (left-right or up-down).
+4. Move the slider to a picture with the blade where you want it, and press
+   **Use this frame as reference**. The profile is kept in the plugin's
+   data folder. Changing the hub, the ring, the box or the blade count
+   means taking the reference again, and the window says so. **Hold at**
+   moves the spot by a few degrees from the reference.
+5. Tick **Hold the blade still during runs** and press **Start**. Record in
+   **Continuous** mode, from the camera's own clock.
+6. Typhon must save **PNG pictures**, because the lock reads them from the
+   run's folder. Raw recording (`TYPHON_SAVE_FORMAT=raw`) gives the lock
+   nothing to read, and the end record says so.
+
+Each run gets `<run>_blade_phase.csv` beside its frames, with one row per
+picture:
+
+- `turn_deg`: the angle from the reference (pixels, side-on);
+- `error_deg`: the distance from the spot;
+- `in_tolerance`: whether it was within **Tolerance**;
+- `rate_fps`: the frame rate at the time;
+- `note`: `behind` when the lock skipped a picture to keep up. It measures
+  the newest picture, and a 65 MP PNG takes about a second to read.
+
+To keep only the good pictures, filter on `in_tolerance = 1`. Nothing is
+deleted. The run's end record has a `"fan"` block under
+`"plugins" → "typhon.plc"` with:
+
+- pictures measured and in tolerance;
+- the nudges made;
+- the final frame rate;
+- the rpm the lock measured;
+- the recent median error;
+- any problem, in words (also said in the status line).
+
+The lock sets the frame rate on the **active camera** only. If you switch
+cameras mid-run, it stops nudging and says so. If the camera won't change
+its frame rate while it is capturing, the end record counts
+`rate_not_set`. A Basler normally allows it.
+
+### 9.4 The PLC's timer as the backup
+
+The timer stays in the ladder as the backup, in case Typhon's lock fails.
+It runs only while `MHR5` is 0. Typhon never turns it back on by itself:
+only the window's **PLC timer on** button, or a switch you wire, does that.
+
+```
+Rung 6   STR   MHR5 == 0          (Typhon has not taken over)
+         OR    X1                 (optional: a panel switch forces the timer)
+         TMR   T1  1000 ms        (the 1 s timer, as today)
+Rung 7   STR   T1.Done            SET Y0          (pulse the camera)
+                                  RST T1          (start the next second)
+```
+
+`Y0` is turned off again by rungs 3 and 4. Use your existing timer rungs if
+you have them: they only need the `MHR5 == 0` contact (and the optional
+`X1`) in front.
+
+- **PLC timer off (computer)** writes 1 to `MHR5`. The timer stops, and the
+  computer triggers the camera: through **Fire camera via PLC**, or with
+  the camera free-running for the fan lock.
+- **PLC timer on** writes 0, and the timer runs again.
+
+The readout shows which one is in charge. In the fan lock the camera
+ignores its trigger wire (TriggerMode Off), so the timer's pulses do no
+harm while it runs. Turn the timer off anyway when the computer is in
+charge, so the two never mix in a triggered run.
+
+### 9.5 Limits
+
+- The fan must be steady. A speed that wanders faster than the lock's few
+  pictures can follow smears the spot.
+- **Side-on** needs the rpm typed close to the fan's: the blades must
+  creep less than about a quarter of the box between pictures. If they
+  jump further, the lock says so. Lock face-on, or type the rpm the lock
+  measured in an earlier run.
+- The lock acts a few pictures late, because pictures are read from the
+  disk after they are saved. Typhon does not hand plugins live frames yet.
+

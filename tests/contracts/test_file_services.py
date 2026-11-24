@@ -347,7 +347,8 @@ def test_every_built_in_plugins_run_files_are_run_markers_and_its_own(
     finally:
         host.close()
     assert owner == {"_events.raw": "typhon.prophesee",
-                     "_capture_triggers.csv": "typhon.trigger"}
+                     "_capture_triggers.csv": "typhon.trigger",
+                     "_blade_phase.csv": "typhon.plc"}
 
 
 def test_the_triggers_csv_is_made_through_the_streamed_service(tmp_path,

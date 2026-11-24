@@ -18,10 +18,11 @@ from typing import Any, Dict
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QSpinBox, QVBoxLayout,
-                               QWidget)
+                               QLineEdit, QPushButton, QScrollArea, QSpinBox,
+                               QVBoxLayout, QWidget)
 
 from . import timing
+from .fan_panel import FanPanel
 
 REFRESH_MS = 500
 INTRO = ("A Do-More PLC says when a bottle passes its photo-eye; Typhon "
@@ -65,7 +66,14 @@ class PlcPanel(QWidget):
         self.setObjectName("plc_panel")
         self.plugin = plugin
         s = plugin.settings
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        inner = QWidget(scroll)
+        scroll.setWidget(inner)
+        layout = QVBoxLayout(inner)
         layout.setContentsMargins(12, 12, 12, 12)
         intro = QLabel(INTRO, self)
         intro.setWordWrap(True)
@@ -152,6 +160,20 @@ class PlcPanel(QWidget):
                                       "the ladder pulses the camera's "
                                       "output and writes 0 back.")
         form.addRow("Fire request", self.fire_register)
+        self.timer_register = QLineEdit(s.timer_register, plc)
+        self.timer_register.setToolTip("0: the PLC's timer triggers the "
+                                       "camera; 1: the timer is off and "
+                                       "the computer triggers it.")
+        self.timer_on = QPushButton("PLC timer on", plc)
+        self.timer_on.setObjectName("btn_plc_timer_on")
+        self.timer_off = QPushButton("PLC timer off (computer)", plc)
+        self.timer_off.setObjectName("btn_plc_timer_off")
+        trow = QHBoxLayout()
+        trow.setContentsMargins(0, 0, 0, 0)
+        trow.addWidget(self.timer_register, 1)
+        trow.addWidget(self.timer_on)
+        trow.addWidget(self.timer_off)
+        form.addRow("Timer switch", trow)
         layout.addWidget(plc)
 
         # -- the belt -------------------------------------------------------
@@ -231,6 +253,8 @@ class PlcPanel(QWidget):
                                     "triggered from the PLC's wire.")
         self.fire_button.clicked.connect(self.fire)
         layout.addWidget(self.fire_button)
+        self.fan_panel = FanPanel(plugin, inner)
+        layout.addWidget(self.fan_panel)
         self.said = QLabel("", self)
         self.said.setObjectName("plc_said")
         self.said.setWordWrap(True)
@@ -238,7 +262,7 @@ class PlcPanel(QWidget):
         layout.addStretch(1)
 
         for w in (self.host, self.count_register, self.speed_register,
-                  self.fire_register):
+                  self.fire_register, self.timer_register):
             w.editingFinished.connect(self.save)
         self.serial_port.lineEdit().editingFinished.connect(self.save)
         self.serial_port.activated.connect(self.save)
@@ -258,6 +282,8 @@ class PlcPanel(QWidget):
         self.test_button.clicked.connect(self.test)
         self.apply_button.clicked.connect(self.apply)
         self.calibrate_button.clicked.connect(self.calibrate)
+        self.timer_on.clicked.connect(lambda: self.set_timer(True))
+        self.timer_off.clicked.connect(lambda: self.set_timer(False))
 
         self._calibrating = False
         self._calibrated = ""
@@ -283,6 +309,7 @@ class PlcPanel(QWidget):
                 "mode": self.mode.currentText(),
                 "count_register": self.count_register.text().strip(),
                 "fire_register": self.fire_register.text().strip(),
+                "timer_register": self.timer_register.text().strip(),
                 "speed_source": self.speed_source.currentText(),
                 "speed_mm_s": self.speed.value(),
                 "speed_register": self.speed_register.text().strip(),
@@ -325,6 +352,7 @@ class PlcPanel(QWidget):
 
     # -- the readout --------------------------------------------------------
     def refresh(self) -> None:
+        self.fan_panel.refresh()
         r = self.plugin.reading
         if not self.plugin._set_up():
             self.readout.setText("Set the PLC's address or serial port (or "
@@ -343,6 +371,10 @@ class PlcPanel(QWidget):
         delay = r.get("delay_us")
         parts.append("delay ?" if delay is None else
                      f"delay needed {delay / 1000.0:.3f} ms")
+        timer = r.get("timer")
+        if timer is not None:
+            parts.append("PLC timer on" if timer else
+                         "PLC timer off (computer)")
         applied = self.plugin.applied_us()
         if self.mode.currentText() == timing.MODE_WIRE:
             parts.append("camera has " + ("—" if applied is None else
@@ -374,6 +406,10 @@ class PlcPanel(QWidget):
                               f"mm/s, reply {r.get('rtt_ms')} ms.")
         else:
             self.said.setText(f"No answer: {r.get('error')}")
+        self.refresh()
+
+    def set_timer(self, on: bool) -> None:
+        self.said.setText(self.plugin.set_timer(on))
         self.refresh()
 
     def fire(self) -> None:

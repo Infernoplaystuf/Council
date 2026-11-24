@@ -53,6 +53,11 @@ class SimulatedPlc:
         #: when the camera's output (Y0) pulsed: bottles and presses alike
         self.pulses: List[float] = []
         self.press_pulses: List[float] = []
+        #: the timer rung (docs 9.4): while the timer register (MHR5) is 0
+        #: the PLC's own timer pulses the camera every timer_s; 1 stops it
+        self.timer_offset = 4
+        self.timer_s = 1.0
+        self.timer_pulses: List[float] = []
 
     # -- life -------------------------------------------------------------
     def start(self) -> "SimulatedPlc":
@@ -117,9 +122,16 @@ class SimulatedPlc:
         """The ladder's fire rung, once a scan: a request in the fire
         register pulses the output, is cleared and counted."""
         period = max(self.scan_ms, 0.2) / 1000.0
+        last_timer = time.perf_counter()
         while not self._stop.is_set():
             time.sleep(period)
             with self._lock:
+                now = time.perf_counter()
+                if self.holding[self.timer_offset]:
+                    last_timer = now
+                elif self.timer_s > 0 and now - last_timer >= self.timer_s:
+                    last_timer = now
+                    self.timer_pulses.append(now)
                 if self.holding[self.fire_offset]:
                     now = time.perf_counter()
                     self.holding[self.fire_offset] = 0

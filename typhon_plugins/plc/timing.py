@@ -67,6 +67,9 @@ class PlcSettings:
     #: "Fire camera via PLC": Typhon writes 1 here; the ladder pulses the
     #: camera's output and writes 0 back (docs/typhon_plc_trigger.md 3.4b)
     fire_register: str = "MHR3"
+    #: who triggers the camera: Typhon writes 0 (the PLC's timer) or 1 (the
+    #: computer: the timer stops); docs/typhon_plc_trigger.md 9.4
+    timer_register: str = "MHR5"
     speed_source: str = SPEED_FIXED
     speed_mm_s: float = 500.0
     speed_register: str = "MHR2"

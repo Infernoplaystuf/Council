@@ -14,6 +14,8 @@
     "panel",
     "run_hooks"
   ],
-  "files": [],
+  "files": [
+    "_blade_phase.csv"
+  ],
   "network": "camera-link"
 }

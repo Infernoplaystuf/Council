@@ -254,8 +254,9 @@ same list.
   TCP or Modbus RTU on a serial port (`council_core/serial_port.py`,
   pyserial optional), wire mode setting the camera's TriggerDelay from the belt speed,
   network mode firing from the PLC's bottle count, auto-calibration, the
-  missed-bottle check, the simulated PLC; the Do-More Designer set-up):
-  `docs/typhon_plc_trigger.md`.
+  missed-bottle check, the simulated PLC; the Do-More Designer set-up;
+  the fan-blade strobe lock with no sensor, `council_core/blade_phase.py`,
+  and the PLC timer switch MHR5): `docs/typhon_plc_trigger.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

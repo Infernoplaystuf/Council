@@ -52,6 +52,7 @@ ALSO
 from __future__ import annotations
 
 import heapq
+import json
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -60,6 +61,7 @@ import typhon_plugin_api as api
 from typhon_plugin_api import builtin
 
 from . import timing
+from .fan import FanRun, FanSettings, LOG_SUFFIX, wait_in_ui
 from .modbus import ModbusClient, ModbusError, ModbusRtuClient, parse_address
 
 PLUGIN_ID = "typhon.plc"
@@ -70,6 +72,15 @@ MONITOR_S = 0.5
 #: The delay is set again when it is this far off (µs, or a fraction).
 FOLLOW_US = 50.0
 FOLLOW_FRACTION = 0.01
+#: The camera's frame rate (the fan lock's free-running clock).
+RATE_KEY = "AcquisitionFrameRate"
+RATE_ON_KEY = "AcquisitionFrameRateEnable"
+TRIGGER_MODE_KEY = "TriggerMode"
+#: The reference profile, in the plugin's data folder (numbered when one
+#: is there: never written over).
+REFERENCE_FILE = "fan_reference.json"
+#: Pictures Find hub reads.
+HUB_PICTURES = 8
 
 
 class PlcLink:
@@ -246,6 +257,11 @@ class PlcPlugin:
         self.last_said = ""
         #: "Fire camera via PLC" presses the PLC took (this session)
         self.presses = 0
+        #: the fan-blade strobe lock (fan.py, strobe.py)
+        self.fan = FanSettings()
+        self.fan_run: Optional[FanRun] = None
+        self._fan_handle: Any = None
+        self._fan_folder: Any = None
 
     # -- life ---------------------------------------------------------------
     def activate(self, ctx: api.PluginContext) -> None:
@@ -254,10 +270,16 @@ class PlcPlugin:
             self.settings = timing.PlcSettings.from_values(ctx.settings())
         except Exception:                                 # noqa: BLE001
             self.settings = timing.PlcSettings()
+        try:
+            self.fan = FanSettings.from_flat(ctx.settings())
+            self.fan.reference = self._load_reference(self.fan.reference_file)
+        except Exception:                                 # noqa: BLE001
+            self.fan = FanSettings()
         if self._set_up():
             self.start_monitor()
 
     def deactivate(self) -> None:
+        self._stop_fan()
         self.stop_monitor()
         self._stop_sim()
         self.ctx = None
@@ -276,12 +298,7 @@ class PlcPlugin:
                                   "speed_register", "speed_source",
                                   "simulated"))
         self.settings = new
-        why = ""
-        if self.ctx is not None:
-            try:
-                self.ctx.save_settings(new.values())
-            except Exception as exc:                      # noqa: BLE001
-                why = str(exc)
+        why = self._save()
         if new.simulated and self.sim is not None:
             self.sim.set_speed(new.speed_mm_s)
         if reconnect:
@@ -291,6 +308,25 @@ class PlcPlugin:
             if self._set_up():
                 self.start_monitor()
         return why
+
+    def _save(self) -> str:
+        """Keep the PLC's and the fan's settings in the project. What went
+        wrong, or ""."""
+        if self.ctx is None:
+            return ""
+        try:
+            self.ctx.save_settings({**self.settings.values(),
+                                    **self.fan.flat()})
+        except Exception as exc:                          # noqa: BLE001
+            return str(exc)
+        return ""
+
+    def update_fan(self, values: Dict[str, Any]) -> str:
+        """New fan settings from the window (kept in the project)."""
+        merged = self.fan.values()
+        merged.update(values)
+        self.fan = FanSettings.from_values(merged)
+        return self._save()
 
     def _set_up(self) -> bool:
         s = self.settings
@@ -410,6 +446,7 @@ class PlcPlugin:
             out["count"] = link.read_count()[0]
             out["speed"] = link.read_speed()
             out["connected"] = True
+            out["timer"] = self._read_timer(link)
             out["rtt_ms"] = round(link.rtt_s * 1000.0, 2)
         except (ModbusError, ValueError, OSError) as exc:
             out["error"] = str(exc)
@@ -418,6 +455,15 @@ class PlcPlugin:
         out["delay_us"] = timing.camera_delay_us(self.settings, out["speed"])
         self.reading = out
         return out
+
+    def _read_timer(self, link: PlcLink) -> Optional[bool]:
+        """True when the PLC's timer triggers the camera, False when the
+        computer does, None when unknown."""
+        try:
+            at = parse_address(self.settings.timer_register)
+            return int(link.client.read_one(at)) == 0
+        except (ModbusError, ValueError, OSError):
+            return None
 
     def _watch(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -553,6 +599,187 @@ class PlcPlugin:
                 + f"; offset now {self.settings.offset_ms:+.3f} ms. "
                   f"Apply the delay, then run again to check.")
 
+    # -- who triggers the camera: the PLC's timer or the computer -----------
+    def set_timer(self, timer_on: bool) -> str:
+        """Write the timer register: 0 hands the camera back to the PLC's
+        timer, 1 stops the timer so the computer triggers (Fire camera via
+        PLC, or the fan lock's free-running camera). Only ever by the
+        window's switch: Typhon never turns the timer back on by itself
+        (Andy, 24 November 2026: the timer is the backup)."""
+        if not self._set_up():
+            return self._said("Set the PLC's address or serial port first.",
+                              False)
+        try:
+            at = parse_address(self.settings.timer_register)
+        except ValueError as exc:
+            return self._said(f"Timer register: {exc}", False)
+        used = {parse_address(r).text for r in
+                (self.settings.count_register, self.settings.speed_register,
+                 self.settings.fire_register) if _parses(r)}
+        if at.text in used or not at.writable:
+            return self._said(f"Timer register {at.text} must be a holding "
+                              f"register of its own (MHR5).", False)
+        try:
+            if self._link is None:
+                self._link = self.make_link()
+            self._link.client.write(at, [0 if timer_on else 1])
+            now = self._read_timer(self._link)
+        except (ModbusError, OSError) as exc:
+            return self._said(f"The PLC did not take it: {exc}", False)
+        self.reading["timer"] = now
+        if now is None or now != timer_on:
+            return self._said(f"Wrote {at.text}, but the PLC reads back "
+                              f"otherwise: is the timer rung in the ladder?",
+                              False)
+        return self._said("The PLC's timer triggers the camera again."
+                          if timer_on else
+                          "The PLC's timer is off: the computer triggers "
+                          "the camera.", False)
+
+    # -- the fan-blade strobe lock (Andy, 24 November 2026) -----------------
+    def _load_reference(self, name: str) -> List[float]:
+        """The reference profile kept in the plugin's data folder."""
+        if not name or self.ctx is None:
+            return []
+        try:
+            data = json.loads((self.ctx.data_dir() / name).read_text(
+                encoding="utf-8"))
+            return [float(v) for v in data.get("profile", [])]
+        except (OSError, ValueError, TypeError, AttributeError):
+            return []
+
+    def fan_camera(self) -> str:
+        """Set the active camera to free-run at the fan's frame rate:
+        TriggerMode Off, the frame rate limit on, at rpm/60/K. Before a
+        run (the trigger cannot change mid-run). On the UI thread."""
+        f = self.fan
+        if f.rpm <= 0:
+            return self._said("Enter the fan's speed (rpm) first.", False)
+        if self.ctx is None or not self.ctx.active_camera():
+            return self._said("Connect a camera first.", False)
+        done, problems = [], []
+        for key, value in ((TRIGGER_MODE_KEY, "Off"), (RATE_ON_KEY, True),
+                           (RATE_KEY, round(f.rate, 6))):
+            try:
+                out = builtin.set_camera_setting(key, value)
+            except Exception as exc:                      # noqa: BLE001
+                problems.append(f"{key}: {exc}")
+                continue
+            took = out.get("value", value) if isinstance(out, dict) else value
+            done.append(f"{key} {took}")
+        words = (f"Fan {f.rpm:g} rpm, {f.turns} turn(s) per picture: "
+                 + ", ".join(done))
+        if problems:
+            words += ". Not set: " + "; ".join(problems)
+        return self._said(words + ".", False)
+
+    def fan_hub(self, camera: Optional[str] = None) -> str:
+        """Find the hub and the ring from the newest pictures of the
+        spinning fan. Slow (reads pictures): off the UI thread."""
+        ctx = self.ctx
+        if ctx is None:
+            return "The plugin is switched off."
+        paths = builtin.latest_pictures(ctx.capture_folder(camera),
+                                        HUB_PICTURES)
+        try:
+            x, y, r_in, r_out = builtin.find_hub(paths)
+        except Exception as exc:                          # noqa: BLE001
+            return (f"No hub found: {exc}. Record a few seconds of the "
+                    f"spinning fan first (any frame rate).")
+        self.update_fan({"hub_x": round(x, 1), "hub_y": round(y, 1),
+                         "ring_in": round(r_in, 1),
+                         "ring_out": round(r_out, 1)})
+        return (f"Hub at ({x:.0f}, {y:.0f}), ring {r_in:.0f}–{r_out:.0f} px "
+                f"from {len(paths)} pictures. Now pick the reference.")
+
+    def fan_reference(self, path: Any = None) -> str:
+        """Take the reference from `path` (the window passes the frame the
+        slider shows; None: the newest picture): where the blade should
+        be. Reads a picture: off the UI thread."""
+        ctx = self.ctx
+        if path is None and ctx is not None:
+            found = builtin.latest_pictures(ctx.capture_folder(), 1)
+            path = found[-1] if found else None
+        if path is None:
+            return "No picture to take the reference from: record one."
+        try:
+            profile = builtin.blade_reference(path, self.fan.fan_view())
+        except Exception as exc:                          # noqa: BLE001
+            return f"No reference: {exc}."
+        name = getattr(path, "name", str(path))
+        kept = ""
+        if ctx is not None:
+            data = json.dumps({"picture": str(path), "profile": profile,
+                               "geometry": self.fan.geometry()})
+            try:
+                kept = ctx.write_new(ctx.data_dir(), REFERENCE_FILE,
+                                     data.encode("utf-8")).name
+            except Exception as exc:                      # noqa: BLE001
+                return f"The reference was not kept: {exc}."
+        self.update_fan({"reference": profile, "reference_name": name,
+                         "reference_geometry": self.fan.geometry(),
+                         "reference_file": kept})
+        return f"Reference: {name}. The lock holds the blade where it is here."
+
+    def _set_rate(self, camera: str, rate: float) -> float:
+        ctx = self.ctx
+        if ctx is None:
+            raise RuntimeError("the plugin is switched off")
+
+        def ui() -> Any:
+            if ctx.active_camera() != camera:
+                raise RuntimeError(f"the active camera is no longer "
+                                   f"{camera}")
+            return builtin.set_camera_setting(RATE_KEY, round(rate, 6))
+
+        out = wait_in_ui(ctx.call_in_ui, ui)
+        took = out.get("value", rate) if isinstance(out, dict) else rate
+        return float(took)
+
+    def _start_fan(self, run: api.RunInfo) -> None:
+        self._stop_fan()
+        f = self.fan
+        if not f.enabled or self.ctx is None:
+            return
+        why = f.problem()
+        if why:
+            self.ctx.say(f"Fan lock off this run: {why}.")
+            return
+        camera = self.ctx.active_camera() or ""
+        folder = run.folders.get(camera)
+        if folder is None and run.folders:
+            camera, folder = next(iter(run.folders.items()))
+        if folder is None:
+            return
+        handle = None
+        try:
+            handle = self.ctx.create_file(folder, f"{run.run}{LOG_SUFFIX}")
+        except Exception:                                 # noqa: BLE001
+            handle = None            # kept in memory, written at the end
+        self._fan_handle, self._fan_folder = handle, folder
+        self.fan_run = FanRun(folder, run.run, f,
+                              lambda r: self._set_rate(camera, r), handle)
+        self.fan_run.start()
+
+    def _stop_fan(self) -> Optional[Dict[str, Any]]:
+        fr, self.fan_run = self.fan_run, None
+        if fr is None:
+            return None
+        fr.stop()
+        handle, self._fan_handle = self._fan_handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except (OSError, ValueError):
+                pass
+        elif self.ctx is not None and self._fan_folder is not None:
+            try:
+                self.ctx.write_new(self._fan_folder,
+                                   f"{fr.run}{LOG_SUFFIX}", fr.csv_bytes())
+            except Exception:                             # noqa: BLE001
+                pass
+        return fr.summary()
+
     # -- run hooks: the missed-bottle check ----------------------------------
     def _count_now(self) -> Optional[int]:
         if not self._set_up():
@@ -565,6 +792,7 @@ class PlcPlugin:
             return None
 
     def on_run_started(self, run: api.RunInfo) -> None:
+        self._start_fan(run)
         if not self._set_up():
             self._run_start = {}
             return
@@ -574,6 +802,16 @@ class PlcPlugin:
                            "presses": self.presses}
 
     def on_run_finished(self, run: api.RunInfo) -> Optional[Dict[str, Any]]:
+        fan = self._stop_fan()
+        out = self._bottle_block(run)
+        if fan is not None:
+            if fan.get("words") and self.ctx is not None:
+                self.ctx.say(f"Fan lock: {fan['words']}")
+            out = dict(out or {})
+            out["fan"] = fan
+        return out
+
+    def _bottle_block(self, run: api.RunInfo) -> Optional[Dict[str, Any]]:
         start = self._run_start
         if not start or start.get("run") != run.run:
             return None
@@ -614,3 +852,11 @@ class PlcPlugin:
     def panel(self, parent: Any = None) -> Any:
         from .panel import PlcPanel
         return PlcPanel(self, parent)
+
+
+def _parses(text: str) -> bool:
+    try:
+        parse_address(text)
+    except ValueError:
+        return False
+    return True

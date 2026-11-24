@@ -90,6 +90,12 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     # its serial link (council_core/serial_port.py: pyserial, optional)
     "open_serial_port": ("council_core.serial_port", "open_port"),
     "serial_ports": ("council_core.serial_port", "list_ports"),
+    # its fan-blade strobe lock (council_core/blade_phase.py, 24 November
+    # 2026): the blade's angle in a picture, the hub found, the reference
+    "FanView": ("council_core.blade_phase", "FanView"),
+    "blade_measure": ("council_core.blade_phase", "measure"),
+    "blade_reference": ("council_core.blade_phase", "reference"),
+    "find_hub": ("council_core.blade_phase", "find_hub"),
 }
 
 __all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])
