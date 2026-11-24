@@ -732,6 +732,11 @@ EVK4 CAMERAS (PROPHESEE)
   prints in C:\\openeb or Downloads and run it again, or give --driver.
   install_openeb.bat --dry-run lists every step without doing any.
   Prophesee's own SDK installer (an account from Prophesee) works too.
+  An EVK4 run records its .raw alone: no pictures while it records (tick
+  "Save pictures while recording" in its settings for them too). The
+  slider shows the .raw; right-click the picture, "Make pictures from
+  .raw…", for the PNGs, or for a whole folder:
+      python _council\\council_core\\raw_pictures.py D:\\runs
 
 NO INTERNET ON THAT MACHINE
   On a PC with internet and the same Windows and Python version (3.11 ->

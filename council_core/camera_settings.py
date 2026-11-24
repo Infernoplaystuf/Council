@@ -2365,6 +2365,7 @@ DISPLAY_ATTRIBUTES: Dict[str, str] = {
     "window_ms": "accumulate_ms",
     "display.events": "display_events",
     "display.palette": "display_palette",
+    "record.pictures": "save_pictures",
 }
 
 
@@ -2398,11 +2399,21 @@ def display_settings(device: Any) -> List[Setting]:
                      "standard picture). Dark: the events on black. "
                      "Colour: light ON and blue OFF on dark blue (PNGs are "
                      "then saved in colour). The .raw is unaffected."),
-    ]
+    ] + ([Setting("record.pictures", "Save pictures while recording",
+                  G_VIEW, BOOL, bool(getattr(device, "save_pictures", True)),
+                  help="Off (the default for an event camera): a run "
+                       "records the .raw alone, every event, and a row "
+                       "per picture window in the frames CSV — nothing is "
+                       "drawn or encoded while it records. Make the PNGs "
+                       "afterwards with \"Make pictures from .raw…\" on "
+                       "the slider. On: a PNG per picture window as well.")]
+         if getattr(device, "records_raw", False) else [])
 
 
 def read_display(device: Any, key: str) -> Any:
-    value = getattr(device, DISPLAY_ATTRIBUTES[key])
+    value = getattr(device, DISPLAY_ATTRIBUTES[key], True)
+    if key == "record.pictures":
+        return bool(value)
     return float(value) if key == "window_ms" else str(value)
 
 
@@ -2411,6 +2422,8 @@ def write_display(device: Any, key: str, value: Any) -> None:
     entries); the grab thread's next window is drawn with it."""
     if key == "window_ms":
         device.accumulate_ms = max(MIN_ACCUMULATE_MS, float(value))
+    elif key == "record.pictures":
+        device.save_pictures = bool(value)
     else:
         setattr(device, DISPLAY_ATTRIBUTES[key], str(value))
 

@@ -134,6 +134,11 @@ class Stats:
     #: or in pylon's buffers, with no failed grab to say so. Failed grabs
     #: are not counted again here. 0 for a camera without frame numbers.
     camera_gaps: int = 0
+    #: AN EVENT CAMERA RECORDING ONLY ITS .raw (Andy, 17 November 2026):
+    #: its pictures are not saved, every event is in the .raw, and each
+    #: picture window still gets its row in the frames CSV (when, how many
+    #: events, where in the .raw) with no file.
+    raw_only: bool = False
 
     @property
     def grab_attempts(self) -> int:
@@ -154,6 +159,8 @@ class Stats:
                 f"{self.dropped} {dropped_label}"]
         if self.recorded:
             bits.append(f"{self.recorded} saved")
+        if self.raw_only:
+            bits.append("pictures off: every event goes to the .raw")
         if self.passed:
             bits.append(f"{self.passed} between triggers (not asked for)")
         if self.waiting:
@@ -674,6 +681,14 @@ class Recorder:
         #: This run's save budget in bytes when it shares the program's with
         #: other cameras (a rig Start); 0 for all of it (WRITE_BUDGET_BYTES).
         self.budget_bytes = 0
+        #: False: no picture is saved, only its row in the frames CSV with
+        #: no file — an event camera recording its .raw alone (Andy, 17
+        #: November 2026: "have the EVK still record the video and not
+        #: convert into images while recording"). FrameWriter.submit logs
+        #: the row at once; nothing is queued or encoded.
+        self.pictures = True
+        #: Rows logged with no picture (pictures False).
+        self.logged = 0
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -722,16 +737,22 @@ class Recorder:
             stage = cameras.frame_stage
         self._writer(stage(frame.image, frame.meta), path)
 
-    def log(self, frame: cameras.Frame, path: Path) -> None:
+    def log(self, frame: cameras.Frame, path: Optional[Path]) -> None:
         """Count a saved frame and give it its index row. NOT thread-safe:
-        FrameWriter calls it one frame at a time, in grab order."""
-        self.written += 1
+        FrameWriter calls it one frame at a time, in grab order. `path`
+        None: a picture that was not saved (pictures False), its row with
+        no file."""
+        if path is None:
+            self.logged += 1
+        else:
+            self.written += 1
         if self._index_rows is not None:
             meta = frame.meta or {}
             window = meta.get("window_ms")
             factor = meta.get("downsample")
             self._index_rows.writerow((
-                path.name, frame.index, frame.timestamp_us,
+                path.name if path is not None else "",
+                frame.index, frame.timestamp_us,
                 meta.get("raw_t_us", ""), meta.get("events", ""),
                 int(round(float(window) * 1000)) if window else "",
                 meta.get("grab_failures", ""),
@@ -857,6 +878,11 @@ class Recorder:
         }
         if totals.get("stream_ended"):
             doc["stream_ended"] = str(totals["stream_ended"])
+        if not self.pictures:
+            # A .raw-only run (added in version 1): no picture was saved;
+            # `windows` rows in the frames CSV say when each picture window
+            # was, its events and where in the .raw, with no file.
+            doc["pictures"] = {"saved": False, "windows": int(self.logged)}
         stack = self.raw_stack
         if stack is not None:
             # A raw run (added in version 1): its frames are in this file,
@@ -1212,6 +1238,13 @@ class FrameWriter:
                 # Offered between the failure and the session noticing it.
                 self.lost += 1
                 return False
+            if not self.recorder.pictures:
+                # A .raw-only run: the row, at once, in grab order (this is
+                # the grab thread, and no writer thread logs in this mode).
+                self.recorder.log(frame, None)
+                if last:
+                    self._end_now()
+                return True
             # One frame bigger than the whole budget is still accepted when
             # nothing is waiting — otherwise a large enough camera could never
             # save anything at all.
@@ -1633,6 +1666,8 @@ class CaptureSession:
         return replace(
             base, dropped=self.mailbox.dropped,
             recorded=sum(w.written for w in writers),
+            raw_only=any(not getattr(w.recorder, "pictures", True)
+                         for w in writers),
             skipped=sum(w.skipped for w in writers),
             waiting=sum(w.pending for w in writers),
             queue_percent=max([w.queue_percent() for w in writers] or [0]),
@@ -1728,6 +1763,7 @@ class CaptureSession:
         if frozen is None or self.writer is not None:
             return live
         return replace(frozen, recorded=live.recorded, skipped=live.skipped,
+                       raw_only=live.raw_only,
                        waiting=live.waiting,
                        unsaved=max(frozen.unsaved, live.unsaved),
                        recording_failed=live.recording_failed)

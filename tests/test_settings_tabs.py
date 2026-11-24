@@ -246,7 +246,8 @@ def test_a_pop_out_reads_its_own_category_not_the_whole_camera(
     evk4.biases.get_all_biases = lambda: calls.append(1) or original()
     listed = frame_camera.settings_list(["Display"])
     assert [s["key"] for s in listed["settings"]] == [
-        "window_ms", "display.events", "display.palette"]
+        "window_ms", "display.events", "display.palette",
+        "record.pictures"]
     assert calls == [], "the biases were read for the display's settings"
     # An IMX636 has six biases (bias_diff too; the fake used to leave it out).
     assert len(frame_camera.settings_list("Biases")["settings"]) == len(

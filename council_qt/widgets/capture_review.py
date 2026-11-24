@@ -301,6 +301,16 @@ class CaptureReviewer(QObject):
         #: The camera is running for the preview (see wants_preview).
         self._previewing = False
         self._run = ""
+        #: A run that saved no pictures, only its .raw (an EVK4 with "Save
+        #: pictures while recording" off): opened in the raw view once its
+        #: .raw is closed (Andy, 17 November 2026).
+        self._raw_next = ""
+        #: "Make pictures from .raw…" at work: (thread, its state, the .raw).
+        self._making: Any = None
+        #: Pictures the .raw in the raw view still has to have made (its
+        #: CSV's rows with no file), read when it is opened.
+        self._raw_wants = 0
+        self._menu: Any = None
         self._seen = 0
         self._shown: Any = None
         self._note = ""
@@ -339,6 +349,12 @@ class CaptureReviewer(QObject):
 
         scrubber.on_step(self._moved)
         folder.on_change(lambda *_: self._scan.start(SCAN_MS))
+        if hasattr(canvas, "setContextMenuPolicy"):
+            # Right-click the picture: "Make pictures from .raw…" (Andy, 17
+            # November 2026) — not a button of its own, so the generated
+            # window's layout is the same.
+            canvas.setContextMenuPolicy(Qt.CustomContextMenu)
+            canvas.customContextMenuRequested.connect(self._canvas_menu)
         hook = getattr(canvas, "on_roi_change", None)
         if roi is not None and callable(hook):
             hook(self._roi_drawn)
@@ -496,6 +512,10 @@ class CaptureReviewer(QObject):
             self._take_new()
         if self._growing and not growing:
             self._finished()
+        if self._raw_next and not capturing:
+            self._open_raw_only_run()
+        if self._making is not None:
+            self._making_progress()
         elif was_capturing and not capturing and self.live:
             # The capture just ended. (Live WITHOUT a capture is the live
             # view, which is not a stop.)
@@ -587,6 +607,7 @@ class CaptureReviewer(QObject):
         self._capturing = True
         self._stay_on_png = False
         self._run_ended = self._keep_pick = False
+        self._raw_next = ""
         self._stop_playing()
         self._end_after_save = False
         if self.mode == RAW:
@@ -629,7 +650,29 @@ class CaptureReviewer(QObject):
         if self.mode == PNG:
             self.reload(keep=None if to_end else keep,
                         at_end=to_end or keep is None)
+            run = self._run
+            if (run and raw_path_for(self.root, run) is not None
+                    and not any(run_of(f) == run for f in self.files)):
+                # The .raw alone: the slider would have nothing of this
+                # run to show, so it shows the .raw (tick opens it).
+                self._raw_next = run
         self._say()
+
+    def _open_raw_only_run(self) -> None:
+        """Open the raw view of a run that saved no pictures, once the
+        camera has closed its .raw."""
+        run = self._raw_next
+        path = raw_path_for(self.root, run)
+        if path is None or self.mode != PNG:
+            self._raw_next = ""
+            return
+        if self.feed.raw_growing(path):
+            return                                  # next tick
+        self._raw_next = ""
+        said = self._to_raw(run=run)
+        if said.startswith("Raw view"):
+            self._note_for("No pictures saved: the .raw of this run "
+                           "(PNG view for live)")
 
     # ==================================================================
     # Showing one position
@@ -828,9 +871,13 @@ class CaptureReviewer(QObject):
             return self._to_png()
         return self._to_raw()
 
-    def _to_raw(self) -> str:
+    def _to_raw(self, run: str = "") -> str:
+        """`run`: open that run's .raw (a run with no pictures)."""
         shown = self._shown[2] if self._shown and self._shown[0] == PNG else ""
-        run = run_of(shown) if shown else ""
+        if run:
+            shown = ""
+        else:
+            run = run_of(shown) if shown else ""
         path = raw_path_for(self.root, run) if run else None
         if path is None and not shown:
             path = latest_raw(self.root) if self.root else None
@@ -864,6 +911,9 @@ class CaptureReviewer(QObject):
         self.live = False
         self.raw = playback
         self.raw_file = path
+        from council_core import raw_pictures
+
+        self._raw_wants = raw_pictures.wants_pictures(path)
         self.mode = RAW
         self._shown = None
         self._raw_target = self._raw_index_for(path, shown)
@@ -1021,7 +1071,9 @@ class CaptureReviewer(QObject):
             total = self.raw.count * self.raw.window_us / 1e6
             if not self.raw.done:
                 return f"Raw {at:.2f} s · reading, {total:.1f} s so far{playing}"
-            return f"Raw {at:.2f} / {total:.2f} s{playing}"
+            ask = (" · no pictures: right-click to make them"
+                   if self._raw_wants and self._making is None else "")
+            return f"Raw {at:.2f} / {total:.2f} s{playing}{ask}"
         if self.live and self._capturing:
             return f"Live · {len(self.files)} saved"
         if self.live:
@@ -1074,7 +1126,94 @@ class CaptureReviewer(QObject):
         finally:
             self._roi_syncing = False
 
+    # ==================================================================
+    # "Make pictures from .raw…"
+    # ==================================================================
+    def _raw_to_make(self) -> Optional[Path]:
+        """The .raw "Make pictures" is for: the one in the raw view, else
+        the run of the picture on screen, else the last run, else the
+        folder's newest."""
+        if self.mode == RAW and self.raw_file is not None:
+            return self.raw_file
+        shown = self._shown[2] if self._shown and self._shown[0] == PNG else ""
+        for run in (run_of(shown) if shown else "", self._run):
+            path = raw_path_for(self.root, run) if run else None
+            if path is not None:
+                return path
+        return latest_raw(self.root) if self.root else None
+
+    def make_pictures(self) -> str:
+        """Draw and save the PNGs of a run that recorded its .raw alone
+        (council_core.raw_pictures), on a thread of its own; the folder is
+        listed again when it is done. Returns what the label says."""
+        if self._making is not None:
+            return self._note_for("Still making pictures…")
+        path = self._raw_to_make()
+        if path is None:
+            return self._note_for("No .raw here to make pictures from")
+        if self.feed.raw_growing(path):
+            return self._note_for("Pictures can be made after Stop")
+        import threading
+
+        from council_core import raw_pictures
+
+        wanted = raw_pictures.wants_pictures(path)
+        if not wanted:
+            return self._note_for(f"{path.name}: every picture is made "
+                                  f"already")
+        state = {"done": 0, "wanted": wanted, "made": None,
+                 "stop": threading.Event(), "said": -1}
+
+        def progress(done: int, of: int) -> None:
+            state["done"] = done
+
+        def work() -> None:
+            state["made"] = raw_pictures.make_pictures(
+                path, open_raw=self._open_raw, stop=state["stop"],
+                progress=progress)
+
+        thread = threading.Thread(target=work, daemon=True,
+                                  name="raw-pictures")
+        self._making = (thread, state, path)
+        thread.start()
+        return self._note_for(f"Making {wanted} pictures from "
+                              f"{path.name}…")
+
+    def _making_progress(self) -> None:
+        thread, state, path = self._making
+        if thread.is_alive():
+            if state["done"] != state["said"]:
+                state["said"] = state["done"]
+                self._note_for(f"Making pictures {state['done']} / "
+                               f"{state['wanted']}…")
+            return
+        self._making = None
+        made = state["made"]
+        if self.raw_file is not None and Path(self.raw_file) == Path(path):
+            from council_core import raw_pictures
+
+            self._raw_wants = raw_pictures.wants_pictures(path)
+        keep = self._shown[2] if self._shown and self._shown[0] == PNG \
+            else None
+        self.reload(keep=keep)
+        self._note_for(made.line() if made is not None
+                       else f"{path.name}: making pictures failed")
+
+    def _canvas_menu(self, pos: Any) -> None:
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self.canvas)
+        action = menu.addAction("Make pictures from .raw…")
+        action.triggered.connect(lambda *_: self.make_pictures())
+        action.setEnabled(self._making is None
+                          and self._raw_to_make() is not None)
+        self._menu = menu
+        if os.environ.get("COUNCIL_NO_DIALOGS", "").strip() in ("", "0"):
+            menu.popup(self.canvas.mapToGlobal(pos))
+
     def close(self) -> None:
+        if self._making is not None:
+            self._making[1]["stop"].set()
         self._stop_playing()
         self._close_raw()
 

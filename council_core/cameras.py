@@ -474,6 +474,13 @@ class Device:
     #: camera has no such stream, and its saved frames ARE the data.
     records_raw = False
 
+    #: Whether a run saves a picture per frame. Always for a frame camera
+    #: (its pictures are the data). An event camera with records_raw may
+    #: record its .raw alone (False, EvkDevice's default; Andy, 17 November
+    #: 2026): the run's frames CSV still gets a row per picture window,
+    #: with no file, and the pictures are made from the .raw afterwards.
+    save_pictures = True
+
     #: Whether stop() then start() on the same open device is safe. A frame
     #: camera's grabs are independent, so yes. An EVK4's decoder carries its
     #: state across a restart and Python cannot reset it (see EvkDevice), so
@@ -2015,6 +2022,9 @@ class EvkDevice(Device):
     # The raw recording
     # ------------------------------------------------------------------
     records_raw = True
+    #: The .raw alone while recording; "Save pictures while recording"
+    #: turns the PNGs back on (Device.save_pictures).
+    save_pictures = False
 
     @property
     def raw_path(self) -> Optional[Path]:

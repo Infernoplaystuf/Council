@@ -562,6 +562,50 @@ def test_an_event_run_records_its_raw_beside_the_frames(tmp_path):
     assert device.calls[-1] == "stop_raw"
 
 
+def test_an_evk4_run_records_the_raw_alone_by_default(tmp_path):
+    """Andy, 17 November 2026: "have the EVK still record the video and not
+    convert into images while recording". The .raw, the records and a row
+    per picture window in the frames CSV (no file); no PNG."""
+    import csv
+    import json
+
+    assert cameras.EvkDevice.save_pictures is False
+    device = connected_raw()
+    device.save_pictures = False
+    out = frame_camera.start(str(tmp_path))
+    run = out["run"]
+    settle()
+    stopped = frame_camera.stop()
+    deadline = time.monotonic() + 5
+    while frame_camera._LIVE.session.saving and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert (tmp_path / f"{run}_events.raw").exists()
+    assert not list(tmp_path.glob("*.png"))
+    with open(tmp_path / f"{run}_frames.csv", newline="",
+              encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows and all(row["file"] == "" for row in rows)
+    assert all(row["timestamp_us"] for row in rows)
+    assert "pictures off" in stopped["summary"]
+    assert "no pictures saved" in frame_camera._run_note(
+        frame_camera._LIVE.session)
+    end = json.loads((tmp_path / f"{run}_run_end.json").read_text(
+        encoding="utf-8"))
+    assert end["pictures"] == {"saved": False, "windows": len(rows)}
+
+
+def test_save_pictures_while_recording_saves_them_too(tmp_path):
+    device = connected_raw()
+    device.save_pictures = True
+    out = frame_camera.start(str(tmp_path))
+    settle()
+    frame_camera.stop()
+    deadline = time.monotonic() + 5
+    while frame_camera._LIVE.session.saving and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert list(tmp_path.glob(f"{out['run']}_frame_*.png"))
+
+
 def test_a_frame_camera_run_has_no_raw(tmp_path):
     connected()
     out = frame_camera.start(str(tmp_path))

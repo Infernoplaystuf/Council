@@ -1089,6 +1089,7 @@ def test_a_recording_opened_as_a_device_lists_only_what_it_has():
     # The display settings are the app's own (how the picture is drawn),
     # so even a recording has them.
     assert keys == ["window_ms", "display.events", "display.palette",
+                    "record.pictures",
                     "camera.serial", "camera.sensor", "camera.format"]
 
 
@@ -1628,3 +1629,28 @@ def test_a_value_the_camera_cannot_take_is_no_reason_to_stop():
     done = cs.apply(dev, {"PixelFormat": "Mono99", "Gain": 3.0})
     assert [c.key for c in done.refused] == ["PixelFormat"]
     assert cs.stops_needed(dev, {"PixelFormat": "Mono12"}) == ["PixelFormat"]
+
+
+def test_an_evk4_records_its_raw_alone_unless_told_to_save_pictures():
+    """Andy, 17 November 2026: "have the EVK still record the video and not
+    convert into images while recording"."""
+    dev, _ = evk()
+    found = by_key(dev)
+    box = found["record.pictures"]
+    assert box.kind == cs.BOOL and box.value is False
+    assert box.label == "Save pictures while recording"
+    assert dev.set_setting("record.pictures", True).ok
+    assert dev.save_pictures is True
+    assert by_key(dev)["record.pictures"].value is True
+
+
+def test_a_frame_camera_has_no_save_pictures_box():
+    dev = cameras.SyntheticDevice(CameraInfo("synthetic", "SIM-EV",
+                                             "Simulated", "SIM-EV",
+                                             kind="event"))
+    try:
+        keys = [s.key for s in dev.settings()]
+    finally:
+        dev.close()
+    assert "record.pictures" not in keys
+    assert cameras.Device.save_pictures is True

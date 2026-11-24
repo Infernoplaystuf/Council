@@ -1173,3 +1173,113 @@ def test_saved_runs_of_two_bit_depths_each_fill_the_display(tmp_path):
     decode(str(tmp_path / "20261005_100000_frame_000001.png"))
     shown = decode(str(tmp_path / "20261005_110000_frame_000001.png"))
     assert int(shown.max()) == 255
+
+
+# ======================================================================
+# A run that recorded its .raw alone (Andy, 17 November 2026)
+# ======================================================================
+def raw_only_run(folder, count=10, raw_every_us=20_000):
+    """An EVK4 run with "Save pictures while recording" off: the .raw and
+    a frames CSV whose rows name no file."""
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / f"{RUN}_frames.csv", "w", newline="") as handle:
+        out = csv.writer(handle)
+        out.writerow(("file", "index", "timestamp_us", "raw_t_us", "events",
+                      "window_us"))
+        for i in range(1, count + 1):
+            out.writerow(("", i, 1_000_000 + i * raw_every_us,
+                          i * raw_every_us, 5, raw_every_us))
+    (folder / f"{RUN}_events.raw").write_bytes(b"% end\n")
+
+
+class ScriptedFeed:
+    def __init__(self):
+        self.capturing_now = False
+        self.growing = False
+
+    def capturing(self):
+        return self.capturing_now
+
+    def saving(self):
+        return False
+
+    def run(self):
+        return RUN
+
+    def written(self, start=0):
+        return []
+
+    def raw_growing(self, path):
+        return self.growing
+
+    def previewing(self):
+        return False
+
+
+def test_a_run_with_no_pictures_opens_in_the_raw_view(ui, tmp_path):
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    feed = ScriptedFeed()
+    rv.feed = feed
+    opened = with_playback(rv, FakePlayback(30))
+    feed.capturing_now = True
+    rv.tick()
+    raw_only_run(tmp_path)
+    feed.capturing_now = False
+    feed.growing = True                 # the camera has not closed it yet
+    rv.tick()
+    assert opened == [] and rv.mode == cr.PNG
+    feed.growing = False
+    rv.tick()
+    assert opened == [tmp_path / f"{RUN}_events.raw"]
+    assert rv.mode == cr.RAW
+    assert "No pictures saved" in ui.ports.view_status.get()
+
+
+def test_a_run_with_pictures_stays_in_the_png_view(ui, tmp_path):
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    feed = ScriptedFeed()
+    rv.feed = feed
+    opened = with_playback(rv, FakePlayback(30))
+    feed.capturing_now = True
+    rv.tick()
+    saved_run(tmp_path)
+    feed.capturing_now = False
+    rv.tick()
+    rv.tick()
+    assert opened == [] and rv.mode == cr.PNG
+
+
+def test_make_pictures_from_raw_fills_the_slider(ui, tmp_path):
+    rv = ui._capture_review
+    raw_only_run(tmp_path, count=8)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    assert rv.files == []
+    with_playback(rv, FakePlayback(30))
+    rv.toggle_view()
+    pump(0.05)
+    assert "right-click to make them" in rv.view_text()
+    said = rv.make_pictures()
+    assert said.startswith("Making 8 pictures")
+    assert pump_until(lambda: rv._making is None and len(rv.files) == 8)
+    assert "8 pictures made" in ui.ports.view_status.get()
+    assert "right-click" not in rv.view_text()
+    assert rv.make_pictures().endswith("every picture is made already")
+
+
+def test_the_canvas_offers_make_pictures_on_a_right_click(ui, tmp_path):
+    rv = ui._capture_review
+    raw_only_run(tmp_path)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    from PySide6.QtCore import QPoint, Qt
+
+    assert rv.canvas.contextMenuPolicy() == Qt.CustomContextMenu
+    rv._canvas_menu(QPoint(5, 5))
+    actions = rv._menu.actions()
+    assert [a.text() for a in actions] == ["Make pictures from .raw…"]
+    assert actions[0].isEnabled()
