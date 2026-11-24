@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "id": "typhon.plc",
+  "short": "plc",
+  "name": "PLC trigger (Do-More)",
+  "version": "0.1.0",
+  "api": "1.0",
+  "kind": "source",
+  "scope": "rig",
+  "entry": "plugin:PlcPlugin",
+  "needs": [],
+  "python": [],
+  "contributes": [
+    "panel",
+    "run_hooks"
+  ],
+  "files": [
+    "_blade_phase.csv"
+  ],
+  "network": "camera-link"
+}

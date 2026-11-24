@@ -411,6 +411,18 @@ The same folder, manifest, review and approval apply to:
   (`typhon_plugins/classify/`) and Send trigger (`typhon_plugins/send_trigger/`).
 - **source** plugins: a trigger box that says "capture now" (`sources()`,
   `make_source(name)`). See `docs/handoff/typhon_triggering_2026-11-02.md`.
+  The built-in PLC trigger (`typhon_plugins/plc/`, guide
+  `docs/typhon_plc_trigger.md`) is a full example: a source that reads a
+  PLC over Modbus TCP (`"network": "camera-link"`, which allows addresses
+  on the local network only) or Modbus RTU on a serial port (pyserial,
+  optional), plus a panel and run hooks. A source plugin
+  may offer no source at times: it offers its source only in network mode.
+  Its fan-blade strobe lock (section 9 of that guide) shows a run hook that
+  follows the run's frames CSV as pictures are saved, streams a run file
+  of its own (`create_file`, `"files": ["_blade_phase.csv"]`), keeps a
+  file in its data folder (`write_new(data_dir(), ...)`: a project's
+  settings hold plain values only, so a long list goes in a file), and
+  changes a camera setting mid-run from its thread (through `call_in_ui`).
 
 The full API reference is `typhon_plugin_api/__init__.py`, and its working
 notes are `docs/typhon_plugin_api_notes.md`.

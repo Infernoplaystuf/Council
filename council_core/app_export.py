@@ -80,10 +80,15 @@ SKIP_SUFFIXES = {".pyc", ".pyo"}
 #: Import name -> the name pip installs it under, where they differ.
 PIP_NAMES = {"PIL": "Pillow", "sklearn": "scikit-learn", "cv2":
              "opencv-python", "yaml": "PyYAML", "skimage": "scikit-image",
-             "pypylon": "pypylon"}
+             "pypylon": "pypylon",
+             # NOT "serial": that is another package on PyPI, and it
+             # breaks pyserial's import
+             "serial": "pyserial"}
 #: Packages an app needs only for some hardware or feature: listed as
 #: comments in requirements.txt, with what they are for.
-OPTIONAL = {"pypylon": "Basler cameras (also the pylon runtime; CoaXPress "
+OPTIONAL = {"serial": "the PLC trigger plugin's serial (Modbus RTU) "
+                      "link",
+            "pypylon": "Basler cameras (also the pylon runtime; CoaXPress "
                        "needs the pylon Software Suite's CXP support and the "
                        "frame grabber's driver)",
             "metavision_hal": "Prophesee event cameras (the Metavision SDK; "
