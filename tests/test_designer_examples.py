@@ -647,6 +647,14 @@ def test_the_factory_opens_a_save_dialog_that_does_not_ask_twice(
         qapp, monkeypatch):
     from council_qt.widgets import example_dialog
     monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
+    # With dialogs on, build_designer also starts the worker that makes
+    # Typhon (plugins) once per vault. Left real here it was still building
+    # when the process ended, and Windows CI saw "65 passed" and a failed
+    # exit (qt-migration, 24 November 2026). Stubbed: this test is about the
+    # save dialog; the worker has its own test below.
+    made = threading.Event()
+    monkeypatch.setattr(dx, "ensure_auto_project",
+                        lambda vault, toolkit="qt": made.set() or "")
     calls = []
     monkeypatch.setattr(example_dialog.dialogs, "asksaveasfilename",
                         lambda **k: calls.append(k) or "C:/x/y.gspec")
@@ -658,6 +666,38 @@ def test_the_factory_opens_a_save_dialog_that_does_not_ask_twice(
         assert calls[0]["initialdir"] == "D"
         assert calls[0]["initialfile"] == "f.gspec"
         assert calls[0]["parent"] is view
+        assert made.wait(5)
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_with_dialogs_on_the_designer_makes_typhon_plugins_on_a_worker(
+        qapp, monkeypatch):
+    """Outside an unattended run, build_designer hands the once-per-vault
+    Typhon (plugins) build to a worker and logs what it says; the worker is
+    finished before the test (and the process) ends."""
+    monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
+    seen = []
+    done = threading.Event()
+
+    def fake(vault, toolkit="qt"):
+        seen.append((threading.current_thread().name, Path(vault)))
+        done.set()
+        return "Made Typhon (plugins) for the test."
+
+    monkeypatch.setattr(dx, "ensure_auto_project", fake)
+    view = build_designer(None)
+    try:
+        assert done.wait(5)
+        deadline = time.monotonic() + 5
+        while "Made Typhon (plugins)" not in log_text(view) and \
+                time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert seen[0][0] == "designer-typhon-plugins"
+        assert seen[0][1] == Path(view.actions.vault_dir)
+        assert "Made Typhon (plugins) for the test." in log_text(view)
     finally:
         view.deleteLater()
         qapp.processEvents()
