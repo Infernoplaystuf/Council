@@ -124,6 +124,8 @@ settings.
 |---|---|---|
 | `MHR1` | Bottle count: add 1 per bottle (wrapping past 65535 is fine) | **Bottle count** |
 | `MHR2` | Belt speed in mm/s (or tenths: set **units per mm/s** to 10) | **Speed register** (when **Belt speed** is *From PLC register*) |
+| `MHR3` | Fire request: Typhon writes 1, the ladder pulses the camera and writes 0 back (3.4b) | **Fire request** |
+| `MHR4` | Presses the ladder took (optional, for your own records) | none |
 
 If the belt always runs at one speed, choose **Belt speed: Fixed**, type in
 the speed, and leave `MHR2` out of the ladder.
@@ -152,6 +154,31 @@ or to the frame grabber's trigger input that forwards `CxpTrigger0`. Check
 the camera's or grabber's manual for the voltage and polarity it needs. Set
 the edge (**RisingEdge**) and, if the line is noisy, a debounce in Typhon's
 Triggering window.
+
+### 3.4b Ladder: let Typhon fire the camera through the PLC
+
+The window's **Fire camera via PLC** button lets the GUI take a picture
+during a run that is triggered from the PLC's wire. A Basler camera listens
+to one trigger source at a time. While it is set to **CxpTrigger0** or
+**Line1** for the PLC, it ignores Typhon's software trigger, so the GUI asks
+the PLC to pulse the same output instead. The picture goes down the same
+wire, with the same trigger delay as a bottle.
+
+```
+Rung 5   STR   MHR3 <> 0          SET  Y0         (Typhon asked: output on)
+                                  INC  MHR4       (count the press)
+                                  MOVE 0 -> MHR3  (request taken)
+```
+
+`Y0` is turned off again by rungs 3 and 4, as for a bottle. Use a compare
+contact for `MHR3 <> 0`, with all three instructions on that one rung. The press reaches
+the camera about one PLC scan after Typhon's write, so allow 1 to 3 ms over
+Ethernet and a few ms more over serial. The camera's trigger delay applies to every
+pulse on its line, so a press waits the same delay as a bottle.
+
+If the button says *the last press was still waiting*, `MHR3` was still 1
+from the press before, which means the fire rung isn't in the ladder or the
+PLC isn't running.
 
 ### 3.5 Belt speed (optional)
 
@@ -206,8 +233,10 @@ count at Start and again at the end. The run's end record
 (`<run>_run_end.json`, under `plugins` → `typhon.plc`) then holds:
 
 - `bottles`: how many bottles the PLC counted during the run;
-- `frames_saved` per camera, and `missed` (frames short of bottles × frames
-  per trigger);
+- `presses`: how many **Fire camera via PLC** presses the PLC took during
+  the run;
+- `frames_saved` per camera, and `missed` (frames short of (bottles +
+  presses) × frames per trigger);
 - in network mode, `network.triggers` (how many Typhon fired), `late`
   (bottles fired late, after the time they were due) and `merged` (bottles
   that arrived between two reads);

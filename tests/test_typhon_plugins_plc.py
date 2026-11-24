@@ -211,6 +211,10 @@ def test_the_missed_bottle_check():
     assert not short["ok"] and short["missed"] == {"cam1": 7, "cam2": 0}
     assert "cam1: 7 frame(s) short" in short["words"]
     assert "fired 4 of 5" in short["words"]
+    pressed = timing.bottle_check(5, None, {"cam1": 7}, presses=2)
+    assert pressed["ok"] and pressed["presses"] == 2
+    assert "and 2 press(es)" in timing.bottle_check(
+        5, None, {"cam1": 5}, presses=2)["words"]
     assert not timing.bottle_check(None, None, {"cam1": 3})["ok"]
 
 
@@ -424,6 +428,41 @@ def test_the_wire_mode_follows_the_speed_between_runs(plugin_project,
         plugin.deactivate()
 
 
+@pytest.mark.parametrize("link", [timing.LINK_TCP, timing.LINK_SERIAL])
+def test_the_gui_fires_the_camera_through_the_plc(plugin_project, link):
+    plugin = plc_on(plugin_project, {"simulated": True, "link": link,
+                                     "mode": timing.MODE_WIRE,
+                                     "follow_speed": False})
+    try:
+        plugin.sim.belt_running = False
+        said = plugin.fire_via_plc()
+        assert said.startswith("Trigger sent through the PLC (MHR3)"), said
+        assert wait_for(lambda: len(plugin.sim.press_pulses) == 1, 2.0)
+        assert plugin.sim.holding[2] == 0, "the ladder cleared the request"
+        assert plugin.sim.holding[3] == 1, "and counted the press"
+        assert plugin.presses == 1
+        plugin.update_settings({"fire_register": "MHR1"})
+        assert "already the bottle count" in plugin.fire_via_plc()
+        plugin.update_settings({"fire_register": "MIR3"})
+        assert "input register" in plugin.fire_via_plc()
+        assert plugin.presses == 1
+    finally:
+        plugin.deactivate()
+
+
+def test_a_press_with_no_fire_rung_is_said(sim):
+    from typhon_plugins.plc.plugin import PlcPlugin
+
+    plugin = PlcPlugin()
+    plugin.settings = timing.PlcSettings(host="127.0.0.1", port=sim.port)
+    sim.fire_offset = 99                     # the ladder has no fire rung
+    try:
+        assert "Trigger sent" in plugin.fire_via_plc()
+        assert "still waiting" in plugin.fire_via_plc()
+    finally:
+        plugin.stop_monitor()
+
+
 def test_the_simulated_plc_over_serial(plugin_project, monkeypatch):
     plugin = plc_on(plugin_project, {"simulated": True,
                                      "link": timing.LINK_SERIAL,
@@ -479,6 +518,8 @@ def test_its_window_is_built_offscreen(plugin_project):
         assert plugin.settings.distance_mm == 250.0
         panel.test()
         assert "The PLC answered" in panel.said.text(), panel.said.text()
+        panel.fire_button.click()
+        assert "Trigger sent through the PLC" in panel.said.text()
         panel.link.setCurrentText(timing.LINK_SERIAL)
         assert plugin.settings.link == timing.LINK_SERIAL
         assert panel.serial_row.isVisibleTo(panel)

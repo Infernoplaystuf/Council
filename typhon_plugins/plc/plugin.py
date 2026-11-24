@@ -36,6 +36,11 @@ modbus.py is the client (standard library only); simulator.py a pretend
 PLC and conveyor on 127.0.0.1 for trying it without hardware.
 
 ALSO
+  * Fire camera via PLC (Andy, 24 November 2026): the GUI writes 1 to the
+    fire register (MHR3); one ladder rung pulses the camera's output and
+    writes 0 back. A Basler listens to one trigger source, so during a
+    run from the PLC's wire this is how Typhon takes an extra picture.
+    Presses are counted in the missed-bottle check.
   * Auto-calibrate (council_core/bottle_position.py, through
     typhon_plugin_api.builtin): from the newest pictures, how far the
     bottle sits from the middle of the view; the delay is corrected by
@@ -226,6 +231,8 @@ class PlcPlugin:
         self.sources_made: List[PlcSource] = []
         self._run_start: Dict[str, Any] = {}
         self.last_said = ""
+        #: "Fire camera via PLC" presses the PLC took (this session)
+        self.presses = 0
 
     # -- life ---------------------------------------------------------------
     def activate(self, ctx: api.PluginContext) -> None:
@@ -287,10 +294,15 @@ class PlcPlugin:
                     speed = parse_address(self.settings.speed_register)
                 except ValueError:
                     speed = parse_address("MHR2")
-                self.sim = SimulatedPlc(
-                    speed_mm_s=self.settings.speed_mm_s,
-                    count_offset=count.offset,
-                    speed_offset=speed.offset).start()
+                sim = SimulatedPlc(speed_mm_s=self.settings.speed_mm_s,
+                                   count_offset=count.offset,
+                                   speed_offset=speed.offset)
+                try:
+                    sim.fire_offset = parse_address(
+                        self.settings.fire_register).offset
+                except ValueError:
+                    pass
+                self.sim = sim.start()
             return self.sim
 
     def _stop_sim(self) -> None:
@@ -447,6 +459,46 @@ class PlcPlugin:
         return self._said(f"Trigger delay set to {float(took) / 1000.0:.3f} "
                           f"ms on {self.ctx.active_camera()}.", quiet)
 
+    # -- the GUI fires the camera through the PLC (Andy, 24 November 2026) --
+    def fire_via_plc(self) -> str:
+        """Ask the PLC to pulse the camera's output once: write 1 to the
+        fire register; the ladder pulses the output and writes 0 back. The
+        camera keeps listening to its wire (CxpTrigger0, Line1), so this
+        works in the middle of a PLC run, with the same trigger delay as a
+        bottle. What happened, in words. Waits on the PLC (a Modbus write,
+        a few ms): call it from a button, not a timer."""
+        if not self._set_up():
+            return self._said("Set the PLC's address or serial port first.",
+                              False)
+        try:
+            at = parse_address(self.settings.fire_register)
+        except ValueError as exc:
+            return self._said(f"Fire register: {exc}", False)
+        taken = {self.settings.count_register.upper(),
+                 self.settings.speed_register.upper()}
+        if at.text in {t.replace(" ", "") for t in taken}:
+            return self._said(f"Fire register {at.text} is already the "
+                              f"bottle count or speed register: pick its "
+                              f"own (MHR3).", False)
+        if not at.writable:
+            return self._said(f"Fire register {at.text} is an input "
+                              f"register: pick a holding register (MHR3).",
+                              False)
+        try:
+            if self._link is None:
+                self._link = self.make_link()
+            client = self._link.client
+            pending = client.read_one(at)
+            client.write(at, [1])
+        except (ModbusError, OSError) as exc:
+            return self._said(f"The PLC did not take the trigger: {exc}",
+                              False)
+        self.presses += 1
+        note = (" (the last press was still waiting: is the fire rung in "
+                "the ladder?)" if pending else "")
+        return self._said(f"Trigger sent through the PLC ({at.text}).{note}",
+                          False)
+
     def _said(self, text: str, quiet: bool) -> str:
         self.last_said = text
         if not quiet and self.ctx is not None:
@@ -505,7 +557,8 @@ class PlcPlugin:
             return
         self._run_start = {"run": run.run, "count": self._count_now(),
                            "speed": self.reading.get("speed"),
-                           "made": len(self.sources_made)}
+                           "made": len(self.sources_made),
+                           "presses": self.presses}
 
     def on_run_finished(self, run: api.RunInfo) -> Optional[Dict[str, Any]]:
         start = self._run_start
@@ -531,7 +584,8 @@ class PlcPlugin:
                 per = max(per, int(getattr(setup, "per_trigger", 1) or 1))
             except Exception:                             # noqa: BLE001
                 pass
-        out = timing.bottle_check(bottles, triggers, frames, per)
+        presses = self.presses - int(start.get("presses") or 0)
+        out = timing.bottle_check(bottles, triggers, frames, per, presses)
         out["mode"] = self.settings.mode
         out["speed_mm_s"] = {"start": start.get("speed"),
                              "end": self.reading.get("speed")}

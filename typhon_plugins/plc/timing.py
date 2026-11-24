@@ -64,6 +64,9 @@ class PlcSettings:
     stop_bits: int = 1
     mode: str = MODE_WIRE
     count_register: str = "MHR1"
+    #: "Fire camera via PLC": Typhon writes 1 here; the ladder pulses the
+    #: camera's output and writes 0 back (docs/typhon_plc_trigger.md 3.4b)
+    fire_register: str = "MHR3"
     speed_source: str = SPEED_FIXED
     speed_mm_s: float = 500.0
     speed_register: str = "MHR2"
@@ -183,25 +186,30 @@ def correction_ms(offset_px: float, mm_per_px: float,
 
 
 def bottle_check(bottles: Optional[int], triggers: Optional[int],
-                 frames: Mapping[str, Optional[int]], per_trigger: int = 1
-                 ) -> Dict[str, Any]:
+                 frames: Mapping[str, Optional[int]], per_trigger: int = 1,
+                 presses: int = 0) -> Dict[str, Any]:
     """The run's bottles (from the PLC's count) against the triggers Typhon
     fired (network mode) and each camera's frames saved: the block written
     into the run's end record, with `missed` per camera (frames short of
-    bottles x per_trigger; 0 when none or unknown)."""
+    (bottles + presses) x per_trigger; 0 when none or unknown). `presses`:
+    "Fire camera via PLC" presses the PLC took during the run, each one
+    more picture on the same wire."""
     per = max(1, int(per_trigger or 1))
+    presses = max(0, int(presses or 0))
     out: Dict[str, Any] = {"bottles": bottles, "triggers": triggers,
+                           "presses": presses,
                            "frames_saved": dict(frames), "missed": {}}
     words = []
     for cam, saved in frames.items():
         if bottles is None or saved is None:
             out["missed"][cam] = None
             continue
-        missed = max(0, bottles * per - int(saved))
+        missed = max(0, (bottles + presses) * per - int(saved))
         out["missed"][cam] = missed
         if missed:
+            extra = f" and {presses} press(es)" if presses else ""
             words.append(f"{cam}: {missed} frame(s) short of {bottles} "
-                         f"bottle(s)")
+                         f"bottle(s){extra}")
     if bottles is not None and triggers is not None and triggers < bottles:
         words.append(f"Typhon fired {triggers} of {bottles} bottles")
     out["ok"] = not words and bottles is not None

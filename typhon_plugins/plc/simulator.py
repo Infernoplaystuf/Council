@@ -46,6 +46,13 @@ class SimulatedPlc:
         #: the serial port's station number and speed (Modbus RTU)
         self.station = 1
         self.baud = 115200
+        #: the "fire" rung (docs 3.4b): a 1 written here pulses the camera's
+        #: output, and the ladder writes 0 back and counts the press
+        self.fire_offset = 2
+        self.presses_offset = 3
+        #: when the camera's output (Y0) pulsed: bottles and presses alike
+        self.pulses: List[float] = []
+        self.press_pulses: List[float] = []
 
     # -- life -------------------------------------------------------------
     def start(self) -> "SimulatedPlc":
@@ -57,7 +64,7 @@ class SimulatedPlc:
         self._server = server
         self.port = server.getsockname()[1]
         self._set_speed_register()
-        for target in (self._accept, self._conveyor):
+        for target in (self._accept, self._conveyor, self._scan):
             t = threading.Thread(target=target, daemon=True,
                                  name=f"sim-plc-{target.__name__}")
             t.start()
@@ -98,12 +105,27 @@ class SimulatedPlc:
         crossed = time.monotonic()
         with self._lock:
             self.detections.append(crossed)
+            self.pulses.append(crossed)
         delay = self.scan_ms / 1000.0
         if delay > 0:
             time.sleep(delay)
         with self._lock:
             off = self.count_offset
             self.holding[off] = (self.holding[off] + 1) & 0xFFFF
+
+    def _scan(self) -> None:
+        """The ladder's fire rung, once a scan: a request in the fire
+        register pulses the output, is cleared and counted."""
+        period = max(self.scan_ms, 0.2) / 1000.0
+        while not self._stop.wait(period):
+            with self._lock:
+                if self.holding[self.fire_offset]:
+                    now = time.monotonic()
+                    self.holding[self.fire_offset] = 0
+                    at = self.presses_offset
+                    self.holding[at] = (self.holding[at] + 1) & 0xFFFF
+                    self.pulses.append(now)
+                    self.press_pulses.append(now)
 
     def _conveyor(self) -> None:
         next_at = time.monotonic() + 0.05

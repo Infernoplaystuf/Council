@@ -147,6 +147,11 @@ class PlcPanel(QWidget):
         self.count_register.setToolTip("The register the ladder adds 1 to "
                                        "per bottle (MHR1 = 40001).")
         form.addRow("Bottle count", self.count_register)
+        self.fire_register = QLineEdit(s.fire_register, plc)
+        self.fire_register.setToolTip("Fire camera via PLC writes 1 here; "
+                                      "the ladder pulses the camera's "
+                                      "output and writes 0 back.")
+        form.addRow("Fire request", self.fire_register)
         layout.addWidget(plc)
 
         # -- the belt -------------------------------------------------------
@@ -219,13 +224,21 @@ class PlcPanel(QWidget):
                   self.calibrate_button):
             row.addWidget(b)
         layout.addLayout(row)
+        self.fire_button = QPushButton("Fire camera via PLC", self)
+        self.fire_button.setObjectName("btn_plc_fire")
+        self.fire_button.setToolTip("The PLC pulses the camera's trigger "
+                                    "output once — works during a run "
+                                    "triggered from the PLC's wire.")
+        self.fire_button.clicked.connect(self.fire)
+        layout.addWidget(self.fire_button)
         self.said = QLabel("", self)
         self.said.setObjectName("plc_said")
         self.said.setWordWrap(True)
         layout.addWidget(self.said)
         layout.addStretch(1)
 
-        for w in (self.host, self.count_register, self.speed_register):
+        for w in (self.host, self.count_register, self.speed_register,
+                  self.fire_register):
             w.editingFinished.connect(self.save)
         self.serial_port.lineEdit().editingFinished.connect(self.save)
         self.serial_port.activated.connect(self.save)
@@ -269,6 +282,7 @@ class PlcPanel(QWidget):
                 "simulated": self.simulated.isChecked(),
                 "mode": self.mode.currentText(),
                 "count_register": self.count_register.text().strip(),
+                "fire_register": self.fire_register.text().strip(),
                 "speed_source": self.speed_source.currentText(),
                 "speed_mm_s": self.speed.value(),
                 "speed_register": self.speed_register.text().strip(),
@@ -361,6 +375,9 @@ class PlcPanel(QWidget):
         else:
             self.said.setText(f"No answer: {r.get('error')}")
         self.refresh()
+
+    def fire(self) -> None:
+        self.said.setText(self.plugin.fire_via_plc())
 
     def apply(self) -> None:
         self.said.setText(self.plugin.apply_delay())
