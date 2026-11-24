@@ -411,6 +411,11 @@ The same folder, manifest, review and approval apply to:
   (`typhon_plugins/classify/`) and Send trigger (`typhon_plugins/send_trigger/`).
 - **source** plugins: a trigger box that says "capture now" (`sources()`,
   `make_source(name)`). See `docs/handoff/typhon_triggering_2026-11-02.md`.
+  The built-in PLC trigger (`typhon_plugins/plc/`, guide
+  `docs/typhon_plc_trigger.md`) is a full example: a source that reads a
+  PLC over Modbus TCP (`"network": "camera-link"`, which allows addresses
+  on the local network only), plus a panel and run hooks. A source plugin
+  may offer no source at times: it offers its source only in network mode.
 
 The full API reference is `typhon_plugin_api/__init__.py`, and its working
 notes are `docs/typhon_plugin_api_notes.md`.

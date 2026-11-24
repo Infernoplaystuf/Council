@@ -82,6 +82,11 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     # 2026): "Find my trigger line" and its words
     "FIND_LINE_SECONDS": ("council_core.basler_lines", "FIND_S"),
     "find_line_words": ("council_core.basler_lines", "find_words"),
+    # the PLC trigger's auto-calibration (council_core/bottle_position.py,
+    # 24 November 2026): numpy and Pillow, which a plugin's folder may not
+    # import
+    "bottle_calibrate": ("council_core.bottle_position", "calibrate"),
+    "latest_pictures": ("council_core.bottle_position", "latest_pictures"),
 }
 
 __all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])

@@ -1,0 +1,301 @@
+"""
+typhon.plc's window: the PLC's address, the mode, the registers, the belt,
+the live readout (count, speed, the delay they make, the delay the camera
+has) and the buttons — Test connection, Apply delay to camera, Calibrate
+from the newest pictures. Every edit is kept in the project at once.
+
+The readout is refreshed twice a second from the plugin's monitor (which
+reads the PLC on its own thread); nothing here waits on the network
+except Test connection, which is bounded by the client's timeout.
+
+Qt widgets only (QtCore, QtWidgets: design 3.11's rule for panels).
+"""
+from __future__ import annotations
+
+import threading
+from typing import Any, Dict
+
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
+                               QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QSpinBox, QVBoxLayout,
+                               QWidget)
+
+from . import timing
+
+REFRESH_MS = 500
+INTRO = ("A Do-More PLC says when a bottle passes its photo-eye; Typhon "
+         "times the picture so the bottle is in the middle of the view. "
+         "The Do-More Designer set-up is in docs/typhon_plc_trigger.md.")
+WIRE_HINT = ("Wire: the PLC's output goes to the camera's trigger input. "
+             "In Triggering pick Triggered: exact and that line (Line1, "
+             "CxpTrigger0 …); this window sets the camera's trigger delay.")
+NET_HINT = ("Network: in Triggering pick Trigger from \"PLC (network)\". "
+            "Typhon reads the bottle count and fires each bottle itself "
+            "(a few ms of spread).")
+
+
+def _spin(parent: QWidget, lo: float, hi: float, value: float,
+          decimals: int = 1, suffix: str = "") -> QDoubleSpinBox:
+    box = QDoubleSpinBox(parent)
+    box.setRange(lo, hi)
+    box.setDecimals(decimals)
+    box.setValue(value)
+    if suffix:
+        box.setSuffix(suffix)
+    box.setKeyboardTracking(False)
+    return box
+
+
+class PlcPanel(QWidget):
+    def __init__(self, plugin: Any, parent: Any = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("plc_panel")
+        self.plugin = plugin
+        s = plugin.settings
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        intro = QLabel(INTRO, self)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # -- the PLC --------------------------------------------------------
+        plc = QGroupBox("PLC", self)
+        form = QFormLayout(plc)
+        self.host = QLineEdit(s.host, plc)
+        self.host.setPlaceholderText("192.168.1.10")
+        self.port = QSpinBox(plc)
+        self.port.setRange(1, 65535)
+        self.port.setValue(s.port)
+        row = QHBoxLayout()
+        row.addWidget(self.host, 1)
+        row.addWidget(QLabel("port", plc))
+        row.addWidget(self.port)
+        form.addRow("Address", row)
+        self.simulated = QCheckBox("Use a simulated PLC (no hardware)", plc)
+        self.simulated.setChecked(s.simulated)
+        form.addRow("", self.simulated)
+        self.mode = QComboBox(plc)
+        self.mode.addItems(list(timing.MODES))
+        self.mode.setCurrentText(s.mode)
+        form.addRow("Mode", self.mode)
+        self.hint = QLabel("", plc)
+        self.hint.setWordWrap(True)
+        form.addRow(self.hint)
+        self.count_register = QLineEdit(s.count_register, plc)
+        self.count_register.setToolTip("The register the ladder adds 1 to "
+                                       "per bottle (MHR1 = 40001).")
+        form.addRow("Bottle count", self.count_register)
+        layout.addWidget(plc)
+
+        # -- the belt -------------------------------------------------------
+        belt = QGroupBox("Belt and timing", self)
+        form = QFormLayout(belt)
+        self.speed_source = QComboBox(belt)
+        self.speed_source.addItems(list(timing.SPEEDS))
+        self.speed_source.setCurrentText(s.speed_source)
+        form.addRow("Belt speed", self.speed_source)
+        self.speed = _spin(belt, 0.0, 100000.0, s.speed_mm_s, 1, " mm/s")
+        form.addRow("Fixed speed", self.speed)
+        self.speed_register = QLineEdit(s.speed_register, belt)
+        self.speed_scale = _spin(belt, 0.001, 10000.0, s.speed_scale, 3)
+        self.speed_scale.setToolTip("Register units per mm/s: 10 when the "
+                                    "PLC keeps tenths of a mm/s.")
+        row = QHBoxLayout()
+        row.addWidget(self.speed_register, 1)
+        row.addWidget(QLabel("units per mm/s", belt))
+        row.addWidget(self.speed_scale)
+        form.addRow("Speed register", row)
+        self.distance = _spin(belt, 0.0, 100000.0, s.distance_mm, 1, " mm")
+        self.distance.setToolTip("From the photo-eye to the middle of the "
+                                 "camera's view, along the belt.")
+        form.addRow("Photo-eye to view", self.distance)
+        self.latency = _spin(belt, 0.0, 10000.0, s.fixed_latency_ms, 3,
+                             " ms")
+        self.latency.setToolTip("PLC scan + output switching + the camera's "
+                                "own trigger latency (and, in network mode, "
+                                "anything else fixed).")
+        form.addRow("Fixed latency", self.latency)
+        self.offset = _spin(belt, -10000.0, 10000.0, s.offset_ms, 3, " ms")
+        self.offset.setToolTip("Calibration's correction (+ fires later).")
+        form.addRow("Calibration offset", self.offset)
+        self.poll = _spin(belt, 0.5, 100.0, s.poll_ms, 1, " ms")
+        form.addRow("Poll every (network)", self.poll)
+        self.follow = QCheckBox("Keep the camera's delay matched to the "
+                                "speed (between runs)", belt)
+        self.follow.setChecked(s.follow_speed)
+        form.addRow("", self.follow)
+        layout.addWidget(belt)
+
+        # -- calibration ----------------------------------------------------
+        cal = QGroupBox("Auto-calibrate", self)
+        form = QFormLayout(cal)
+        self.view_mm = _spin(cal, 0.0, 100000.0, s.view_mm, 1, " mm")
+        self.view_mm.setToolTip("How many mm of belt the picture spans, "
+                                "along the belt.")
+        form.addRow("View along belt", self.view_mm)
+        self.direction = QComboBox(cal)
+        self.direction.addItems(list(timing.DIRECTIONS))
+        self.direction.setCurrentText(s.direction)
+        form.addRow("Bottles move", self.direction)
+        self.frames = QSpinBox(cal)
+        self.frames.setRange(1, 200)
+        self.frames.setValue(s.calibrate_frames)
+        form.addRow("Pictures to use", self.frames)
+        layout.addWidget(cal)
+
+        # -- readout and buttons --------------------------------------------
+        self.readout = QLabel("", self)
+        self.readout.setObjectName("plc_readout")
+        self.readout.setWordWrap(True)
+        layout.addWidget(self.readout)
+        row = QHBoxLayout()
+        self.test_button = QPushButton("Test connection", self)
+        self.apply_button = QPushButton("Apply delay to camera", self)
+        self.calibrate_button = QPushButton("Calibrate from newest pictures",
+                                            self)
+        for b in (self.test_button, self.apply_button,
+                  self.calibrate_button):
+            row.addWidget(b)
+        layout.addLayout(row)
+        self.said = QLabel("", self)
+        self.said.setObjectName("plc_said")
+        self.said.setWordWrap(True)
+        layout.addWidget(self.said)
+        layout.addStretch(1)
+
+        for w in (self.host, self.count_register, self.speed_register):
+            w.editingFinished.connect(self.save)
+        for w in (self.port, self.frames):
+            w.valueChanged.connect(self.save)
+        for w in (self.speed, self.speed_scale, self.distance, self.latency,
+                  self.offset, self.poll, self.view_mm):
+            w.valueChanged.connect(self.save)
+        for w in (self.mode, self.speed_source, self.direction):
+            w.currentTextChanged.connect(self.save)
+        for w in (self.simulated, self.follow):
+            w.toggled.connect(self.save)
+        self.test_button.clicked.connect(self.test)
+        self.apply_button.clicked.connect(self.apply)
+        self.calibrate_button.clicked.connect(self.calibrate)
+
+        self._calibrating = False
+        self._calibrated = ""
+        self.timer = QTimer(self)
+        self.timer.setInterval(REFRESH_MS)
+        self.timer.timeout.connect(self.refresh)
+        self._shown()
+        self.refresh()
+
+    # -- keeping the settings ---------------------------------------------
+    def values(self) -> Dict[str, Any]:
+        return {"host": self.host.text().strip(), "port": self.port.value(),
+                "simulated": self.simulated.isChecked(),
+                "mode": self.mode.currentText(),
+                "count_register": self.count_register.text().strip(),
+                "speed_source": self.speed_source.currentText(),
+                "speed_mm_s": self.speed.value(),
+                "speed_register": self.speed_register.text().strip(),
+                "speed_scale": self.speed_scale.value(),
+                "distance_mm": self.distance.value(),
+                "fixed_latency_ms": self.latency.value(),
+                "offset_ms": self.offset.value(),
+                "poll_ms": self.poll.value(),
+                "follow_speed": self.follow.isChecked(),
+                "view_mm": self.view_mm.value(),
+                "direction": self.direction.currentText(),
+                "calibrate_frames": self.frames.value()}
+
+    def save(self, *_: Any) -> None:
+        why = self.plugin.update_settings(self.values())
+        if why:
+            self.said.setText(f"Not kept in the project: {why}")
+        self._shown()
+        self.refresh()
+
+    def _shown(self) -> None:
+        wire = self.mode.currentText() == timing.MODE_WIRE
+        self.hint.setText(WIRE_HINT if wire else NET_HINT)
+        self.apply_button.setEnabled(wire)
+        self.follow.setEnabled(wire)
+        self.poll.setEnabled(not wire)
+        from_plc = self.speed_source.currentText() == timing.SPEED_PLC
+        self.speed.setEnabled(not from_plc or self.simulated.isChecked())
+        self.speed_register.setEnabled(from_plc)
+        self.speed_scale.setEnabled(from_plc)
+        self.host.setEnabled(not self.simulated.isChecked())
+        self.port.setEnabled(not self.simulated.isChecked())
+
+    # -- the readout --------------------------------------------------------
+    def refresh(self) -> None:
+        r = self.plugin.reading
+        if not (self.plugin.settings.host or self.plugin.settings.simulated):
+            self.readout.setText("Set the PLC's address (or tick the "
+                                 "simulated PLC).")
+            return
+        parts = []
+        if r.get("connected"):
+            parts.append(f"Connected · bottle count {r.get('count')}")
+            if r.get("rtt_ms") is not None:
+                parts.append(f"reply {r['rtt_ms']} ms")
+        else:
+            parts.append(f"Not connected: {r.get('error') or 'waiting'}")
+        speed = r.get("speed")
+        parts.append("speed ?" if speed is None else
+                     f"speed {speed:.1f} mm/s")
+        delay = r.get("delay_us")
+        parts.append("delay ?" if delay is None else
+                     f"delay needed {delay / 1000.0:.3f} ms")
+        applied = self.plugin.applied_us()
+        if self.mode.currentText() == timing.MODE_WIRE:
+            parts.append("camera has " + ("—" if applied is None else
+                                          f"{applied / 1000.0:.3f} ms"))
+        self.readout.setText(" · ".join(parts))
+        if self._calibrated:
+            self.said.setText(self._calibrated)
+            self._calibrated = ""
+            self.offset.blockSignals(True)
+            self.offset.setValue(self.plugin.settings.offset_ms)
+            self.offset.blockSignals(False)
+            self.calibrate_button.setEnabled(True)
+
+    def showEvent(self, event: Any) -> None:              # noqa: N802
+        super().showEvent(event)
+        self.refresh()
+        self.timer.start()
+
+    def hideEvent(self, event: Any) -> None:              # noqa: N802
+        super().hideEvent(event)
+        self.timer.stop()
+
+    # -- the buttons --------------------------------------------------------
+    def test(self) -> None:
+        r = self.plugin.read_now()
+        if r.get("connected"):
+            self.said.setText(f"The PLC answered: bottle count "
+                              f"{r.get('count')}, speed {r.get('speed')} "
+                              f"mm/s, reply {r.get('rtt_ms')} ms.")
+        else:
+            self.said.setText(f"No answer: {r.get('error')}")
+        self.refresh()
+
+    def apply(self) -> None:
+        self.said.setText(self.plugin.apply_delay())
+        self.refresh()
+
+    def calibrate(self) -> None:
+        if self._calibrating:
+            return
+        self._calibrating = True
+        self.calibrate_button.setEnabled(False)
+        self.said.setText("Calibrating from the newest pictures…")
+
+        def work() -> None:
+            try:
+                text = self.plugin.calibrate()
+            except Exception as exc:                      # noqa: BLE001
+                text = f"Calibration failed: {exc}"
+            self._calibrated = text
+            self._calibrating = False
+
+        threading.Thread(target=work, daemon=True, name="plc-calibrate").start()
