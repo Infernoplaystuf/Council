@@ -254,6 +254,13 @@ same list.
   pictures while recording", the slider's raw view, "Make pictures from
   .raw…" by right-click, `council_core/raw_pictures.py`):
   `docs/handoff/typhon_evk_raw_only_2026-11-17.md`.
+- The PLC trigger plugin (`typhon_plugins/plc/`: a Do-More PLC over Modbus
+  TCP or Modbus RTU on a serial port (`council_core/serial_port.py`,
+  pyserial optional), wire mode setting the camera's TriggerDelay from the belt speed,
+  network mode firing from the PLC's bottle count, auto-calibration, the
+  missed-bottle check, the simulated PLC; the Do-More Designer set-up;
+  the fan-blade strobe lock with no sensor, `council_core/blade_phase.py`,
+  and the PLC timer switch MHR5): `docs/typhon_plc_trigger.md`.
 - The Council rebuilding Typhon (layout, wiring and the hand-built widgets,
   each graded apart; `run_typhon_recreate.py`, the oracle stub, the report):
   `docs/handoff/typhon_recreate_2026-10-22.md`.

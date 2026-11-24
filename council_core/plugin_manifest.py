@@ -129,7 +129,9 @@ RAW_FILE = "_events.raw"
 #: its design fixed (design 3.9): no third-party file may hold one, as no
 #: plugin may hold a core ending (the registry also refuses a second claim
 #: of any run file, council_core.plugin_host.discover).
-BUILTIN_FILES = (RAW_FILE, TRIGGERS_FILE)
+#: The PLC trigger plugin's fan-blade phase log (typhon_plugins/plc/fan.py).
+BLADE_PHASE_FILE = "_blade_phase.csv"
+BUILTIN_FILES = (RAW_FILE, TRIGGERS_FILE, BLADE_PHASE_FILE)
 
 #: Every field of schema 1, and which plugins must give it.
 REQUIRED = ("schema", "id", "short", "name", "version", "api", "kind",

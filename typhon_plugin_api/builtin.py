@@ -82,6 +82,20 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     # 2026): "Find my trigger line" and its words
     "FIND_LINE_SECONDS": ("council_core.basler_lines", "FIND_S"),
     "find_line_words": ("council_core.basler_lines", "find_words"),
+    # the PLC trigger's auto-calibration (council_core/bottle_position.py,
+    # 24 November 2026): numpy and Pillow, which a plugin's folder may not
+    # import
+    "bottle_calibrate": ("council_core.bottle_position", "calibrate"),
+    "latest_pictures": ("council_core.bottle_position", "latest_pictures"),
+    # its serial link (council_core/serial_port.py: pyserial, optional)
+    "open_serial_port": ("council_core.serial_port", "open_port"),
+    "serial_ports": ("council_core.serial_port", "list_ports"),
+    # its fan-blade strobe lock (council_core/blade_phase.py, 24 November
+    # 2026): the blade's angle in a picture, the hub found, the reference
+    "FanView": ("council_core.blade_phase", "FanView"),
+    "blade_measure": ("council_core.blade_phase", "measure"),
+    "blade_reference": ("council_core.blade_phase", "reference"),
+    "find_hub": ("council_core.blade_phase", "find_hub"),
 }
 
 __all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])
