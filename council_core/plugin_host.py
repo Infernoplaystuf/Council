@@ -183,12 +183,14 @@ BUILTIN_PLUGINS: Tuple[Tuple[str, str], ...] = (
     ("typhon.crop", "crop"),
     ("typhon.send_trigger", "send_trigger"),
     ("typhon.plc", "plc"),
+    ("typhon.event_analysis", "event_analysis"),
 )
 #: Built-ins a new project does not run until ticked in Plugins… (a plugin
 #: home with no base set file): optional extras (Send trigger, 5 November
-#: 2026; PLC trigger, 24 November 2026). A base set written by the user
-#: lists what it lists.
-OPTIONAL_BUILTINS: Tuple[str, ...] = ("typhon.send_trigger", "typhon.plc")
+#: 2026; PLC trigger, 24 November 2026; Event analysis, 25 November 2026).
+#: A base set written by the user lists what it lists.
+OPTIONAL_BUILTINS: Tuple[str, ...] = ("typhon.send_trigger", "typhon.plc",
+                                      "typhon.event_analysis")
 
 
 def default_plugins(builtins: Sequence[Tuple[str, str]] = BUILTIN_PLUGINS
