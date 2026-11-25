@@ -71,6 +71,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r requirements.txt pytest
+          # OpenCV is optional for Council (the Typhon Event analysis plugin
+          # needs it); installed here so that plugin's tests run, not skip.
+          python -m pip install opencv-python-headless
 
       - name: Run the tests
         run: python tests/run_all.py -j 4 --timeout 900 --logs test-logs
