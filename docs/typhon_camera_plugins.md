@@ -449,6 +449,15 @@ The same folder, manifest, review and approval apply to:
   file in its data folder (`write_new(data_dir(), ...)`: a project's
   settings hold plain values only, so a long list goes in a file), and
   changes a camera setting mid-run from its thread (through `call_in_ui`).
+  The built-in Event analysis (`typhon_plugins/event_analysis/`, guide
+  `docs/typhon_event_analysis.md`) is a panel-only feature that works on
+  recordings already on disk. It runs long work on its own thread, and its
+  window polls that thread on a timer. Its numpy and OpenCV code is in
+  `council_core/event_analysis.py`, reached through
+  `typhon_plugin_api.builtin.event_analysis()`, because a built-in plugin's
+  folder imports only the standard library and `typhon_plugin_api`. A
+  plugin from someone else may import numpy and its SDK directly (section
+  12).
 
 The full API reference is `typhon_plugin_api/__init__.py`, and its working
 notes are `docs/typhon_plugin_api_notes.md`.

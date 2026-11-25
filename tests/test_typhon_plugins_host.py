@@ -229,6 +229,10 @@ def test_the_real_built_ins_are_found_and_on_but_the_optional_ones(plugin_home):
         if pid == "typhon.classify" and \
                 importlib.util.find_spec("sklearn") is None:
             assert state == ph.INCOMPATIBLE and "sklearn" in why
+        elif pid == "typhon.event_analysis" and any(
+                importlib.util.find_spec(m) is None for m in ("numpy", "cv2")):
+            # its manifest asks for numpy and OpenCV, which a Python may lack
+            assert state == ph.INCOMPATIBLE and "install" in why
         elif pid in ph.OPTIONAL_BUILTINS:
             # found, not run until ticked in Plugins… (Send trigger)
             assert state == ph.DISCOVERED, (pid, state, why)

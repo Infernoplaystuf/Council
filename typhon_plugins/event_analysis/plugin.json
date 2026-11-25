@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "id": "typhon.event_analysis",
+  "short": "evanalysis",
+  "name": "Event analysis (smoke plume, melt pool)",
+  "version": "0.1.0",
+  "api": "1.0",
+  "kind": "feature",
+  "scope": "rig",
+  "entry": "plugin:EventAnalysisPlugin",
+  "needs": [],
+  "python": [
+    "numpy",
+    "cv2"
+  ],
+  "contributes": [
+    "panel"
+  ],
+  "files": [],
+  "network": "none"
+}

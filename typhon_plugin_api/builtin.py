@@ -96,9 +96,14 @@ _REEXPORTS: Dict[str, Tuple[str, str]] = {
     "blade_measure": ("council_core.blade_phase", "measure"),
     "blade_reference": ("council_core.blade_phase", "reference"),
     "find_hub": ("council_core.blade_phase", "find_hub"),
+    # the event analysis plugin (council_core/event_analysis.py, 25
+    # November 2026): numpy and OpenCV, which a plugin's folder may not
+    # import; event_analysis() below hands the plugin the whole module
+    "event_analysis_missing": ("council_core.event_analysis", "missing"),
 }
 
-__all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker"])
+__all__ = sorted([*_REEXPORTS, "classifier_library", "classifier_picker",
+                  "event_analysis"])
 
 
 def classifier_library() -> Any:
@@ -117,6 +122,15 @@ def classifier_picker() -> Any:
     import importlib
 
     return importlib.import_module("council_qt.widgets.classifier_picker")
+
+
+def event_analysis() -> Any:
+    """council_core.event_analysis: the six analyses of Andy's Prophesee
+    script (homography, rectify, velocity arrows, melt-pool paths,
+    raindrops, smoke plumes) that typhon.event_analysis runs."""
+    import importlib
+
+    return importlib.import_module("council_core.event_analysis")
 
 
 def __getattr__(name: str) -> Any:
